@@ -60,6 +60,9 @@ pub fn build(b: *std.Build) void {
     const mvzr_dep = b.dependency("mvzr", .{ .target = target, .optimize = optimize });
     const mvzr_mod = mvzr_dep.module("mvzr");
 
+    const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
+    const vaxis_mod = vaxis_dep.module("vaxis");
+
     const exe = b.addExecutable(.{
         .name = "velk",
         .root_module = b.createModule(.{
@@ -69,6 +72,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "velk", .module = mod },
                 .{ .name = "mvzr", .module = mvzr_mod },
+                .{ .name = "vaxis", .module = vaxis_mod },
             },
         }),
     });

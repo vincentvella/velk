@@ -6,6 +6,65 @@ const anthropic = @import("anthropic.zig");
 const tool = @import("tool.zig");
 const tools = @import("tools.zig");
 const agent = @import("agent.zig");
+const session = @import("session.zig");
+const tui = @import("tui.zig");
+
+/// Sink that mirrors the original plain-CLI behavior: assistant text to
+/// stdout (flushed per delta), tool calls/results to stderr.
+const PlainSink = struct {
+    text_out: *Io.Writer,
+    progress_out: *Io.Writer,
+    arena: std.mem.Allocator,
+    printed_text: bool = false,
+
+    fn sink(self: *PlainSink) agent.Sink {
+        return .{
+            .ctx = self,
+            .onText = onText,
+            .onToolCall = onToolCall,
+            .onToolResult = onToolResult,
+            .onTurnEnd = onTurnEnd,
+        };
+    }
+
+    fn cast(ctx: ?*anyopaque) *PlainSink {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn onText(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        const self = cast(ctx);
+        try self.text_out.writeAll(text);
+        try self.text_out.flush();
+        self.printed_text = true;
+    }
+
+    fn onToolCall(ctx: ?*anyopaque, name: []const u8, input_json: []const u8) anyerror!void {
+        const self = cast(ctx);
+        var preview = input_json;
+        if (preview.len > 200) preview = preview[0..200];
+        try self.progress_out.print("→ {s}({s})\n", .{ name, preview });
+        try self.progress_out.flush();
+    }
+
+    fn onToolResult(ctx: ?*anyopaque, text: []const u8, is_error: bool) anyerror!void {
+        const self = cast(ctx);
+        var preview = text;
+        if (preview.len > 200) preview = preview[0..200];
+        const ellipsis: []const u8 = if (text.len > 200) "…" else "";
+        const prefix: []const u8 = if (is_error) "← (error) " else "← ";
+        try self.progress_out.print("{s}{s}{s}\n", .{ prefix, preview, ellipsis });
+        try self.progress_out.flush();
+    }
+
+    fn onTurnEnd(ctx: ?*anyopaque) anyerror!void {
+        const self = cast(ctx);
+        if (self.printed_text) {
+            try self.text_out.writeAll("\n");
+            try self.text_out.flush();
+        }
+        self.printed_text = false;
+    }
+};
 
 fn handleSigInt(_: std.posix.SIG) callconv(.c) void {
     // Signal-safe only: write a final newline so the shell prompt lands on a
@@ -68,14 +127,35 @@ pub fn main(init: std.process.Init) !void {
             settings.* = .{ .io = init.io, .unsafe = opts.unsafe };
             const tool_set = try tools.buildAll(arena, settings);
 
-            agent.run(arena, &client, w, errw, .{
+            var sess: session.Session = .init(arena, &client, .{
                 .model = opts.model,
                 .max_tokens = opts.max_tokens,
                 .system = opts.system,
-                .prompt = opts.prompt,
                 .tools = tool_set,
-            }) catch |err| {
-                try renderClientError(errw, err, &client);
+            });
+
+            if (opts.prompt) |p| {
+                // One-shot mode: run a single turn and exit.
+                var plain: PlainSink = .{ .text_out = w, .progress_out = errw, .arena = arena };
+                sess.ask(p, plain.sink()) catch |err| {
+                    try renderClientError(errw, err, &client);
+                    try errw.flush();
+                    std.process.exit(1);
+                };
+                return;
+            }
+
+            // No prompt: launch the interactive REPL unless explicitly
+            // disabled or not connected to a TTY.
+            const stdin_is_tty = (std.Io.File.stdin().isTty(init.io)) catch false;
+            if (opts.no_tui or !stdin_is_tty) {
+                try cli.printHelp(w);
+                try w.flush();
+                return;
+            }
+
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess) catch |err| {
+                try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);
             };

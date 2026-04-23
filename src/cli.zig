@@ -4,12 +4,16 @@ pub const default_model = "claude-opus-4-7";
 pub const default_max_tokens: u32 = 4096;
 
 pub const Options = struct {
-    prompt: []const u8,
+    /// Optional one-shot prompt. When null, the agent is launched in
+    /// REPL mode (TUI if stdin is a TTY).
+    prompt: ?[]const u8 = null,
     model: []const u8 = default_model,
     system: ?[]const u8 = null,
     max_tokens: u32 = default_max_tokens,
     /// Drop path-safety checks in built-in tools.
     unsafe: bool = false,
+    /// Force plain (non-TUI) output even when stdin is a TTY.
+    no_tui: bool = false,
 };
 
 pub const ParseError = struct {
@@ -29,7 +33,7 @@ pub fn parse(args: []const []const u8) Action {
         return errAction("missing argv[0]", null);
     }
 
-    var opts: Options = .{ .prompt = "" };
+    var opts: Options = .{};
     var prompt: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -59,6 +63,10 @@ pub fn parse(args: []const []const u8) Action {
             opts.unsafe = true;
             continue;
         }
+        if (eql(arg, "--no-tui")) {
+            opts.no_tui = true;
+            continue;
+        }
 
         if (arg.len > 1 and arg[0] == '-') {
             return errAction("unknown flag", arg);
@@ -68,27 +76,25 @@ pub fn parse(args: []const []const u8) Action {
         prompt = arg;
     }
 
-    if (prompt) |p| {
-        opts.prompt = p;
-        return .{ .run = opts };
-    }
-    // No flags and no prompt: bare `velk` shows help.
-    // Flags but no prompt: user intent was clear, surface a real error.
-    if (args.len <= 1) return .help;
-    return errAction("missing prompt", null);
+    if (prompt) |p| opts.prompt = p;
+    return .{ .run = opts };
 }
 
 pub fn printHelp(w: anytype) !void {
     try w.print(
         \\velk — terminal AI harness
         \\
-        \\Usage: velk [options] <prompt>
+        \\Usage: velk [options] [prompt]
+        \\
+        \\Without a prompt, velk launches an interactive REPL (TUI).
+        \\With a prompt, velk runs one turn and exits.
         \\
         \\Options:
         \\  -m, --model <id>      model id (default: {s})
         \\  -s, --system <text>   system prompt
         \\      --max-tokens <n>  max tokens to generate (default: {d})
         \\      --unsafe          allow tools to access paths outside CWD
+        \\      --no-tui          force plain output (no TUI)
         \\  -h, --help            show this help
         \\  -V, --version         show version
         \\
@@ -159,22 +165,25 @@ test "parse: -V returns version" {
     try testing.expect(parse(&.{ "velk", "-V" }) == .version);
 }
 
-test "parse: no args returns help" {
-    try testing.expect(parse(&.{"velk"}) == .help);
+test "parse: no args returns run with null prompt (REPL intent)" {
+    const o = try expectRun(parse(&.{"velk"}));
+    try testing.expect(o.prompt == null);
 }
 
 test "parse: positional prompt with defaults" {
     const o = try expectRun(parse(&.{ "velk", "hello world" }));
-    try testing.expectEqualStrings("hello world", o.prompt);
+    try testing.expectEqualStrings("hello world", o.prompt.?);
     try testing.expectEqualStrings(default_model, o.model);
     try testing.expectEqual(default_max_tokens, o.max_tokens);
     try testing.expectEqual(@as(?[]const u8, null), o.system);
+    try testing.expect(!o.no_tui);
+    try testing.expect(!o.unsafe);
 }
 
 test "parse: --model overrides default" {
     const o = try expectRun(parse(&.{ "velk", "--model", "claude-sonnet-4-6", "hi" }));
     try testing.expectEqualStrings("claude-sonnet-4-6", o.model);
-    try testing.expectEqualStrings("hi", o.prompt);
+    try testing.expectEqualStrings("hi", o.prompt.?);
 }
 
 test "parse: -m short form" {
@@ -198,17 +207,28 @@ test "parse: --max-tokens parses integer" {
     try testing.expectEqual(@as(u32, 1024), o.max_tokens);
 }
 
+test "parse: --no-tui flag" {
+    const o = try expectRun(parse(&.{ "velk", "--no-tui" }));
+    try testing.expect(o.no_tui);
+    try testing.expect(o.prompt == null);
+}
+
+test "parse: --unsafe flag" {
+    const o = try expectRun(parse(&.{ "velk", "--unsafe", "hi" }));
+    try testing.expect(o.unsafe);
+}
+
 test "parse: flags in any order before positional" {
     const o = try expectRun(parse(&.{ "velk", "-m", "x", "--max-tokens", "10", "-s", "sys", "p" }));
     try testing.expectEqualStrings("x", o.model);
     try testing.expectEqual(@as(u32, 10), o.max_tokens);
     try testing.expectEqualStrings("sys", o.system.?);
-    try testing.expectEqualStrings("p", o.prompt);
+    try testing.expectEqualStrings("p", o.prompt.?);
 }
 
 test "parse: positional before flags" {
     const o = try expectRun(parse(&.{ "velk", "p", "-m", "x" }));
-    try testing.expectEqualStrings("p", o.prompt);
+    try testing.expectEqualStrings("p", o.prompt.?);
     try testing.expectEqualStrings("x", o.model);
 }
 
@@ -235,14 +255,4 @@ test "parse: unknown flag errors" {
 test "parse: extra positional errors" {
     const e = try expectParseError(parse(&.{ "velk", "first", "second" }));
     try testing.expectEqualStrings("second", e.arg.?);
-}
-
-test "parse: flags without prompt errors (not help)" {
-    const e = try expectParseError(parse(&.{ "velk", "--max-tokens", "10000" }));
-    try testing.expectEqualStrings("missing prompt", e.message);
-}
-
-test "parse: -m without prompt errors" {
-    const e = try expectParseError(parse(&.{ "velk", "-m", "claude-sonnet-4-6" }));
-    try testing.expectEqualStrings("missing prompt", e.message);
 }

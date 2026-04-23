@@ -4,9 +4,9 @@
 //! tool_result user message, and repeats until `stop_reason` is `end_turn`
 //! (or the iteration budget is exhausted).
 //!
-//! Live text deltas are written to `text_out` as they arrive; tool calls
-//! and their results are summarized to `progress_out` (stderr by default,
-//! keeping stdout = assistant-text only for piping).
+//! Output is delivered through a `Sink` rather than directly to a writer,
+//! so the same loop drives both the plain CLI (sink writes to stdout/
+//! stderr) and the TUI (sink updates scrollback state).
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,13 +15,35 @@ const types = anthropic.types;
 const sse = anthropic.sse;
 const tool = @import("tool.zig");
 
+/// Callbacks the agent fires as a turn unfolds. All slices passed in are
+/// only valid for the duration of the call — copy if you need to retain.
+pub const Sink = struct {
+    ctx: ?*anyopaque,
+    /// Streaming text delta from the assistant.
+    onText: *const fn (?*anyopaque, []const u8) anyerror!void,
+    /// A tool_use block has been fully assembled and is about to run.
+    /// `input_json` is the model's input pretty-printed for display.
+    onToolCall: *const fn (?*anyopaque, name: []const u8, input_json: []const u8) anyerror!void,
+    /// The previous tool_use produced this result.
+    onToolResult: *const fn (?*anyopaque, text: []const u8, is_error: bool) anyerror!void,
+    /// Called once per turn after stop_reason has been observed (or when
+    /// the loop is exiting due to error/budget). Lets the sink finalize
+    /// (e.g. write a trailing newline to stdout).
+    onTurnEnd: *const fn (?*anyopaque) anyerror!void,
+};
+
 pub const Config = struct {
     model: []const u8,
     max_tokens: u32,
     system: ?[]const u8 = null,
+    /// Initial user prompt for the turn. The agent appends a user message
+    /// containing this text and then drives the tool loop.
     prompt: []const u8,
     tools: []const tool.Tool = &.{},
     max_iterations: u32 = 10,
+    /// Optional starting message history (e.g. earlier turns from a session).
+    /// The agent will copy entries into its own list before appending.
+    history: []const types.Message = &.{},
 };
 
 pub const Error = error{
@@ -34,14 +56,16 @@ pub const Error = error{
     InvalidToolInput,
 } || std.mem.Allocator.Error;
 
+/// Run one full turn (user prompt → assistant end_turn). Returns the
+/// final message list so the caller can persist it as session history.
 pub fn run(
     arena: std.mem.Allocator,
     client: *anthropic.Client,
-    text_out: *Io.Writer,
-    progress_out: *Io.Writer,
+    sink: Sink,
     config: Config,
-) !void {
+) ![]const types.Message {
     var messages: std.ArrayList(types.Message) = .empty;
+    for (config.history) |m| try messages.append(arena, m);
     try messages.append(arena, try types.textMessage(arena, "user", config.prompt));
 
     const tool_defs = try buildToolDefs(arena, config.tools);
@@ -58,29 +82,25 @@ pub fn run(
 
         var state: StreamState = .{
             .arena = arena,
-            .text_out = text_out,
+            .sink = sink,
             .blocks = .empty,
-            .printed_text = false,
         };
 
         client.streamMessage(req, &state, StreamState.onEvent) catch |err| {
-            if (state.printed_text) try text_out.writeAll("\n");
-            try text_out.flush();
+            try sink.onTurnEnd(sink.ctx);
             return err;
         };
 
         if (state.err) |e| {
-            if (state.printed_text) try text_out.writeAll("\n");
-            try text_out.flush();
+            try sink.onTurnEnd(sink.ctx);
             return e;
-        }
-        if (state.printed_text) {
-            try text_out.writeAll("\n");
-            try text_out.flush();
         }
 
         const stop_reason = state.stop_reason orelse "end_turn";
-        if (!std.mem.eql(u8, stop_reason, "tool_use")) return;
+        if (!std.mem.eql(u8, stop_reason, "tool_use")) {
+            try sink.onTurnEnd(sink.ctx);
+            return messages.items;
+        }
 
         // Assemble the assistant message from accumulated blocks and append it.
         const assistant_blocks = try assembleAssistantBlocks(arena, state.blocks.items);
@@ -90,13 +110,14 @@ pub fn run(
         var results: std.ArrayList(types.ContentBlock) = .empty;
         for (assistant_blocks) |block| {
             if (!std.mem.eql(u8, block.type, "tool_use")) continue;
-            const result_block = try executeOne(arena, config.tools, block, progress_out);
+            const result_block = try executeOne(arena, config.tools, block, sink);
             try results.append(arena, result_block);
         }
 
         try messages.append(arena, .{ .role = "user", .content = results.items });
     }
 
+    try sink.onTurnEnd(sink.ctx);
     return Error.IterationBudgetExceeded;
 }
 
@@ -138,25 +159,21 @@ fn executeOne(
     arena: std.mem.Allocator,
     tools: []const tool.Tool,
     block: types.ContentBlock,
-    progress_out: *Io.Writer,
+    sink: Sink,
 ) !types.ContentBlock {
     const id = block.id orelse return Error.InvalidToolInput;
     const name = block.name orelse return Error.InvalidToolInput;
 
-    try progress_out.print("→ {s}", .{name});
-    if (block.input) |inp| {
-        var inp_str = try std.json.Stringify.valueAlloc(arena, inp, .{});
-        if (inp_str.len > 200) inp_str = inp_str[0..200];
-        try progress_out.print("({s})", .{inp_str});
-    }
-    try progress_out.writeAll("\n");
-    try progress_out.flush();
+    const input_str = if (block.input) |inp|
+        try std.json.Stringify.valueAlloc(arena, inp, .{})
+    else
+        try arena.dupe(u8, "{}");
+    try sink.onToolCall(sink.ctx, name, input_str);
 
     const reg: tool.Registry = .{ .tools = tools };
     const t = reg.find(name) orelse {
         const msg = try std.fmt.allocPrint(arena, "unknown tool: {s}", .{name});
-        try progress_out.print("← (unknown tool)\n", .{});
-        try progress_out.flush();
+        try sink.onToolResult(sink.ctx, msg, true);
         return .{
             .type = "tool_result",
             .tool_use_id = id,
@@ -167,8 +184,7 @@ fn executeOne(
 
     const out = t.execute(t.context, arena, block.input orelse .{ .null = {} }) catch |e| {
         const msg = try std.fmt.allocPrint(arena, "tool errored: {s}", .{@errorName(e)});
-        try progress_out.print("← (error: {s})\n", .{@errorName(e)});
-        try progress_out.flush();
+        try sink.onToolResult(sink.ctx, msg, true);
         return .{
             .type = "tool_result",
             .tool_use_id = id,
@@ -177,11 +193,7 @@ fn executeOne(
         };
     };
 
-    var preview = out.text;
-    if (preview.len > 200) preview = preview[0..200];
-    try progress_out.print("← {s}{s}\n", .{ preview, if (out.text.len > 200) "…" else "" });
-    try progress_out.flush();
-
+    try sink.onToolResult(sink.ctx, out.text, out.is_error);
     return .{
         .type = "tool_result",
         .tool_use_id = id,
@@ -202,9 +214,8 @@ const InProgressBlock = struct {
 
 const StreamState = struct {
     arena: std.mem.Allocator,
-    text_out: *Io.Writer,
+    sink: Sink,
     blocks: std.ArrayList(InProgressBlock),
-    printed_text: bool,
     stop_reason: ?[]const u8 = null,
     err: ?anyerror = null,
 
@@ -244,9 +255,7 @@ const StreamState = struct {
             var block = &self.blocks.items[parsed.index];
             if (parsed.delta.text) |t| {
                 try block.text.appendSlice(self.arena, t);
-                try self.text_out.writeAll(t);
-                try self.text_out.flush();
-                self.printed_text = true;
+                try self.sink.onText(self.sink.ctx, t);
             }
             if (parsed.delta.partial_json) |pj| {
                 try block.input_json.appendSlice(self.arena, pj);
