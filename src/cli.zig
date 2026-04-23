@@ -8,6 +8,8 @@ pub const Options = struct {
     model: []const u8 = default_model,
     system: ?[]const u8 = null,
     max_tokens: u32 = default_max_tokens,
+    /// Drop path-safety checks in built-in tools.
+    unsafe: bool = false,
 };
 
 pub const ParseError = struct {
@@ -53,6 +55,10 @@ pub fn parse(args: []const []const u8) Action {
                 return errAction("invalid integer for --max-tokens", v);
             continue;
         }
+        if (eql(arg, "--unsafe")) {
+            opts.unsafe = true;
+            continue;
+        }
 
         if (arg.len > 1 and arg[0] == '-') {
             return errAction("unknown flag", arg);
@@ -82,6 +88,7 @@ pub fn printHelp(w: anytype) !void {
         \\  -m, --model <id>      model id (default: {s})
         \\  -s, --system <text>   system prompt
         \\      --max-tokens <n>  max tokens to generate (default: {d})
+        \\      --unsafe          allow tools to access paths outside CWD
         \\  -h, --help            show this help
         \\  -V, --version         show version
         \\

@@ -4,6 +4,7 @@ const velk = @import("velk");
 const cli = @import("cli.zig");
 const anthropic = @import("anthropic.zig");
 const tool = @import("tool.zig");
+const tools = @import("tools.zig");
 const agent = @import("agent.zig");
 
 fn handleSigInt(_: std.posix.SIG) callconv(.c) void {
@@ -63,14 +64,16 @@ pub fn main(init: std.process.Init) !void {
             var client: anthropic.Client = .init(init.gpa, init.io, api_key);
             defer client.deinit();
 
-            const tools: []const tool.Tool = &.{try tool.buildEcho(arena)};
+            const settings = try arena.create(tools.Settings);
+            settings.* = .{ .io = init.io, .unsafe = opts.unsafe };
+            const tool_set = try tools.buildAll(arena, settings);
 
             agent.run(arena, &client, w, errw, .{
                 .model = opts.model,
                 .max_tokens = opts.max_tokens,
                 .system = opts.system,
                 .prompt = opts.prompt,
-                .tools = tools,
+                .tools = tool_set,
             }) catch |err| {
                 try renderClientError(errw, err, &client);
                 try errw.flush();

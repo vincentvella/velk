@@ -1,0 +1,598 @@
+//! Built-in tools the agent can call. Each tool is a small wrapper:
+//! parse JSON input, validate path safety where applicable, do the
+//! work, format the output. Schemas are JSON strings parsed once at
+//! `buildAll` time and reused per request.
+//!
+//! All filesystem and process operations route through the Io
+//! threaded into `Settings.io` (`std.process.Init.io` in the real
+//! program, `std.testing.io` in tests).
+
+const std = @import("std");
+const Io = std.Io;
+const tool = @import("tool.zig");
+
+/// Per-process tool settings. Pointed to by every tool's `context` field
+/// so any tool that touches the filesystem can consult `unsafe` and reuse
+/// the right `io` implementation.
+pub const Settings = struct {
+    io: Io,
+    /// When false, paths must be relative and lexically inside CWD.
+    unsafe: bool = false,
+};
+
+pub const Error = error{
+    PathOutsideCwd,
+    InvalidPath,
+};
+
+const max_output_bytes = 32 * 1024;
+const max_file_bytes = 256 * 1024;
+
+/// Build every built-in tool. The returned slice borrows from `arena`
+/// and from `settings` — both must outlive the tools.
+pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const tool.Tool {
+    var list: std.ArrayList(tool.Tool) = .empty;
+    try list.append(arena, try buildEcho(arena));
+    try list.append(arena, try buildReadFile(arena, settings));
+    try list.append(arena, try buildWriteFile(arena, settings));
+    try list.append(arena, try buildEdit(arena, settings));
+    try list.append(arena, try buildLs(arena, settings));
+    try list.append(arena, try buildGrep(arena, settings));
+    try list.append(arena, try buildBash(arena, settings));
+    return list.items;
+}
+
+// ───────── safety ─────────
+
+/// Reject absolute paths and any relative path that escapes CWD via `..`.
+/// Lexical-only: symlinks pointing outside CWD are not caught.
+fn validatePath(settings: *const Settings, raw: []const u8) ![]const u8 {
+    if (settings.unsafe) return raw;
+    if (raw.len == 0) return Error.InvalidPath;
+    if (std.fs.path.isAbsolute(raw)) return Error.PathOutsideCwd;
+
+    var depth: i32 = 0;
+    var iter = std.mem.splitScalar(u8, raw, '/');
+    while (iter.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            depth -= 1;
+            if (depth < 0) return Error.PathOutsideCwd;
+        } else {
+            depth += 1;
+        }
+    }
+    return raw;
+}
+
+fn settingsFromCtx(ctx: ?*anyopaque) *const Settings {
+    return @ptrCast(@alignCast(ctx.?));
+}
+
+fn errorOutput(arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !tool.Output {
+    return .{ .text = try std.fmt.allocPrint(arena, fmt, args), .is_error = true };
+}
+
+// ───────── echo ─────────
+
+const echo_schema_json: []const u8 =
+    \\{"type":"object","properties":{"text":{"type":"string","description":"The text to echo back."}},"required":["text"]}
+;
+
+pub fn buildEcho(arena: std.mem.Allocator) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, echo_schema_json, .{});
+    return .{
+        .name = "echo",
+        .description = "Echo back the provided text. Useful for sanity-checking the tool loop.",
+        .input_schema = schema,
+        .execute = echoExecute,
+    };
+}
+
+fn echoExecute(_: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const text = (try getString(input, "text")) orelse return errorOutput(arena, "echo: missing 'text'", .{});
+    return .{ .text = try arena.dupe(u8, text) };
+}
+
+// ───────── read_file ─────────
+
+const read_file_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "path":{"type":"string","description":"Relative path from CWD."},
+    \\   "offset":{"type":"integer","description":"Optional 1-indexed line to start from."},
+    \\   "limit":{"type":"integer","description":"Optional max number of lines to read."}
+    \\ },
+    \\ "required":["path"]}
+;
+
+pub fn buildReadFile(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, read_file_schema_json, .{});
+    return .{
+        .name = "read_file",
+        .description = "Read a file's contents. Optionally slice by line range with `offset` (1-indexed start) and `limit` (max lines).",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = readFileExecute,
+    };
+}
+
+fn readFileExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const raw_path = (try getString(input, "path")) orelse return errorOutput(arena, "read_file: missing 'path'", .{});
+    const path = validatePath(settings, raw_path) catch |e| return errorOutput(arena, "read_file: {s}", .{@errorName(e)});
+
+    const offset_opt = try getInt(input, "offset");
+    const limit_opt = try getInt(input, "limit");
+
+    const cwd = Io.Dir.cwd();
+    const data = cwd.readFileAlloc(settings.io, path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.StreamTooLong => return errorOutput(arena, "read_file: {s} exceeds {d} bytes", .{ path, max_file_bytes }),
+        else => return errorOutput(arena, "read_file: {s}: {s}", .{ path, @errorName(e) }),
+    };
+
+    if (offset_opt == null and limit_opt == null) {
+        return .{ .text = data };
+    }
+
+    const start_line: usize = if (offset_opt) |o| (if (o > 0) @intCast(o) else 1) else 1;
+    const max_lines: usize = if (limit_opt) |l| (if (l > 0) @intCast(l) else 0) else std.math.maxInt(usize);
+
+    var out: std.ArrayList(u8) = .empty;
+    var line_iter = std.mem.splitScalar(u8, data, '\n');
+    var current: usize = 1;
+    var emitted: usize = 0;
+    while (line_iter.next()) |line| {
+        if (current >= start_line and emitted < max_lines) {
+            try out.appendSlice(arena, line);
+            try out.append(arena, '\n');
+            emitted += 1;
+        }
+        current += 1;
+        if (emitted >= max_lines) break;
+    }
+    return .{ .text = out.items };
+}
+
+// ───────── write_file ─────────
+
+const write_file_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "path":{"type":"string","description":"Relative path from CWD. Parent directory must already exist."},
+    \\   "content":{"type":"string","description":"Full file contents to write (overwrites existing)."}
+    \\ },
+    \\ "required":["path","content"]}
+;
+
+pub fn buildWriteFile(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, write_file_schema_json, .{});
+    return .{
+        .name = "write_file",
+        .description = "Create or overwrite a file with the given contents. Parent directory must exist.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = writeFileExecute,
+    };
+}
+
+fn writeFileExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const raw_path = (try getString(input, "path")) orelse return errorOutput(arena, "write_file: missing 'path'", .{});
+    const content = (try getString(input, "content")) orelse return errorOutput(arena, "write_file: missing 'content'", .{});
+    const path = validatePath(settings, raw_path) catch |e| return errorOutput(arena, "write_file: {s}", .{@errorName(e)});
+
+    const cwd = Io.Dir.cwd();
+    cwd.writeFile(settings.io, .{ .sub_path = path, .data = content }) catch |e|
+        return errorOutput(arena, "write_file: {s}: {s}", .{ path, @errorName(e) });
+
+    return .{ .text = try std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ content.len, path }) };
+}
+
+// ───────── edit ─────────
+
+const edit_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "path":{"type":"string","description":"Relative path from CWD."},
+    \\   "old_string":{"type":"string","description":"Exact text to replace. Must occur exactly once."},
+    \\   "new_string":{"type":"string","description":"Replacement text."}
+    \\ },
+    \\ "required":["path","old_string","new_string"]}
+;
+
+pub fn buildEdit(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, edit_schema_json, .{});
+    return .{
+        .name = "edit",
+        .description = "Replace `old_string` with `new_string` in a file. Errors if the match is missing or non-unique.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = editExecute,
+    };
+}
+
+fn editExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const raw_path = (try getString(input, "path")) orelse return errorOutput(arena, "edit: missing 'path'", .{});
+    const old_str = (try getString(input, "old_string")) orelse return errorOutput(arena, "edit: missing 'old_string'", .{});
+    const new_str = (try getString(input, "new_string")) orelse return errorOutput(arena, "edit: missing 'new_string'", .{});
+    const path = validatePath(settings, raw_path) catch |e| return errorOutput(arena, "edit: {s}", .{@errorName(e)});
+
+    if (old_str.len == 0) return errorOutput(arena, "edit: old_string is empty", .{});
+
+    const cwd = Io.Dir.cwd();
+    const original = cwd.readFileAlloc(settings.io, path, arena, .limited(max_file_bytes)) catch |e|
+        return errorOutput(arena, "edit: read {s}: {s}", .{ path, @errorName(e) });
+
+    const first = std.mem.indexOf(u8, original, old_str) orelse return errorOutput(arena, "edit: no match for old_string in {s}", .{path});
+    if (std.mem.indexOfPos(u8, original, first + 1, old_str) != null) {
+        return errorOutput(arena, "edit: old_string matches more than once in {s} — make it more specific", .{path});
+    }
+
+    const total_len = original.len - old_str.len + new_str.len;
+    var out = try arena.alloc(u8, total_len);
+    @memcpy(out[0..first], original[0..first]);
+    @memcpy(out[first .. first + new_str.len], new_str);
+    @memcpy(out[first + new_str.len ..], original[first + old_str.len ..]);
+
+    cwd.writeFile(settings.io, .{ .sub_path = path, .data = out }) catch |e|
+        return errorOutput(arena, "edit: write {s}: {s}", .{ path, @errorName(e) });
+
+    return .{ .text = try std.fmt.allocPrint(arena, "replaced 1 occurrence in {s}", .{path}) };
+}
+
+// ───────── ls ─────────
+
+const ls_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "path":{"type":"string","description":"Relative directory path. Defaults to '.' (CWD)."}
+    \\ }}
+;
+
+pub fn buildLs(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, ls_schema_json, .{});
+    return .{
+        .name = "ls",
+        .description = "List entries in a directory with file sizes. Limited to 200 entries.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = lsExecute,
+    };
+}
+
+fn lsExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const raw_path = (try getString(input, "path")) orelse ".";
+    const path = validatePath(settings, raw_path) catch |e| return errorOutput(arena, "ls: {s}", .{@errorName(e)});
+
+    const cwd = Io.Dir.cwd();
+    var dir = cwd.openDir(settings.io, path, .{ .iterate = true }) catch |e|
+        return errorOutput(arena, "ls: open {s}: {s}", .{ path, @errorName(e) });
+    defer dir.close(settings.io);
+
+    var out: std.ArrayList(u8) = .empty;
+    var iter = dir.iterate();
+    var count: usize = 0;
+    while (try iter.next(settings.io)) |entry| {
+        if (count >= 200) {
+            try out.appendSlice(arena, "… (truncated at 200 entries)\n");
+            break;
+        }
+        switch (entry.kind) {
+            .directory => try out.print(arena, "{s}/\n", .{entry.name}),
+            .file => {
+                const stat = dir.statFile(settings.io, entry.name, .{}) catch {
+                    try out.print(arena, "{s}\n", .{entry.name});
+                    count += 1;
+                    continue;
+                };
+                try out.print(arena, "{s} ({d} bytes)\n", .{ entry.name, stat.size });
+            },
+            else => try out.print(arena, "{s} ({s})\n", .{ entry.name, @tagName(entry.kind) }),
+        }
+        count += 1;
+    }
+    return .{ .text = out.items };
+}
+
+// ───────── grep ─────────
+
+const grep_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "pattern":{"type":"string","description":"Literal substring to search for. Not a regex."},
+    \\   "path":{"type":"string","description":"File or directory to search. Directories are walked recursively."},
+    \\   "max_results":{"type":"integer","description":"Optional cap on result lines (default 100)."}
+    \\ },
+    \\ "required":["pattern","path"]}
+;
+
+pub fn buildGrep(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, grep_schema_json, .{});
+    return .{
+        .name = "grep",
+        .description = "Search for a literal substring in a file, or recursively across a directory. Returns lines as `path:lineno:content`.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = grepExecute,
+    };
+}
+
+fn grepExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const pattern = (try getString(input, "pattern")) orelse return errorOutput(arena, "grep: missing 'pattern'", .{});
+    const raw_path = (try getString(input, "path")) orelse return errorOutput(arena, "grep: missing 'path'", .{});
+    const path = validatePath(settings, raw_path) catch |e| return errorOutput(arena, "grep: {s}", .{@errorName(e)});
+    const max_results: usize = if (try getInt(input, "max_results")) |m| @intCast(@max(m, 1)) else 100;
+    if (pattern.len == 0) return errorOutput(arena, "grep: pattern is empty", .{});
+
+    const cwd = Io.Dir.cwd();
+    const stat = cwd.statFile(settings.io, path, .{}) catch |e|
+        return errorOutput(arena, "grep: stat {s}: {s}", .{ path, @errorName(e) });
+
+    var out: std.ArrayList(u8) = .empty;
+    var hits: usize = 0;
+
+    switch (stat.kind) {
+        .file => try grepOneFile(settings, arena, &out, path, pattern, max_results, &hits),
+        .directory => {
+            var dir = cwd.openDir(settings.io, path, .{ .iterate = true }) catch |e|
+                return errorOutput(arena, "grep: open dir {s}: {s}", .{ path, @errorName(e) });
+            defer dir.close(settings.io);
+            var walker = try dir.walk(arena);
+            defer walker.deinit();
+            while (try walker.next(settings.io)) |entry| {
+                if (entry.kind != .file) continue;
+                const full = try std.fs.path.join(arena, &.{ path, entry.path });
+                grepOneFile(settings, arena, &out, full, pattern, max_results, &hits) catch continue;
+                if (hits >= max_results) break;
+            }
+        },
+        else => return errorOutput(arena, "grep: {s} is not a regular file or directory", .{path}),
+    }
+
+    if (hits == 0) return .{ .text = try arena.dupe(u8, "(no matches)") };
+    if (hits >= max_results) try out.print(arena, "… (truncated at {d} matches)\n", .{max_results});
+    return .{ .text = out.items };
+}
+
+fn grepOneFile(
+    settings: *const Settings,
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    path: []const u8,
+    pattern: []const u8,
+    max_results: usize,
+    hits: *usize,
+) !void {
+    const cwd = Io.Dir.cwd();
+    const data = cwd.readFileAlloc(settings.io, path, arena, .limited(max_file_bytes)) catch return;
+    var line_iter = std.mem.splitScalar(u8, data, '\n');
+    var lineno: usize = 1;
+    while (line_iter.next()) |line| : (lineno += 1) {
+        if (std.mem.indexOf(u8, line, pattern) != null) {
+            try out.print(arena, "{s}:{d}:{s}\n", .{ path, lineno, line });
+            hits.* += 1;
+            if (hits.* >= max_results) return;
+        }
+    }
+}
+
+// ───────── bash ─────────
+
+const bash_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "command":{"type":"string","description":"Shell command to execute via /bin/sh -c."}
+    \\ },
+    \\ "required":["command"]}
+;
+
+pub fn buildBash(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, bash_schema_json, .{});
+    return .{
+        .name = "bash",
+        .description = "Run a shell command via `/bin/sh -c`. Returns exit code, stdout, and stderr.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = bashExecute,
+    };
+}
+
+fn bashExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const command = (try getString(input, "command")) orelse return errorOutput(arena, "bash: missing 'command'", .{});
+
+    const argv = &[_][]const u8{ "/bin/sh", "-c", command };
+    const result = std.process.run(arena, settings.io, .{
+        .argv = argv,
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    }) catch |e| return errorOutput(arena, "bash: spawn failed: {s}", .{@errorName(e)});
+
+    const exit_code: i32 = switch (result.term) {
+        .exited => |c| @intCast(c),
+        .signal => |s| -@as(i32, @intCast(@intFromEnum(s))),
+        else => -1,
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "exit: {d}\n", .{exit_code});
+    if (result.stdout.len > 0) try out.print(arena, "--- stdout ---\n{s}", .{result.stdout});
+    if (result.stderr.len > 0) {
+        if (result.stdout.len > 0 and !std.mem.endsWith(u8, result.stdout, "\n")) try out.append(arena, '\n');
+        try out.print(arena, "--- stderr ---\n{s}", .{result.stderr});
+    }
+    return .{ .text = out.items, .is_error = exit_code != 0 };
+}
+
+// ───────── shared input helpers ─────────
+
+fn getString(value: std.json.Value, field: []const u8) !?[]const u8 {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.NotAnObject,
+    };
+    const v = obj.get(field) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn getInt(value: std.json.Value, field: []const u8) !?i64 {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.NotAnObject,
+    };
+    const v = obj.get(field) orelse return null;
+    return switch (v) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => null,
+    };
+}
+
+// ───────── tests ─────────
+
+const testing = std.testing;
+
+fn jsonObj(a: std.mem.Allocator, kv: anytype) !std.json.Value {
+    var obj: std.json.ObjectMap = .empty;
+    inline for (std.meta.fields(@TypeOf(kv))) |f| {
+        const v = @field(kv, f.name);
+        const json_v: std.json.Value = switch (@TypeOf(v)) {
+            []const u8 => .{ .string = v },
+            comptime_int => .{ .integer = v },
+            else => @compileError("unsupported test arg type for " ++ f.name),
+        };
+        try obj.put(a, f.name, json_v);
+    }
+    return .{ .object = obj };
+}
+
+fn testSettings() Settings {
+    return .{ .io = testing.io, .unsafe = true };
+}
+
+test "validatePath: refuses absolute path in safe mode" {
+    const settings: Settings = .{ .io = testing.io, .unsafe = false };
+    try testing.expectError(Error.PathOutsideCwd, validatePath(&settings, "/etc/passwd"));
+}
+
+test "validatePath: refuses .. that escapes" {
+    const settings: Settings = .{ .io = testing.io, .unsafe = false };
+    try testing.expectError(Error.PathOutsideCwd, validatePath(&settings, "../etc/passwd"));
+    try testing.expectError(Error.PathOutsideCwd, validatePath(&settings, "a/../../b"));
+}
+
+test "validatePath: allows .. that stays inside" {
+    const settings: Settings = .{ .io = testing.io, .unsafe = false };
+    _ = try validatePath(&settings, "a/b/../c");
+}
+
+test "validatePath: allows anything in unsafe mode" {
+    const settings: Settings = .{ .io = testing.io, .unsafe = true };
+    _ = try validatePath(&settings, "/etc/passwd");
+    _ = try validatePath(&settings, "../../../escape");
+}
+
+test "read_file + write_file roundtrip in tmp dir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const tmp_path = try tmp.dir.realpathAlloc(a, ".");
+    const file_path = try std.fs.path.join(a, &.{ tmp_path, "hello.txt" });
+
+    const wf = try buildWriteFile(a, &settings);
+    const rf = try buildReadFile(a, &settings);
+
+    const wf_input = try jsonObj(a, .{ .path = @as([]const u8, file_path), .content = @as([]const u8, "hello world\n") });
+    const wf_out = try wf.execute(@constCast(@ptrCast(&settings)), a, wf_input);
+    try testing.expect(!wf_out.is_error);
+
+    const rf_input = try jsonObj(a, .{ .path = @as([]const u8, file_path) });
+    const rf_out = try rf.execute(@constCast(@ptrCast(&settings)), a, rf_input);
+    try testing.expectEqualStrings("hello world\n", rf_out.text);
+}
+
+test "edit: replaces unique match" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const tmp_path = try tmp.dir.realpathAlloc(a, ".");
+    const file_path = try std.fs.path.join(a, &.{ tmp_path, "edit.txt" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "edit.txt", .data = "before middle after\n" });
+
+    const ed = try buildEdit(a, &settings);
+    const input = try jsonObj(a, .{
+        .path = @as([]const u8, file_path),
+        .old_string = @as([]const u8, "middle"),
+        .new_string = @as([]const u8, "MIDDLE"),
+    });
+    const out = try ed.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+
+    const after = try tmp.dir.readFileAlloc(testing.io, "edit.txt", a, .limited(1024));
+    try testing.expectEqualStrings("before MIDDLE after\n", after);
+}
+
+test "edit: errors when match is non-unique" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const tmp_path = try tmp.dir.realpathAlloc(a, ".");
+    const file_path = try std.fs.path.join(a, &.{ tmp_path, "dup.txt" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "dup.txt", .data = "x x\n" });
+
+    const ed = try buildEdit(a, &settings);
+    const input = try jsonObj(a, .{
+        .path = @as([]const u8, file_path),
+        .old_string = @as([]const u8, "x"),
+        .new_string = @as([]const u8, "y"),
+    });
+    const out = try ed.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "more than once") != null);
+}
+
+test "bash: captures stdout and exit code" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const b = try buildBash(a, &settings);
+    const input = try jsonObj(a, .{ .command = @as([]const u8, "echo hi") });
+    const out = try b.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "exit: 0") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "hi") != null);
+}
+
+test "bash: nonzero exit marked is_error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const b = try buildBash(a, &settings);
+    const input = try jsonObj(a, .{ .command = @as([]const u8, "exit 7") });
+    const out = try b.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "exit: 7") != null);
+}
