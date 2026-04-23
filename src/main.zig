@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const velk = @import("velk");
 const cli = @import("cli.zig");
+const anthropic = @import("anthropic.zig");
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -37,14 +38,58 @@ pub fn main(init: std.process.Init) !void {
                 try errw.flush();
                 std.process.exit(1);
             };
-            _ = api_key; // phase 2 will use this for the request
 
-            try w.print("(phase 2 will send the request)\n", .{});
-            try w.print("  model:      {s}\n", .{opts.model});
-            try w.print("  max_tokens: {d}\n", .{opts.max_tokens});
-            if (opts.system) |s| try w.print("  system:     {s}\n", .{s});
-            try w.print("  prompt:     {s}\n", .{opts.prompt});
+            var client: anthropic.Client = .init(init.gpa, init.io, api_key);
+            defer client.deinit();
+
+            const req: anthropic.MessagesRequest = .{
+                .model = opts.model,
+                .max_tokens = opts.max_tokens,
+                .system = opts.system,
+                .messages = &.{.{ .role = "user", .content = opts.prompt }},
+            };
+
+            var result = client.createMessage(req) catch |err| {
+                try renderClientError(errw, err, &client);
+                try errw.flush();
+                std.process.exit(1);
+            };
+            defer result.deinit();
+
+            const resp = result.value();
+            for (resp.content) |block| {
+                if (block.text) |t| try w.writeAll(t);
+            }
+            try w.writeAll("\n");
             try w.flush();
         },
+    }
+}
+
+fn renderClientError(errw: *Io.Writer, err: anyerror, client: *const anthropic.Client) !void {
+    switch (err) {
+        anthropic.Error.ApiError => {
+            // Try to parse the captured body as a structured ApiError; if that
+            // fails, dump it raw so the user still sees what happened.
+            const body = client.last_error_body orelse "";
+            const parsed = std.json.parseFromSlice(
+                anthropic.ApiError,
+                client.gpa,
+                body,
+                .{ .ignore_unknown_fields = true },
+            ) catch {
+                try errw.print("velk: API error\n{s}\n", .{body});
+                return;
+            };
+            defer parsed.deinit();
+            try errw.print("velk: API error ({s}): {s}\n", .{
+                parsed.value.@"error".type,
+                parsed.value.@"error".message,
+            });
+        },
+        anthropic.Error.ResponseParseFailure => {
+            try errw.print("velk: could not parse API response\n{s}\n", .{client.last_error_body orelse ""});
+        },
+        else => try errw.print("velk: request failed: {s}\n", .{@errorName(err)}),
     }
 }
