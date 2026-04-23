@@ -66,7 +66,10 @@ pub fn parse(args: []const []const u8) Action {
         opts.prompt = p;
         return .{ .run = opts };
     }
-    return .help;
+    // No flags and no prompt: bare `velk` shows help.
+    // Flags but no prompt: user intent was clear, surface a real error.
+    if (args.len <= 1) return .help;
+    return errAction("missing prompt", null);
 }
 
 pub fn printHelp(w: anytype) !void {
@@ -225,4 +228,14 @@ test "parse: unknown flag errors" {
 test "parse: extra positional errors" {
     const e = try expectParseError(parse(&.{ "velk", "first", "second" }));
     try testing.expectEqualStrings("second", e.arg.?);
+}
+
+test "parse: flags without prompt errors (not help)" {
+    const e = try expectParseError(parse(&.{ "velk", "--max-tokens", "10000" }));
+    try testing.expectEqualStrings("missing prompt", e.message);
+}
+
+test "parse: -m without prompt errors" {
+    const e = try expectParseError(parse(&.{ "velk", "-m", "claude-sonnet-4-6" }));
+    try testing.expectEqualStrings("missing prompt", e.message);
 }
