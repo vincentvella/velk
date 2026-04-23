@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const mvzr = @import("mvzr");
 const tool = @import("tool.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
@@ -302,7 +303,7 @@ fn lsExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) 
 const grep_schema_json: []const u8 =
     \\{"type":"object",
     \\ "properties":{
-    \\   "pattern":{"type":"string","description":"Literal substring to search for. Not a regex."},
+    \\   "pattern":{"type":"string","description":"Regular expression pattern. Supports common metacharacters (^$.*+?[]|()), character classes, and anchors."},
     \\   "path":{"type":"string","description":"File or directory to search. Directories are walked recursively."},
     \\   "max_results":{"type":"integer","description":"Optional cap on result lines (default 100)."}
     \\ },
@@ -313,7 +314,7 @@ pub fn buildGrep(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool
     const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, grep_schema_json, .{});
     return .{
         .name = "grep",
-        .description = "Search for a literal substring in a file, or recursively across a directory. Returns lines as `path:lineno:content`.",
+        .description = "Regex-search a file or recursively across a directory. Returns matches as `path:lineno:content`.",
         .input_schema = schema,
         .context = @constCast(@ptrCast(settings)),
         .execute = grepExecute,
@@ -328,6 +329,8 @@ fn grepExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
     const max_results: usize = if (try getInt(input, "max_results")) |m| @intCast(@max(m, 1)) else 100;
     if (pattern.len == 0) return errorOutput(arena, "grep: pattern is empty", .{});
 
+    var regex = mvzr.compile(pattern) orelse return errorOutput(arena, "grep: invalid regex: {s}", .{pattern});
+
     const cwd = Io.Dir.cwd();
     const stat = cwd.statFile(settings.io, path, .{}) catch |e|
         return errorOutput(arena, "grep: stat {s}: {s}", .{ path, @errorName(e) });
@@ -336,7 +339,7 @@ fn grepExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
     var hits: usize = 0;
 
     switch (stat.kind) {
-        .file => try grepOneFile(settings, arena, &out, path, pattern, max_results, &hits),
+        .file => try grepOneFile(settings, arena, &out, path, &regex, max_results, &hits),
         .directory => {
             var dir = cwd.openDir(settings.io, path, .{ .iterate = true }) catch |e|
                 return errorOutput(arena, "grep: open dir {s}: {s}", .{ path, @errorName(e) });
@@ -346,7 +349,7 @@ fn grepExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
             while (try walker.next(settings.io)) |entry| {
                 if (entry.kind != .file) continue;
                 const full = try std.fs.path.join(arena, &.{ path, entry.path });
-                grepOneFile(settings, arena, &out, full, pattern, max_results, &hits) catch continue;
+                grepOneFile(settings, arena, &out, full, &regex, max_results, &hits) catch continue;
                 if (hits >= max_results) break;
             }
         },
@@ -363,7 +366,7 @@ fn grepOneFile(
     arena: std.mem.Allocator,
     out: *std.ArrayList(u8),
     path: []const u8,
-    pattern: []const u8,
+    regex: *const mvzr.Regex,
     max_results: usize,
     hits: *usize,
 ) !void {
@@ -372,7 +375,7 @@ fn grepOneFile(
     var line_iter = std.mem.splitScalar(u8, data, '\n');
     var lineno: usize = 1;
     while (line_iter.next()) |line| : (lineno += 1) {
-        if (std.mem.indexOf(u8, line, pattern) != null) {
+        if (regex.match(line) != null) {
             try out.print(arena, "{s}:{d}:{s}\n", .{ path, lineno, line });
             hits.* += 1;
             if (hits.* >= max_results) return;
@@ -385,10 +388,13 @@ fn grepOneFile(
 const bash_schema_json: []const u8 =
     \\{"type":"object",
     \\ "properties":{
-    \\   "command":{"type":"string","description":"Shell command to execute via /bin/sh -c."}
+    \\   "command":{"type":"string","description":"Shell command to execute via /bin/sh -c."},
+    \\   "timeout_ms":{"type":"integer","description":"Optional wall-clock timeout in milliseconds. Defaults to 30000."}
     \\ },
     \\ "required":["command"]}
 ;
+
+const default_bash_timeout_ms: i64 = 30_000;
 
 pub fn buildBash(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
     const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, bash_schema_json, .{});
@@ -404,13 +410,25 @@ pub fn buildBash(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool
 fn bashExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
     const settings = settingsFromCtx(ctx);
     const command = (try getString(input, "command")) orelse return errorOutput(arena, "bash: missing 'command'", .{});
+    const timeout_ms: i64 = (try getInt(input, "timeout_ms")) orelse default_bash_timeout_ms;
+
+    const timeout: Io.Timeout = if (timeout_ms <= 0) .none else .{
+        .duration = .{
+            .raw = Io.Duration.fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        },
+    };
 
     const argv = &[_][]const u8{ "/bin/sh", "-c", command };
     const result = std.process.run(arena, settings.io, .{
         .argv = argv,
         .stdout_limit = .limited(max_output_bytes),
         .stderr_limit = .limited(max_output_bytes),
-    }) catch |e| return errorOutput(arena, "bash: spawn failed: {s}", .{@errorName(e)});
+        .timeout = timeout,
+    }) catch |e| switch (e) {
+        error.Timeout => return errorOutput(arena, "bash: timed out after {d}ms", .{timeout_ms}),
+        else => return errorOutput(arena, "bash: spawn failed: {s}", .{@errorName(e)}),
+    };
 
     const exit_code: i32 = switch (result.term) {
         .exited => |c| @intCast(c),
@@ -582,6 +600,65 @@ test "bash: captures stdout and exit code" {
     try testing.expect(!out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.text, "exit: 0") != null);
     try testing.expect(std.mem.indexOf(u8, out.text, "hi") != null);
+}
+
+test "bash: timeout kills a long-running command" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const b = try buildBash(a, &settings);
+    const input = try jsonObj(a, .{
+        .command = @as([]const u8, "sleep 5"),
+        .timeout_ms = 100,
+    });
+    const out = try b.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "timed out") != null);
+}
+
+test "grep: regex metacharacters match" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const tmp_path = try tmp.dir.realpathAlloc(a, ".");
+    const file_path = try std.fs.path.join(a, &.{ tmp_path, "grep.txt" });
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "grep.txt",
+        .data = "apple 123\nbanana ABC\ncherry 456\n",
+    });
+
+    const g = try buildGrep(a, &settings);
+    const input = try jsonObj(a, .{
+        .pattern = @as([]const u8, "[0-9]+"),
+        .path = @as([]const u8, file_path),
+    });
+    const out = try g.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "apple 123") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "cherry 456") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "banana") == null);
+}
+
+test "grep: invalid regex returns is_error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const g = try buildGrep(a, &settings);
+    const input = try jsonObj(a, .{
+        .pattern = @as([]const u8, "["),
+        .path = @as([]const u8, "."),
+    });
+    const out = try g.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "invalid regex") != null);
 }
 
 test "bash: nonzero exit marked is_error" {
