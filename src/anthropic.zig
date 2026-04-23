@@ -1,5 +1,6 @@
 pub const types = @import("anthropic/types.zig");
 pub const client = @import("anthropic/client.zig");
+pub const sse = @import("anthropic/sse.zig");
 
 pub const Client = client.Client;
 pub const Result = client.Result;
@@ -15,4 +16,5 @@ pub const ApiError = types.ApiError;
 test {
     _ = types;
     _ = client;
+    _ = sse;
 }

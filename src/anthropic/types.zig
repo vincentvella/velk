@@ -12,6 +12,27 @@ pub const MessagesRequest = struct {
     max_tokens: u32,
     messages: []const Message,
     system: ?[]const u8 = null,
+    /// Set to true for SSE streaming responses. Encoded only when non-null
+    /// (request serialization uses `emit_null_optional_fields = false`).
+    stream: ?bool = null,
+};
+
+/// Decoded `data:` payload of a `content_block_delta` SSE event.
+pub const ContentBlockDelta = struct {
+    type: []const u8,
+    index: u32,
+    delta: Delta,
+
+    pub const Delta = struct {
+        type: []const u8,
+        text: ?[]const u8 = null,
+    };
+};
+
+/// Decoded `data:` payload of a streaming `error` event.
+pub const StreamError = struct {
+    type: []const u8,
+    @"error": ApiError.Detail,
 };
 
 pub const ContentBlock = struct {
@@ -59,6 +80,20 @@ test "MessagesRequest: minimal serialization" {
     defer testing.allocator.free(json);
     try testing.expectEqualStrings(
         \\{"model":"claude-opus-4-7","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}
+    , json);
+}
+
+test "MessagesRequest: stream=true serializes the field" {
+    const req: MessagesRequest = .{
+        .model = "x",
+        .max_tokens = 10,
+        .messages = &.{.{ .role = "user", .content = "hi" }},
+        .stream = true,
+    };
+    const json = try std.json.Stringify.valueAlloc(testing.allocator, req, .{ .emit_null_optional_fields = false });
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        \\{"model":"x","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"stream":true}
     , json);
 }
 
