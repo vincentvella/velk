@@ -3,6 +3,8 @@ const Io = std.Io;
 const velk = @import("velk");
 const cli = @import("cli.zig");
 const anthropic = @import("anthropic.zig");
+const tool = @import("tool.zig");
+const agent = @import("agent.zig");
 
 fn handleSigInt(_: std.posix.SIG) callconv(.c) void {
     // Signal-safe only: write a final newline so the shell prompt lands on a
@@ -23,6 +25,7 @@ fn installSigIntHandler() void {
 
 pub fn main(init: std.process.Init) !void {
     installSigIntHandler();
+
     var stdout_buf: [4096]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), init.io, &stdout_buf);
     const w = &stdout.interface;
@@ -60,80 +63,26 @@ pub fn main(init: std.process.Init) !void {
             var client: anthropic.Client = .init(init.gpa, init.io, api_key);
             defer client.deinit();
 
-            const req: anthropic.MessagesRequest = .{
+            const tools: []const tool.Tool = &.{try tool.buildEcho(arena)};
+
+            agent.run(arena, &client, w, errw, .{
                 .model = opts.model,
                 .max_tokens = opts.max_tokens,
                 .system = opts.system,
-                .messages = &.{.{ .role = "user", .content = opts.prompt }},
-            };
-
-            var stream_ctx: StreamCtx = .{ .w = w, .gpa = init.gpa };
-            client.streamMessage(req, &stream_ctx, StreamCtx.onEvent) catch |err| {
-                if (stream_ctx.wrote_any) try w.writeAll("\n");
-                try w.flush();
+                .prompt = opts.prompt,
+                .tools = tools,
+            }) catch |err| {
                 try renderClientError(errw, err, &client);
                 try errw.flush();
                 std.process.exit(1);
             };
-
-            if (stream_ctx.err) |e| return e;
-            if (stream_ctx.wrote_any) try w.writeAll("\n");
-            try w.flush();
         },
     }
 }
 
-const StreamCtx = struct {
-    w: *Io.Writer,
-    gpa: std.mem.Allocator,
-    wrote_any: bool = false,
-    err: ?anyerror = null,
-
-    fn onEvent(self: *StreamCtx, ev: anthropic.sse.Event) anyerror!void {
-        // Ignore events the user doesn't see; only text deltas reach stdout.
-        // We swallow JSON parse errors per-event so a single malformed delta
-        // doesn't tear down the stream — but we remember the first one to
-        // surface after the stream completes.
-        if (std.mem.eql(u8, ev.name, "content_block_delta")) {
-            const parsed = std.json.parseFromSlice(
-                anthropic.types.ContentBlockDelta,
-                self.gpa,
-                ev.data,
-                .{ .ignore_unknown_fields = true },
-            ) catch |e| {
-                if (self.err == null) self.err = e;
-                return;
-            };
-            defer parsed.deinit();
-            if (parsed.value.delta.text) |t| {
-                try self.w.writeAll(t);
-                try self.w.flush();
-                self.wrote_any = true;
-            }
-        } else if (std.mem.eql(u8, ev.name, "error")) {
-            const parsed = std.json.parseFromSlice(
-                anthropic.types.StreamError,
-                self.gpa,
-                ev.data,
-                .{ .ignore_unknown_fields = true },
-            ) catch return;
-            defer parsed.deinit();
-            // Stash via err so main can surface after teardown.
-            self.err = error.StreamingApiError;
-            // Best-effort: write the message so the user sees it inline.
-            std.debug.print("\nvelk: API error ({s}): {s}\n", .{
-                parsed.value.@"error".type,
-                parsed.value.@"error".message,
-            });
-        }
-    }
-};
-
 fn renderClientError(errw: *Io.Writer, err: anyerror, client: *const anthropic.Client) !void {
     switch (err) {
         anthropic.Error.ApiError => {
-            // Try to parse the captured body as a structured ApiError; if that
-            // fails, dump it raw so the user still sees what happened.
             const body = client.last_error_body orelse "";
             const parsed = std.json.parseFromSlice(
                 anthropic.ApiError,
@@ -152,6 +101,9 @@ fn renderClientError(errw: *Io.Writer, err: anyerror, client: *const anthropic.C
         },
         anthropic.Error.ResponseParseFailure => {
             try errw.print("velk: could not parse API response\n{s}\n", .{client.last_error_body orelse ""});
+        },
+        agent.Error.IterationBudgetExceeded => {
+            try errw.print("velk: hit iteration budget without end_turn\n", .{});
         },
         else => try errw.print("velk: request failed: {s}\n", .{@errorName(err)}),
     }
