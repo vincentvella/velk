@@ -4,7 +4,25 @@ const velk = @import("velk");
 const cli = @import("cli.zig");
 const anthropic = @import("anthropic.zig");
 
+fn handleSigInt(_: std.posix.SIG) callconv(.c) void {
+    // Signal-safe only: write a final newline so the shell prompt lands on a
+    // fresh line, then _exit (NOT std.process.exit, which runs cleanup that
+    // is not async-safe). 130 = 128 + SIGINT, the conventional shell code.
+    _ = std.c.write(1, "\n", 1);
+    std.c._exit(130);
+}
+
+fn installSigIntHandler() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = handleSigInt },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &act, null);
+}
+
 pub fn main(init: std.process.Init) !void {
+    installSigIntHandler();
     var stdout_buf: [4096]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), init.io, &stdout_buf);
     const w = &stdout.interface;
