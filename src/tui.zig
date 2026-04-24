@@ -14,9 +14,32 @@ const persist = @import("persist.zig");
 const cost = @import("cost.zig");
 
 const Event = union(enum) {
+    // vaxis-posted events
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
+
+    // Agent-thread-posted events. Slices are heap-allocated via gpa
+    // and owned by the main thread once dequeued; the handler frees.
+    a_text: []u8,
+    a_tool_call: AgentToolCall,
+    a_tool_result: AgentToolResult,
+    a_usage: provider_mod.Usage,
+    a_done: WorkerResult,
+};
+
+const AgentToolCall = struct {
+    name: []u8,
+    input: []u8,
+};
+
+const AgentToolResult = struct {
+    text: []u8,
+    is_error: bool,
+};
+
+const WorkerResult = struct {
+    err: ?anyerror = null,
 };
 
 const Block = struct {
@@ -65,11 +88,96 @@ const Selection = struct {
 
 const AutoScroll = enum { none, up, down };
 
+const LoopT = vaxis.Loop(Event);
+
+/// Per-turn agent execution state. While a turn is in flight, the worker
+/// runs on its own task (via Io.concurrent). Sink callbacks alloc strings
+/// in `gpa` and post Event variants to the loop queue; the main thread
+/// drains them and updates TUI state. Cancel is sub-ms via Future.cancel.
+const Turn = struct {
+    future: Io.Future(WorkerResult),
+    shim: *ShimSink,
+    /// Owned by gpa; freed on turn cleanup (after future has been awaited).
+    prompt: []u8,
+};
+
+const ShimSink = struct {
+    gpa: std.mem.Allocator,
+    loop: *LoopT,
+
+    fn sink(self: *ShimSink) agent.Sink {
+        return .{
+            .ctx = self,
+            .onText = onText,
+            .onToolCall = onToolCall,
+            .onToolResult = onToolResult,
+            .onTurnEnd = onTurnEnd,
+        };
+    }
+
+    fn cast(ctx: ?*anyopaque) *ShimSink {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn onText(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        const self = cast(ctx);
+        const owned = try self.gpa.dupe(u8, text);
+        errdefer self.gpa.free(owned);
+        try self.loop.postEvent(.{ .a_text = owned });
+    }
+
+    fn onToolCall(ctx: ?*anyopaque, name: []const u8, input_json: []const u8) anyerror!void {
+        const self = cast(ctx);
+        const name_dup = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(name_dup);
+        const input_dup = try self.gpa.dupe(u8, input_json);
+        errdefer self.gpa.free(input_dup);
+        try self.loop.postEvent(.{ .a_tool_call = .{ .name = name_dup, .input = input_dup } });
+    }
+
+    fn onToolResult(ctx: ?*anyopaque, text: []const u8, is_error: bool) anyerror!void {
+        const self = cast(ctx);
+        const text_dup = try self.gpa.dupe(u8, text);
+        errdefer self.gpa.free(text_dup);
+        try self.loop.postEvent(.{ .a_tool_result = .{ .text = text_dup, .is_error = is_error } });
+    }
+
+    fn onTurnEnd(ctx: ?*anyopaque, usage: provider_mod.Usage) anyerror!void {
+        const self = cast(ctx);
+        try self.loop.postEvent(.{ .a_usage = usage });
+    }
+};
+
+/// Worker function invoked on a separate task. Returns a `WorkerResult`
+/// (in the Future) and ALSO posts `a_done` so the main thread learns to
+/// await without polling.
+fn agentWorker(
+    sess: *session_mod.Session,
+    prompt: []const u8,
+    shim: *ShimSink,
+) WorkerResult {
+    var result: WorkerResult = .{};
+    sess.ask(prompt, shim.sink()) catch |err| {
+        result.err = err;
+    };
+    shim.loop.postEvent(.{ .a_done = result }) catch {};
+    return result;
+}
+
 const Tui = struct {
     arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
     vx: *vaxis.Vaxis,
     tty: *vaxis.Tty,
+    loop: *LoopT,
+    sess: *session_mod.Session,
     model: []const u8,
+    turn: ?Turn = null,
+    /// Owned by run(); scoped so `all_lines` stays valid between renders
+    /// (selection extraction reads it after a render returns). Reset
+    /// at the start of each render so memory is reclaimed.
+    lines_arena: *std.heap.ArenaAllocator,
     blocks: std.ArrayList(Block) = .empty,
     assistant_buf: std.ArrayList(u8) = .empty,
     has_open_assistant: bool = false,
@@ -127,11 +235,18 @@ const Tui = struct {
 
         const scroll_h: u16 = h - 2;
 
+        // Reset (not deinit) so previous render's lines memory is
+        // reclaimed AND `all_lines` is repointed to a fresh slab that
+        // outlives this render call. Mouse handlers that read
+        // `tui.all_lines` between renders see valid bytes.
+        _ = self.lines_arena.reset(.retain_capacity);
+        const lines_alloc = self.lines_arena.allocator();
+
         var lines: std.ArrayList(RenderedLine) = .empty;
-        for (self.blocks.items) |block| try wrapBlockInto(self.arena, &lines, block, w);
+        for (self.blocks.items) |block| try wrapBlockInto(lines_alloc, &lines, block, w);
         if (self.has_open_assistant) {
             const tmp: Block = .{ .kind = .assistant_text, .text = self.assistant_buf.items };
-            try wrapBlockInto(self.arena, &lines, tmp, w);
+            try wrapBlockInto(lines_alloc, &lines, tmp, w);
         }
 
         const total = lines.items.len;
@@ -162,11 +277,11 @@ const Tui = struct {
         const sep_row: u16 = h - 2;
         var sep_buf: std.ArrayList(u8) = .empty;
         if (self.scroll_offset > 0) {
-            try sep_buf.print(self.arena, "── ↑ {d} line(s) above ", .{self.scroll_offset});
+            try sep_buf.print(lines_alloc, "── ↑ {d} line(s) above ", .{self.scroll_offset});
         } else {
-            try sep_buf.appendSlice(self.arena, "── ");
+            try sep_buf.appendSlice(lines_alloc, "── ");
         }
-        while (sep_buf.items.len < w) try sep_buf.append(self.arena, '-');
+        while (sep_buf.items.len < w) try sep_buf.append(lines_alloc, '-');
         _ = win.print(&.{.{ .text = sep_buf.items[0..@min(sep_buf.items.len, w)], .style = .{ .fg = .{ .index = 8 } } }}, .{
             .row_offset = sep_row,
             .wrap = .none,
@@ -189,61 +304,64 @@ const Tui = struct {
         try self.vx.render(self.tty.writer());
     }
 
-    fn sink(self: *Tui) agent.Sink {
-        return .{
-            .ctx = self,
-            .onText = onText,
-            .onToolCall = onToolCall,
-            .onToolResult = onToolResult,
-            .onTurnEnd = onTurnEnd,
+    /// Spawn the agent worker on its own task. Caller has already pushed
+    /// the user prompt as a block and set `busy = true`. The shim and
+    /// prompt are owned by gpa and freed when the turn cleans up.
+    fn startTurn(self: *Tui, prompt: []u8) !void {
+        const shim = try self.gpa.create(ShimSink);
+        shim.* = .{ .gpa = self.gpa, .loop = self.loop };
+        const future = Io.concurrent(self.io, agentWorker, .{ self.sess, prompt, shim }) catch |e| {
+            self.gpa.destroy(shim);
+            return e;
         };
+        self.turn = .{ .future = future, .shim = shim, .prompt = prompt };
     }
 
-    fn cast(ctx: ?*anyopaque) *Tui {
-        return @ptrCast(@alignCast(ctx.?));
-    }
-
-    fn onText(ctx: ?*anyopaque, text: []const u8) anyerror!void {
-        const self = cast(ctx);
-        try self.appendAssistantText(text);
-        try self.render();
-    }
-
-    fn onToolCall(ctx: ?*anyopaque, name: []const u8, input_json: []const u8) anyerror!void {
-        const self = cast(ctx);
-        var preview = input_json;
-        if (preview.len > 200) preview = preview[0..200];
-        const line = try std.fmt.allocPrint(self.arena, "→ {s}({s})", .{ name, preview });
-        try self.pushBlock(.tool_call, line);
-        try self.render();
-    }
-
-    fn onToolResult(ctx: ?*anyopaque, text: []const u8, is_error: bool) anyerror!void {
-        const self = cast(ctx);
-        var preview = text;
-        if (preview.len > 200) preview = preview[0..200];
-        const ellipsis: []const u8 = if (text.len > 200) "…" else "";
-        const line = try std.fmt.allocPrint(self.arena, "← {s}{s}", .{ preview, ellipsis });
-        try self.pushBlock(if (is_error) .tool_result_error else .tool_result, line);
-        try self.render();
-    }
-
-    fn onTurnEnd(ctx: ?*anyopaque, usage: provider_mod.Usage) anyerror!void {
-        const self = cast(ctx);
-        try self.flushOpenAssistant();
-        if (usage.input_tokens > 0 or usage.output_tokens > 0) {
-            var buf: std.ArrayList(u8) = .empty;
-            try buf.print(self.arena, "[tokens: {d} in / {d} out", .{ usage.input_tokens, usage.output_tokens });
-            if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0) {
-                try buf.print(self.arena, " · cache {d} read / {d} write", .{ usage.cache_read_tokens, usage.cache_creation_tokens });
-            }
-            if (cost.turnCost(self.model, usage)) |c| {
-                try buf.print(self.arena, " · ${d:.4}", .{c});
-            }
-            try buf.append(self.arena, ']');
-            try self.pushBlock(.notice, buf.items);
+    /// Run after we've received the worker's `a_done` event. Awaits the
+    /// future (non-blocking — worker has already returned), frees the
+    /// per-turn allocations, clears `busy`, and renders any trailing
+    /// assistant text.
+    fn finishTurn(self: *Tui) !void {
+        if (self.turn) |*t| {
+            _ = t.future.await(self.io);
+            self.gpa.free(t.prompt);
+            self.gpa.destroy(t.shim);
+            self.turn = null;
         }
-        try self.render();
+        self.busy = false;
+        try self.flushOpenAssistant();
+    }
+
+    /// Cancel the in-flight turn (if any). Blocks briefly while the
+    /// worker unwinds — Future.cancel sends a cancel signal that the
+    /// next Cancelable IO call in the worker raises as
+    /// `error.Canceled`.
+    fn cancelTurn(self: *Tui) !void {
+        if (self.turn) |*t| {
+            _ = t.future.cancel(self.io);
+            self.gpa.free(t.prompt);
+            self.gpa.destroy(t.shim);
+            self.turn = null;
+        }
+        self.busy = false;
+        try self.flushOpenAssistant();
+    }
+
+    /// Append a turn-summary notice with token counts (and cost when
+    /// the model is in our price table). Called when an `a_usage` event
+    /// arrives from the worker.
+    fn pushUsageNotice(self: *Tui, usage: provider_mod.Usage) !void {
+        if (usage.input_tokens == 0 and usage.output_tokens == 0) return;
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.print(self.arena, "[tokens: {d} in / {d} out", .{ usage.input_tokens, usage.output_tokens });
+        if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0) {
+            try buf.print(self.arena, " · cache {d} read / {d} write", .{ usage.cache_read_tokens, usage.cache_creation_tokens });
+        }
+        if (cost.turnCost(self.model, usage)) |c| {
+            try buf.print(self.arena, " · ${d:.4}", .{c});
+        }
+        try buf.append(self.arena, ']');
+        try self.pushBlock(.notice, buf.items);
     }
 };
 
@@ -360,6 +478,17 @@ pub fn run(
     sess: *session_mod.Session,
     model: []const u8,
 ) !void {
+    // Dedicated arena for TUI-state allocations (blocks, history,
+    // input buffer). Separate from `arena` (which the agent worker
+    // shares via session.arena) so the two threads never touch the
+    // same allocator.
+    var tui_arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer tui_arena_state.deinit();
+    const tui_arena = tui_arena_state.allocator();
+
+    var lines_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer lines_arena.deinit();
+
     var tty_buffer: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buffer);
     defer tty.deinit();
@@ -377,21 +506,32 @@ pub fn run(
     try vx.setMouseMode(tty.writer(), true);
     defer vx.setMouseMode(tty.writer(), false) catch {};
 
-    var tui: Tui = .{ .arena = arena, .vx = &vx, .tty = &tty, .model = model };
+    var tui: Tui = .{
+        .arena = tui_arena,
+        .gpa = gpa,
+        .io = io,
+        .vx = &vx,
+        .tty = &tty,
+        .loop = &loop,
+        .sess = sess,
+        .model = model,
+        .lines_arena = &lines_arena,
+    };
+    defer tui.cancelTurn() catch {}; // ensure worker is awaited if user exits mid-turn
 
     // Hydrate input history from disk so up-arrow recall works across
     // launches. Failures are non-fatal — first run, no XDG_STATE_HOME,
     // etc — we just skip persistence and run with an empty history.
     const history_path = persist.historyPath(arena, env_map) catch null;
     if (history_path) |path| {
-        if (persist.loadHistory(arena, io, path)) |hist| {
-            try tui.input_history.appendSlice(arena, hist);
+        if (persist.loadHistory(tui_arena, io, path)) |hist| {
+            try tui.input_history.appendSlice(tui_arena, hist);
         } else |_| {}
     }
 
     try tui.pushBlock(
         .notice,
-        "velk REPL — Ctrl-D exit · Enter send · ↑/↓ history · PageUp/PageDown scroll · drag to select · mouse-up copies to clipboard",
+        "velk REPL — Ctrl-D exit · Ctrl-C abort/cancel · Enter send · ↑/↓ history · PageUp/PageDown scroll · drag to select · mouse-up copies to clipboard",
     );
     try tui.render();
 
@@ -485,8 +625,13 @@ pub fn run(
                         const n = tui.selection.normalized();
                         const has_span = n.start.line != n.end.line or n.start.col != n.end.col;
                         if (has_span) {
-                            const text = try extractSelection(arena, tui.all_lines, tui.selection);
-                            if (text.len > 0) try copyToClipboard(arena, tty.writer(), text);
+                            // Per-call scratch arena: the selection text
+                            // lives just long enough to base64-encode and
+                            // ship to the clipboard.
+                            var sa: std.heap.ArenaAllocator = .init(gpa);
+                            defer sa.deinit();
+                            const text = try extractSelection(sa.allocator(), tui.all_lines, tui.selection);
+                            if (text.len > 0) try copyToClipboard(sa.allocator(), tty.writer(), text);
                         } else {
                             tui.selection.active = false;
                             try tui.render();
@@ -498,6 +643,14 @@ pub fn run(
             .key_press => |key| {
                 if (key.matches('d', .{ .ctrl = true })) return;
                 if (key.matches('c', .{ .ctrl = true })) {
+                    // Order of precedence: abort in-flight turn → clear
+                    // selection → clear input → exit on empty.
+                    if (tui.turn != null) {
+                        try tui.cancelTurn();
+                        try tui.pushBlock(.notice, "[aborted]");
+                        try tui.render();
+                        continue;
+                    }
                     if (tui.selection.active) {
                         tui.selection.active = false;
                         try tui.render();
@@ -554,7 +707,7 @@ pub fn run(
                     tui.history_idx = next_idx;
                     const entry = tui.input_history.items[tui.input_history.items.len - 1 - next_idx];
                     tui.input.clearRetainingCapacity();
-                    try tui.input.appendSlice(arena, entry);
+                    try tui.input.appendSlice(tui_arena, entry);
                     try tui.render();
                     continue;
                 }
@@ -567,7 +720,7 @@ pub fn run(
                             tui.history_idx = i - 1;
                             const entry = tui.input_history.items[tui.input_history.items.len - i];
                             tui.input.clearRetainingCapacity();
-                            try tui.input.appendSlice(arena, entry);
+                            try tui.input.appendSlice(tui_arena, entry);
                         }
                         try tui.render();
                     }
@@ -575,22 +728,26 @@ pub fn run(
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     if (tui.input.items.len == 0) continue;
-                    const prompt = try arena.dupe(u8, tui.input.items);
-                    try tui.input_history.append(arena, prompt);
+                    // Two copies of the prompt: one for tui's history (in
+                    // tui_arena, lives for the session) and one for the
+                    // worker (in gpa, lives until turn cleanup).
+                    const prompt_for_history = try tui_arena.dupe(u8, tui.input.items);
+                    const prompt_for_worker = try gpa.dupe(u8, tui.input.items);
+                    try tui.input_history.append(tui_arena, prompt_for_history);
                     tui.history_idx = null;
-                    if (history_path) |path| persist.appendHistory(arena, io, path, prompt) catch {};
-                    try tui.pushBlock(.user_prompt, prompt);
+                    if (history_path) |path| persist.appendHistory(tui_arena, io, path, prompt_for_history) catch {};
+                    try tui.pushBlock(.user_prompt, prompt_for_history);
                     tui.input.clearRetainingCapacity();
                     tui.busy = true;
                     try tui.render();
 
-                    sess.ask(prompt, tui.sink()) catch |err| {
-                        const msg = try std.fmt.allocPrint(arena, "error: {s}", .{@errorName(err)});
+                    tui.startTurn(prompt_for_worker) catch |err| {
+                        gpa.free(prompt_for_worker);
+                        const msg = try std.fmt.allocPrint(tui_arena, "error spawning agent: {s}", .{@errorName(err)});
                         try tui.pushBlock(.tool_result_error, msg);
+                        tui.busy = false;
+                        try tui.render();
                     };
-
-                    tui.busy = false;
-                    try tui.render();
                     continue;
                 }
                 if (key.matches(vaxis.Key.backspace, .{})) {
@@ -599,9 +756,56 @@ pub fn run(
                     continue;
                 }
                 if (key.text) |t| {
-                    try tui.input.appendSlice(arena, t);
+                    try tui.input.appendSlice(tui_arena, t);
                     try tui.render();
                 }
+            },
+
+            // ── agent-thread events ───────────────────────────────
+            // Discard if the turn was canceled out from under us
+            // (events queued before cancel arrived are stale).
+            .a_text => |text| {
+                defer gpa.free(text);
+                if (tui.turn == null) continue;
+                try tui.appendAssistantText(text);
+                try tui.render();
+            },
+            .a_tool_call => |tc| {
+                defer gpa.free(tc.name);
+                defer gpa.free(tc.input);
+                if (tui.turn == null) continue;
+                var preview = tc.input;
+                if (preview.len > 200) preview = preview[0..200];
+                const line = try std.fmt.allocPrint(tui_arena, "→ {s}({s})", .{ tc.name, preview });
+                try tui.pushBlock(.tool_call, line);
+                try tui.render();
+            },
+            .a_tool_result => |tr| {
+                defer gpa.free(tr.text);
+                if (tui.turn == null) continue;
+                var preview = tr.text;
+                if (preview.len > 200) preview = preview[0..200];
+                const ellipsis: []const u8 = if (tr.text.len > 200) "…" else "";
+                const line = try std.fmt.allocPrint(tui_arena, "← {s}{s}", .{ preview, ellipsis });
+                try tui.pushBlock(if (tr.is_error) .tool_result_error else .tool_result, line);
+                try tui.render();
+            },
+            .a_usage => |usage| {
+                if (tui.turn == null) continue;
+                try tui.pushUsageNotice(usage);
+                try tui.render();
+            },
+            .a_done => |result| {
+                if (tui.turn == null) continue;
+                try tui.finishTurn();
+                if (result.err) |err| switch (err) {
+                    error.Canceled => try tui.pushBlock(.notice, "[aborted]"),
+                    else => {
+                        const msg = try std.fmt.allocPrint(tui_arena, "error: {s}", .{@errorName(err)});
+                        try tui.pushBlock(.tool_result_error, msg);
+                    },
+                };
+                try tui.render();
             },
         }
     }
