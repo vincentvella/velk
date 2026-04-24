@@ -54,9 +54,6 @@ fn toAnthropic(arena: std.mem.Allocator, req: provider_mod.Request) !types.Messa
     const messages = try arena.alloc(types.Message, req.messages.len);
     for (req.messages, 0..) |m, i| messages[i] = try translateMessage(arena, m);
 
-    // Mark the last tool with cache_control so Anthropic ephemeral-caches
-    // the entire tools block. On a multi-turn conversation the cache hit
-    // (within the 5-minute TTL) drops tools-token cost to ~10%.
     const tool_defs: ?[]const types.ToolDef = if (req.tools.len == 0) null else blk: {
         const defs = try arena.alloc(types.ToolDef, req.tools.len);
         for (req.tools, 0..) |t, j| defs[j] = .{
@@ -64,24 +61,23 @@ fn toAnthropic(arena: std.mem.Allocator, req: provider_mod.Request) !types.Messa
             .description = t.description,
             .input_schema = t.input_schema,
         };
-        defs[defs.len - 1].cache_control = .{};
         break :blk defs;
     };
 
-    // Same idea for the system prompt: emit as a single text block with
-    // cache_control. Cheap, and pays for itself on turn two.
-    const system_blocks: ?[]const types.SystemBlock = if (req.system) |sys| blk: {
-        const blocks = try arena.alloc(types.SystemBlock, 1);
-        blocks[0] = .{ .text = sys, .cache_control = .{} };
-        break :blk blocks;
-    } else null;
-
+    // Top-level cache_control enables Anthropic's automatic caching:
+    // the system picks the last cacheable block as the breakpoint.
+    // On multi-turn conversations the breakpoint advances with the
+    // conversation; on single-shot calls within the 5-minute TTL,
+    // identical prefixes hit cache. Note: caching is silently disabled
+    // when the cacheable prefix is below the model's minimum (4096 for
+    // Opus 4.7, 2048 for Sonnet 4.6, 1024 for older models).
     return .{
         .model = req.model,
         .max_tokens = req.max_tokens,
-        .system = system_blocks,
+        .system = req.system,
         .messages = messages,
         .tools = tool_defs,
+        .cache_control = .{},
     };
 }
 

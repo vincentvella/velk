@@ -41,30 +41,20 @@ pub const ToolDef = struct {
     name: []const u8,
     description: []const u8,
     input_schema: std.json.Value,
-    /// When present, Anthropic caches everything in the request up to
-    /// and including this block (5-minute ephemeral TTL). We only need
-    /// this on the last tool — that gets the entire tools array cached.
-    cache_control: ?CacheControl = null,
-};
-
-/// Single text block in a system prompt (used when we want to attach a
-/// cache_control marker; the simpler `system: string` shape is encoded
-/// as a plain string and can't be cached).
-pub const SystemBlock = struct {
-    type: []const u8 = "text",
-    text: []const u8,
-    cache_control: ?CacheControl = null,
 };
 
 pub const MessagesRequest = struct {
     model: []const u8,
     max_tokens: u32,
     messages: []const Message,
-    /// Always sent as an array of text blocks; Anthropic accepts this
-    /// shape everywhere a string would work, and the array form is the
-    /// only one that supports `cache_control`.
-    system: ?[]const SystemBlock = null,
+    system: ?[]const u8 = null,
     tools: ?[]const ToolDef = null,
+    /// Top-level cache marker enables Anthropic's "automatic caching"
+    /// mode: the system places the breakpoint on the last cacheable
+    /// block on its own. Caching only engages once the cacheable
+    /// prefix exceeds the model's minimum (4096 tokens for Opus 4.7,
+    /// 2048 for Sonnet 4.6, 1024 for older models).
+    cache_control: ?CacheControl = null,
     /// Set to true for SSE streaming responses. Encoded only when non-null
     /// (request serialization uses `emit_null_optional_fields = false`).
     stream: ?bool = null,
@@ -253,19 +243,20 @@ test "MessagesRequest: serializes tool_use and tool_result content blocks" {
     try testing.expect(std.mem.indexOf(u8, json, "\"content\":\"hello\\n\"") != null);
 }
 
-test "MessagesRequest: includes system when present (cached array form)" {
+test "MessagesRequest: includes system + top-level cache_control" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const req: MessagesRequest = .{
         .model = "x",
         .max_tokens = 10,
         .messages = &.{try textMessage(arena.allocator(), "user", "hi")},
-        .system = &.{.{ .text = "be terse", .cache_control = .{} }},
+        .system = "be terse",
+        .cache_control = .{},
     };
     const json = try std.json.Stringify.valueAlloc(testing.allocator, req, .{ .emit_null_optional_fields = false });
     defer testing.allocator.free(json);
     try testing.expectEqualStrings(
-        \\{"model":"x","max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"system":[{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}]}
+        \\{"model":"x","max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"system":"be terse","cache_control":{"type":"ephemeral"}}
     , json);
 }
 
