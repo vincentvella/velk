@@ -10,6 +10,7 @@ const vaxis = @import("vaxis");
 const agent = @import("agent.zig");
 const provider_mod = @import("provider.zig");
 const session_mod = @import("session.zig");
+const cost = @import("cost.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -67,6 +68,7 @@ const Tui = struct {
     arena: std.mem.Allocator,
     vx: *vaxis.Vaxis,
     tty: *vaxis.Tty,
+    model: []const u8,
     blocks: std.ArrayList(Block) = .empty,
     assistant_buf: std.ArrayList(u8) = .empty,
     has_open_assistant: bool = false,
@@ -86,6 +88,12 @@ const Tui = struct {
     /// When the mouse is held at the top/bottom while dragging, the
     /// polling tick scrolls in this direction until released.
     autoscroll: AutoScroll = .none,
+    /// In-memory list of submitted prompts, oldest first. Up/Down at
+    /// the input prompt walks through this.
+    input_history: std.ArrayList([]const u8) = .empty,
+    /// `null` = composing fresh; otherwise an index into `input_history`
+    /// counted from the *end* (0 = last submitted prompt).
+    history_idx: ?usize = null,
 
     fn pushBlock(self: *Tui, kind: Block.Kind, text: []const u8) !void {
         try self.flushOpenAssistant();
@@ -223,13 +231,16 @@ const Tui = struct {
         const self = cast(ctx);
         try self.flushOpenAssistant();
         if (usage.input_tokens > 0 or usage.output_tokens > 0) {
-            const summary = if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0)
-                try std.fmt.allocPrint(self.arena, "[tokens: {d} in / {d} out · cache {d} read / {d} write]", .{
-                    usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_creation_tokens,
-                })
-            else
-                try std.fmt.allocPrint(self.arena, "[tokens: {d} in / {d} out]", .{ usage.input_tokens, usage.output_tokens });
-            try self.pushBlock(.notice, summary);
+            var buf: std.ArrayList(u8) = .empty;
+            try buf.print(self.arena, "[tokens: {d} in / {d} out", .{ usage.input_tokens, usage.output_tokens });
+            if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0) {
+                try buf.print(self.arena, " · cache {d} read / {d} write", .{ usage.cache_read_tokens, usage.cache_creation_tokens });
+            }
+            if (cost.turnCost(self.model, usage)) |c| {
+                try buf.print(self.arena, " · ${d:.4}", .{c});
+            }
+            try buf.append(self.arena, ']');
+            try self.pushBlock(.notice, buf.items);
         }
         try self.render();
     }
@@ -346,6 +357,7 @@ pub fn run(
     gpa: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
     sess: *session_mod.Session,
+    model: []const u8,
 ) !void {
     var tty_buffer: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buffer);
@@ -364,10 +376,10 @@ pub fn run(
     try vx.setMouseMode(tty.writer(), true);
     defer vx.setMouseMode(tty.writer(), false) catch {};
 
-    var tui: Tui = .{ .arena = arena, .vx = &vx, .tty = &tty };
+    var tui: Tui = .{ .arena = arena, .vx = &vx, .tty = &tty, .model = model };
     try tui.pushBlock(
         .notice,
-        "velk REPL — Ctrl-D exit · Enter send · wheel/PageUp/PageDown scroll · drag to select · mouse-up copies to clipboard",
+        "velk REPL — Ctrl-D exit · Enter send · ↑/↓ history · PageUp/PageDown scroll · drag to select · mouse-up copies to clipboard",
     );
     try tui.render();
 
@@ -520,9 +532,40 @@ pub fn run(
                     continue;
                 }
                 if (tui.busy) continue;
+                // Plain Up/Down (no modifiers) = input history navigation.
+                if (key.matches(vaxis.Key.up, .{})) {
+                    if (tui.input_history.items.len == 0) continue;
+                    const next_idx: usize = if (tui.history_idx) |i|
+                        @min(i + 1, tui.input_history.items.len - 1)
+                    else
+                        0;
+                    tui.history_idx = next_idx;
+                    const entry = tui.input_history.items[tui.input_history.items.len - 1 - next_idx];
+                    tui.input.clearRetainingCapacity();
+                    try tui.input.appendSlice(arena, entry);
+                    try tui.render();
+                    continue;
+                }
+                if (key.matches(vaxis.Key.down, .{})) {
+                    if (tui.history_idx) |i| {
+                        if (i == 0) {
+                            tui.history_idx = null;
+                            tui.input.clearRetainingCapacity();
+                        } else {
+                            tui.history_idx = i - 1;
+                            const entry = tui.input_history.items[tui.input_history.items.len - i];
+                            tui.input.clearRetainingCapacity();
+                            try tui.input.appendSlice(arena, entry);
+                        }
+                        try tui.render();
+                    }
+                    continue;
+                }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     if (tui.input.items.len == 0) continue;
                     const prompt = try arena.dupe(u8, tui.input.items);
+                    try tui.input_history.append(arena, prompt);
+                    tui.history_idx = null;
                     try tui.pushBlock(.user_prompt, prompt);
                     tui.input.clearRetainingCapacity();
                     tui.busy = true;

@@ -10,6 +10,7 @@ const tools = @import("tools.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
+const cost = @import("cost.zig");
 const tui = @import("tui.zig");
 
 /// Sink that mirrors the original plain-CLI behavior: assistant text to
@@ -18,6 +19,7 @@ const PlainSink = struct {
     text_out: *Io.Writer,
     progress_out: *Io.Writer,
     arena: std.mem.Allocator,
+    model: []const u8,
     printed_text: bool = false,
 
     fn sink(self: *PlainSink) agent.Sink {
@@ -70,6 +72,9 @@ const PlainSink = struct {
         try self.progress_out.print("[tokens: {d} in / {d} out", .{ usage.input_tokens, usage.output_tokens });
         if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0) {
             try self.progress_out.print(" · cache {d} read / {d} write", .{ usage.cache_read_tokens, usage.cache_creation_tokens });
+        }
+        if (cost.turnCost(self.model, usage)) |c| {
+            try self.progress_out.print(" · ${d:.4}", .{c});
         }
         try self.progress_out.writeAll("]\n");
         try self.progress_out.flush();
@@ -190,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
             }
 
             if (opts.prompt) |p| {
-                var plain: PlainSink = .{ .text_out = w, .progress_out = errw, .arena = arena };
+                var plain: PlainSink = .{ .text_out = w, .progress_out = errw, .arena = arena, .model = model };
                 sess.ask(p, plain.sink()) catch |err| {
                     try renderProviderError(errw, err, provider);
                     try errw.flush();
@@ -206,7 +211,7 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
 
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess) catch |err| {
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);
