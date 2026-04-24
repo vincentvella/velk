@@ -3,9 +3,11 @@
 //! loop until end_turn and persists the resulting messages.
 
 const std = @import("std");
+const Io = std.Io;
 const provider_mod = @import("provider.zig");
 const tool = @import("tool.zig");
 const agent = @import("agent.zig");
+const persist = @import("persist.zig");
 
 pub const Config = struct {
     model: []const u8,
@@ -20,6 +22,11 @@ pub const Session = struct {
     provider: provider_mod.Provider,
     config: Config,
     messages: std.ArrayList(provider_mod.Message) = .empty,
+    /// When set, every successful `ask` writes the message list to this
+    /// path so the conversation can be resumed in a future invocation.
+    save_path: ?[]const u8 = null,
+    /// Required if `save_path` is set.
+    io: ?Io = null,
 
     pub fn init(arena: std.mem.Allocator, provider: provider_mod.Provider, config: Config) Session {
         return .{ .arena = arena, .provider = provider, .config = config };
@@ -37,5 +44,8 @@ pub const Session = struct {
         });
         self.messages.clearRetainingCapacity();
         try self.messages.appendSlice(self.arena, final);
+        if (self.save_path) |path| {
+            if (self.io) |io| persist.save(self.arena, io, path, self.messages.items) catch {};
+        }
     }
 };

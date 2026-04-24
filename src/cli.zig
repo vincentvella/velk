@@ -20,6 +20,9 @@ pub const Options = struct {
     unsafe: bool = false,
     /// Force plain (non-TUI) output even when stdin is a TTY.
     no_tui: bool = false,
+    /// Optional session name. When set, message history is loaded from
+    /// (and saved back to) ~/.local/share/velk/sessions/<name>.json.
+    session: ?[]const u8 = null,
 };
 
 pub const ParseError = struct {
@@ -73,6 +76,11 @@ pub fn parse(args: []const []const u8) Action {
             opts.no_tui = true;
             continue;
         }
+        if (eql(arg, "--session") or eql(arg, "-S")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.session = v;
+            continue;
+        }
         if (eql(arg, "--provider") or eql(arg, "-p")) {
             const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
             if (eql(v, "anthropic")) opts.provider = .anthropic
@@ -110,6 +118,8 @@ pub fn printHelp(w: anytype) !void {
         \\      --max-tokens <n>  max tokens to generate (default: {d})
         \\      --unsafe          allow tools to access paths outside CWD
         \\      --no-tui          force plain output (no TUI)
+        \\  -S, --session <name>  load/save chat history under
+        \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\  -h, --help            show this help
         \\  -V, --version         show version
         \\

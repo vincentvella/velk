@@ -9,6 +9,7 @@ const tool = @import("tool.zig");
 const tools = @import("tools.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
+const persist = @import("persist.zig");
 const tui = @import("tui.zig");
 
 /// Sink that mirrors the original plain-CLI behavior: assistant text to
@@ -169,6 +170,24 @@ pub fn main(init: std.process.Init) !void {
                 .system = opts.system,
                 .tools = tool_set,
             });
+
+            if (opts.session) |name| {
+                const path = persist.sessionPath(arena, init.environ_map, name) catch |err| {
+                    try errw.print("velk: bad --session name: {s}\n", .{@errorName(err)});
+                    try errw.flush();
+                    std.process.exit(2);
+                };
+                sess.save_path = path;
+                sess.io = init.io;
+                if (try persist.load(arena, init.io, path)) |loaded| {
+                    try sess.messages.appendSlice(arena, loaded);
+                    try errw.print("velk: resumed session '{s}' ({d} messages)\n", .{ name, loaded.len });
+                    try errw.flush();
+                } else {
+                    try errw.print("velk: starting new session '{s}'\n", .{name});
+                    try errw.flush();
+                }
+            }
 
             if (opts.prompt) |p| {
                 var plain: PlainSink = .{ .text_out = w, .progress_out = errw, .arena = arena };
