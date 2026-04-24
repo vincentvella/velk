@@ -1,15 +1,21 @@
 const std = @import("std");
 
 pub const default_model = "claude-opus-4-7";
+pub const default_openai_model = "gpt-5";
 pub const default_max_tokens: u32 = 4096;
+
+pub const Provider = enum { anthropic, openai, openrouter };
+pub const default_provider: Provider = .anthropic;
 
 pub const Options = struct {
     /// Optional one-shot prompt. When null, the agent is launched in
     /// REPL mode (TUI if stdin is a TTY).
     prompt: ?[]const u8 = null,
-    model: []const u8 = default_model,
+    /// Model id. If null, the provider's default is used.
+    model: ?[]const u8 = null,
     system: ?[]const u8 = null,
     max_tokens: u32 = default_max_tokens,
+    provider: Provider = default_provider,
     /// Drop path-safety checks in built-in tools.
     unsafe: bool = false,
     /// Force plain (non-TUI) output even when stdin is a TTY.
@@ -67,6 +73,14 @@ pub fn parse(args: []const []const u8) Action {
             opts.no_tui = true;
             continue;
         }
+        if (eql(arg, "--provider") or eql(arg, "-p")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            if (eql(v, "anthropic")) opts.provider = .anthropic
+            else if (eql(v, "openai")) opts.provider = .openai
+            else if (eql(v, "openrouter")) opts.provider = .openrouter
+            else return errAction("unknown provider (expected anthropic|openai|openrouter)", v);
+            continue;
+        }
 
         if (arg.len > 1 and arg[0] == '-') {
             return errAction("unknown flag", arg);
@@ -90,7 +104,8 @@ pub fn printHelp(w: anytype) !void {
         \\With a prompt, velk runs one turn and exits.
         \\
         \\Options:
-        \\  -m, --model <id>      model id (default: {s})
+        \\  -p, --provider <id>   anthropic (default), openai, openrouter
+        \\  -m, --model <id>      model id (provider-default if omitted)
         \\  -s, --system <text>   system prompt
         \\      --max-tokens <n>  max tokens to generate (default: {d})
         \\      --unsafe          allow tools to access paths outside CWD
@@ -99,9 +114,12 @@ pub fn printHelp(w: anytype) !void {
         \\  -V, --version         show version
         \\
         \\Environment:
-        \\  ANTHROPIC_API_KEY     required to make API calls
+        \\  ANTHROPIC_API_KEY     required for --provider anthropic (default: {s})
+        \\  OPENAI_API_KEY        required for --provider openai
+        \\  OPENROUTER_API_KEY    required for --provider openrouter
+        \\  OPENAI_BASE_URL       optional override for openai/openrouter base URL
         \\
-    , .{ default_model, default_max_tokens });
+    , .{ default_max_tokens, default_model });
 }
 
 pub fn printVersion(w: anytype, version: []const u8) !void {
@@ -173,22 +191,38 @@ test "parse: no args returns run with null prompt (REPL intent)" {
 test "parse: positional prompt with defaults" {
     const o = try expectRun(parse(&.{ "velk", "hello world" }));
     try testing.expectEqualStrings("hello world", o.prompt.?);
-    try testing.expectEqualStrings(default_model, o.model);
+    try testing.expectEqual(@as(?[]const u8, null), o.model);
     try testing.expectEqual(default_max_tokens, o.max_tokens);
     try testing.expectEqual(@as(?[]const u8, null), o.system);
+    try testing.expectEqual(default_provider, o.provider);
     try testing.expect(!o.no_tui);
     try testing.expect(!o.unsafe);
 }
 
 test "parse: --model overrides default" {
     const o = try expectRun(parse(&.{ "velk", "--model", "claude-sonnet-4-6", "hi" }));
-    try testing.expectEqualStrings("claude-sonnet-4-6", o.model);
+    try testing.expectEqualStrings("claude-sonnet-4-6", o.model.?);
     try testing.expectEqualStrings("hi", o.prompt.?);
 }
 
 test "parse: -m short form" {
     const o = try expectRun(parse(&.{ "velk", "-m", "claude-haiku-4-5", "hi" }));
-    try testing.expectEqualStrings("claude-haiku-4-5", o.model);
+    try testing.expectEqualStrings("claude-haiku-4-5", o.model.?);
+}
+
+test "parse: --provider openai" {
+    const o = try expectRun(parse(&.{ "velk", "--provider", "openai", "hi" }));
+    try testing.expectEqual(Provider.openai, o.provider);
+}
+
+test "parse: -p short form for provider" {
+    const o = try expectRun(parse(&.{ "velk", "-p", "openrouter", "hi" }));
+    try testing.expectEqual(Provider.openrouter, o.provider);
+}
+
+test "parse: unknown provider errors" {
+    const e = try expectParseError(parse(&.{ "velk", "--provider", "googly", "hi" }));
+    try testing.expect(std.mem.indexOf(u8, e.message, "unknown provider") != null);
 }
 
 test "parse: --system sets system prompt" {
@@ -220,7 +254,7 @@ test "parse: --unsafe flag" {
 
 test "parse: flags in any order before positional" {
     const o = try expectRun(parse(&.{ "velk", "-m", "x", "--max-tokens", "10", "-s", "sys", "p" }));
-    try testing.expectEqualStrings("x", o.model);
+    try testing.expectEqualStrings("x", o.model.?);
     try testing.expectEqual(@as(u32, 10), o.max_tokens);
     try testing.expectEqualStrings("sys", o.system.?);
     try testing.expectEqualStrings("p", o.prompt.?);
@@ -229,7 +263,7 @@ test "parse: flags in any order before positional" {
 test "parse: positional before flags" {
     const o = try expectRun(parse(&.{ "velk", "p", "-m", "x" }));
     try testing.expectEqualStrings("p", o.prompt.?);
-    try testing.expectEqualStrings("x", o.model);
+    try testing.expectEqualStrings("x", o.model.?);
 }
 
 test "parse: --max-tokens non-numeric errors" {
