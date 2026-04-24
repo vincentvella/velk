@@ -46,6 +46,17 @@ pub const Request = struct {
     tools: []const ToolDef = &.{},
 };
 
+pub const Usage = struct {
+    input_tokens: u32 = 0,
+    output_tokens: u32 = 0,
+    /// Tokens that hit a prompt cache (counted toward input). Anthropic
+    /// reports this when ephemeral cache_control is in use; OpenAI
+    /// surfaces it as `prompt_tokens_details.cached_tokens`.
+    cache_read_tokens: u32 = 0,
+    /// Tokens that wrote to a prompt cache (Anthropic-only today).
+    cache_creation_tokens: u32 = 0,
+};
+
 /// Stream callbacks invoked by a provider as a turn unfolds. All slices
 /// are valid only during the call — copy if you need to retain them.
 pub const Stream = struct {
@@ -54,6 +65,10 @@ pub const Stream = struct {
     onText: *const fn (?*anyopaque, text: []const u8) anyerror!void,
     /// A tool_use block has been fully assembled by the provider.
     onToolUse: *const fn (?*anyopaque, use: ToolUse) anyerror!void,
+    /// Token usage for the request that just completed. May be called
+    /// zero or one times per `stream` invocation depending on provider
+    /// support; treat absence as "unknown, leave totals unchanged".
+    onUsage: *const fn (?*anyopaque, usage: Usage) anyerror!void,
     /// End-of-turn signal with the provider-reported stop reason.
     /// Normalized values: "end_turn", "tool_use", "max_tokens",
     /// "stop_sequence". Unknown values pass through verbatim.

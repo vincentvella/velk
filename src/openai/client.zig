@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 const types = @import("types.zig");
 const sse = @import("../anthropic/sse.zig");
+const anth_client = @import("../anthropic/client.zig");
 
 pub const default_base_url = "https://api.openai.com/v1/chat/completions";
 
@@ -39,7 +40,8 @@ pub const Client = struct {
     }
 
     /// Send a chat completion request with `stream: true` and dispatch
-    /// each SSE event to `onEvent`.
+    /// each SSE event to `onEvent`. Retries on 429/5xx with exponential
+    /// backoff (max 3 retries, mirroring the Anthropic client).
     pub fn streamChat(
         self: *Client,
         req: types.ChatRequest,
@@ -48,6 +50,7 @@ pub const Client = struct {
     ) !void {
         var streaming_req = req;
         streaming_req.stream = true;
+        streaming_req.stream_options = .{ .include_usage = true };
 
         const body = try std.json.Stringify.valueAlloc(self.gpa, streaming_req, .{ .emit_null_optional_fields = false });
         defer self.gpa.free(body);
@@ -56,36 +59,50 @@ pub const Client = struct {
         defer self.gpa.free(auth_header);
 
         const uri = try std.Uri.parse(self.base_url);
-        var http_req = try self.http.request(.POST, uri, .{
-            .keep_alive = true,
-            .headers = .{ .accept_encoding = .{ .override = "identity" } },
-            .extra_headers = &.{
-                .{ .name = "authorization", .value = auth_header },
-                .{ .name = "content-type", .value = "application/json" },
-                .{ .name = "accept", .value = "text/event-stream" },
-            },
-        });
-        defer http_req.deinit();
+        const extra_headers = &[_]std.http.Header{
+            .{ .name = "authorization", .value = auth_header },
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "accept", .value = "text/event-stream" },
+        };
 
-        http_req.transfer_encoding = .{ .content_length = body.len };
-        var body_writer = try http_req.sendBodyUnflushed(&.{});
-        try body_writer.writer.writeAll(body);
-        try body_writer.end();
-        try http_req.connection.?.flush();
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            var http_req = try self.http.request(.POST, uri, .{
+                .keep_alive = true,
+                .headers = .{ .accept_encoding = .{ .override = "identity" } },
+                .extra_headers = extra_headers,
+            });
+            var keep_req = false;
+            defer if (!keep_req) http_req.deinit();
 
-        var redirect_buf: [1024]u8 = undefined;
-        var response = try http_req.receiveHead(&redirect_buf);
+            http_req.transfer_encoding = .{ .content_length = body.len };
+            var body_writer = try http_req.sendBodyUnflushed(&.{});
+            try body_writer.writer.writeAll(body);
+            try body_writer.end();
+            try http_req.connection.?.flush();
 
-        const status = @intFromEnum(response.head.status);
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
+            var redirect_buf: [1024]u8 = undefined;
+            var response = try http_req.receiveHead(&redirect_buf);
 
-        if (status < 200 or status >= 300) {
-            try self.drainErrorBody(reader);
-            return Error.ApiError;
+            const status = @intFromEnum(response.head.status);
+            var transfer_buf: [8192]u8 = undefined;
+            const reader = response.reader(&transfer_buf);
+
+            if (anth_client.shouldRetry(status) and attempt < anth_client.max_retries) {
+                try anth_client.retryBackoff(self.io, attempt);
+                continue;
+            }
+
+            if (status < 200 or status >= 300) {
+                try self.drainErrorBody(reader);
+                return Error.ApiError;
+            }
+
+            keep_req = true;
+            defer http_req.deinit();
+            try sse.stream(self.gpa, reader, ctx, onEvent);
+            return;
         }
-
-        try sse.stream(self.gpa, reader, ctx, onEvent);
     }
 
     fn drainErrorBody(self: *Client, reader: *Io.Reader) !void {

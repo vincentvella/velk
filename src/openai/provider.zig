@@ -53,9 +53,8 @@ pub const Adapter = struct {
         try self.client.streamChat(oai_req, &state, StreamState.onEvent);
 
         if (state.err) |e| return e;
-        // Emit any tool_uses that finished accumulating but never got a
-        // finish_reason event (rare, but defensive).
         try state.flushPendingToolCalls();
+        if (state.saw_usage) try sink.onUsage(sink.ctx, state.usage);
         const reason = state.stop_reason orelse "end_turn";
         try sink.onStop(sink.ctx, normalizeStopReason(reason));
     }
@@ -183,6 +182,8 @@ const StreamState = struct {
     pending: std.ArrayList(PendingToolCall) = .empty,
     stop_reason: ?[]const u8 = null,
     err: ?anyerror = null,
+    usage: provider_mod.Usage = .{},
+    saw_usage: bool = false,
 
     fn ensure(self: *StreamState, idx: usize) !void {
         while (self.pending.items.len <= idx) try self.pending.append(self.arena, .{});
@@ -237,6 +238,13 @@ const StreamState = struct {
                 self.stop_reason = reason;
                 if (std.mem.eql(u8, reason, "tool_calls")) try self.flushPendingToolCalls();
             }
+        }
+
+        if (parsed.usage) |u| {
+            self.usage.input_tokens = u.prompt_tokens;
+            self.usage.output_tokens = u.completion_tokens;
+            if (u.prompt_tokens_details) |d| self.usage.cache_read_tokens = d.cached_tokens;
+            self.saw_usage = true;
         }
     }
 };

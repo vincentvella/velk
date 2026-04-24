@@ -58,13 +58,20 @@ const PlainSink = struct {
         try self.progress_out.flush();
     }
 
-    fn onTurnEnd(ctx: ?*anyopaque) anyerror!void {
+    fn onTurnEnd(ctx: ?*anyopaque, usage: provider_mod.Usage) anyerror!void {
         const self = cast(ctx);
         if (self.printed_text) {
             try self.text_out.writeAll("\n");
             try self.text_out.flush();
         }
         self.printed_text = false;
+        if (usage.input_tokens == 0 and usage.output_tokens == 0) return;
+        try self.progress_out.print("[tokens: {d} in / {d} out", .{ usage.input_tokens, usage.output_tokens });
+        if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0) {
+            try self.progress_out.print(" · cache {d} read / {d} write", .{ usage.cache_read_tokens, usage.cache_creation_tokens });
+        }
+        try self.progress_out.writeAll("]\n");
+        try self.progress_out.flush();
     }
 };
 

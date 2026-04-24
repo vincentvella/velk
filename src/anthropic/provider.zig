@@ -44,6 +44,7 @@ pub const Adapter = struct {
         try self.client.streamMessage(anth_req, &state, StreamState.onEvent);
 
         if (state.err) |e| return e;
+        if (state.saw_usage) try sink.onUsage(sink.ctx, state.usage);
         const reason = state.stop_reason orelse "end_turn";
         try sink.onStop(sink.ctx, reason);
     }
@@ -120,6 +121,8 @@ const StreamState = struct {
     blocks: std.ArrayList(InProgressBlock) = .empty,
     stop_reason: ?[]const u8 = null,
     err: ?anyerror = null,
+    usage: provider_mod.Usage = .{},
+    saw_usage: bool = false,
 
     fn ensureBlock(self: *StreamState, index: usize) !void {
         while (self.blocks.items.len <= index) {
@@ -147,7 +150,20 @@ const StreamState = struct {
     }
 
     fn onEvent(self: *StreamState, ev: sse.Event) anyerror!void {
-        if (std.mem.eql(u8, ev.name, "content_block_start")) {
+        if (std.mem.eql(u8, ev.name, "message_start")) {
+            const parsed = std.json.parseFromSliceLeaky(
+                types.MessageStart,
+                self.arena,
+                ev.data,
+                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+            ) catch return;
+            const u = parsed.message.usage;
+            self.usage.input_tokens = u.input_tokens;
+            self.usage.cache_creation_tokens = u.cache_creation_input_tokens;
+            self.usage.cache_read_tokens = u.cache_read_input_tokens;
+            self.usage.output_tokens = u.output_tokens;
+            self.saw_usage = true;
+        } else if (std.mem.eql(u8, ev.name, "content_block_start")) {
             const parsed = std.json.parseFromSliceLeaky(
                 types.ContentBlockStart,
                 self.arena,
@@ -192,6 +208,10 @@ const StreamState = struct {
                 .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
             ) catch return;
             if (parsed.delta.stop_reason) |sr| self.stop_reason = sr;
+            if (parsed.usage) |u| {
+                self.usage.output_tokens = u.output_tokens;
+                self.saw_usage = true;
+            }
         } else if (std.mem.eql(u8, ev.name, "error")) {
             const parsed = std.json.parseFromSliceLeaky(
                 types.StreamError,

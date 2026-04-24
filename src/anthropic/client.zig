@@ -4,6 +4,18 @@ const types = @import("types.zig");
 const sse = @import("sse.zig");
 
 pub const default_base_url = "https://api.anthropic.com/v1/messages";
+pub const max_retries: u32 = 3;
+
+pub fn shouldRetry(status: u16) bool {
+    return status == 429 or (status >= 500 and status < 600);
+}
+
+/// Sleep before attempt N+1. Doubles each time: 1s, 2s, 4s, capped at 30s.
+pub fn retryBackoff(io: Io, attempt: u32) !void {
+    const base: u64 = 1000;
+    const ms = @min(base << @intCast(@min(attempt, 5)), 30_000);
+    try Io.sleep(io, Io.Duration.fromMilliseconds(@intCast(ms)), .awake);
+}
 
 pub const Error = error{
     // Surfaced when the API returns 4xx/5xx with a parseable error body.
@@ -93,9 +105,10 @@ pub const Client = struct {
     }
 
     /// Send a Messages API request with `stream: true` and dispatch each SSE
-    /// event to `onEvent` as it arrives. Forces `req.stream = true`.
-    /// On non-2xx, drains the body into `self.last_error_body` and returns
-    /// `Error.ApiError` without invoking `onEvent`.
+    /// event to `onEvent` as it arrives. Retries the request setup on
+    /// 429 / 5xx with exponential backoff (max 3 retries) — once the body
+    /// starts streaming we no longer retry, since the partial output is
+    /// already on its way to the user.
     pub fn streamMessage(
         self: *Client,
         req: types.MessagesRequest,
@@ -109,41 +122,51 @@ pub const Client = struct {
         defer self.gpa.free(body);
 
         const uri = try std.Uri.parse(self.base_url);
-        var http_req = try self.http.request(.POST, uri, .{
-            .keep_alive = true,
-            // Force uncompressed body so we can feed bytes straight into the
-            // SSE parser. Compression on tiny event frames isn't worth the
-            // extra Decompress wiring (and the server would otherwise pick
-            // gzip/zstd, leaving the parser staring at binary garbage).
-            .headers = .{ .accept_encoding = .{ .override = "identity" } },
-            .extra_headers = &.{
-                .{ .name = "x-api-key", .value = self.api_key },
-                .{ .name = "anthropic-version", .value = types.default_anthropic_version },
-                .{ .name = "content-type", .value = "application/json" },
-                .{ .name = "accept", .value = "text/event-stream" },
-            },
-        });
-        defer http_req.deinit();
+        const extra_headers = &[_]std.http.Header{
+            .{ .name = "x-api-key", .value = self.api_key },
+            .{ .name = "anthropic-version", .value = types.default_anthropic_version },
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "accept", .value = "text/event-stream" },
+        };
 
-        http_req.transfer_encoding = .{ .content_length = body.len };
-        var body_writer = try http_req.sendBodyUnflushed(&.{});
-        try body_writer.writer.writeAll(body);
-        try body_writer.end();
-        try http_req.connection.?.flush();
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            var http_req = try self.http.request(.POST, uri, .{
+                .keep_alive = true,
+                .headers = .{ .accept_encoding = .{ .override = "identity" } },
+                .extra_headers = extra_headers,
+            });
+            var keep_req = false;
+            defer if (!keep_req) http_req.deinit();
 
-        var redirect_buf: [1024]u8 = undefined;
-        var response = try http_req.receiveHead(&redirect_buf);
+            http_req.transfer_encoding = .{ .content_length = body.len };
+            var body_writer = try http_req.sendBodyUnflushed(&.{});
+            try body_writer.writer.writeAll(body);
+            try body_writer.end();
+            try http_req.connection.?.flush();
 
-        const status = @intFromEnum(response.head.status);
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
+            var redirect_buf: [1024]u8 = undefined;
+            var response = try http_req.receiveHead(&redirect_buf);
 
-        if (status < 200 or status >= 300) {
-            try self.drainErrorBody(reader);
-            return Error.ApiError;
+            const status = @intFromEnum(response.head.status);
+            var transfer_buf: [8192]u8 = undefined;
+            const reader = response.reader(&transfer_buf);
+
+            if (shouldRetry(status) and attempt < max_retries) {
+                try retryBackoff(self.io, attempt);
+                continue;
+            }
+
+            if (status < 200 or status >= 300) {
+                try self.drainErrorBody(reader);
+                return Error.ApiError;
+            }
+
+            keep_req = true;
+            defer http_req.deinit();
+            try sse.stream(self.gpa, reader, ctx, onEvent);
+            return;
         }
-
-        try sse.stream(self.gpa, reader, ctx, onEvent);
     }
 
     fn drainErrorBody(self: *Client, reader: *Io.Reader) !void {

@@ -16,7 +16,10 @@ pub const Sink = struct {
     onText: *const fn (?*anyopaque, []const u8) anyerror!void,
     onToolCall: *const fn (?*anyopaque, name: []const u8, input_json: []const u8) anyerror!void,
     onToolResult: *const fn (?*anyopaque, text: []const u8, is_error: bool) anyerror!void,
-    onTurnEnd: *const fn (?*anyopaque) anyerror!void,
+    /// Called once at the very end of a turn, after the model emits a
+    /// non-tool stop reason (or the loop bails). `usage` is the sum of
+    /// all iterations within the turn.
+    onTurnEnd: *const fn (?*anyopaque, usage: provider_mod.Usage) anyerror!void,
 };
 
 pub const Config = struct {
@@ -48,6 +51,8 @@ pub fn run(
 
     const tool_defs = try buildToolDefs(arena, config.tools);
 
+    var cumulative: provider_mod.Usage = .{};
+
     var iteration: u32 = 0;
     while (iteration < config.max_iterations) : (iteration += 1) {
         const req: provider_mod.Request = .{
@@ -67,16 +72,23 @@ pub fn run(
             .ctx = &state,
             .onText = TurnState.onText,
             .onToolUse = TurnState.onToolUse,
+            .onUsage = TurnState.onUsage,
             .onStop = TurnState.onStop,
         }) catch |err| {
-            try sink.onTurnEnd(sink.ctx);
+            try sink.onTurnEnd(sink.ctx, cumulative);
             return err;
         };
 
-        try sink.onTurnEnd(sink.ctx);
+        cumulative.input_tokens +|= state.usage.input_tokens;
+        cumulative.output_tokens +|= state.usage.output_tokens;
+        cumulative.cache_read_tokens +|= state.usage.cache_read_tokens;
+        cumulative.cache_creation_tokens +|= state.usage.cache_creation_tokens;
 
         const stop = state.stop_reason orelse "end_turn";
-        if (!std.mem.eql(u8, stop, "tool_use")) return messages.items;
+        if (!std.mem.eql(u8, stop, "tool_use")) {
+            try sink.onTurnEnd(sink.ctx, cumulative);
+            return messages.items;
+        }
 
         // Build the assistant message that the model just produced
         // (text + tool_use blocks) and append it to history.
@@ -92,6 +104,7 @@ pub fn run(
         try messages.append(arena, .{ .role = .user, .content = results.items });
     }
 
+    try sink.onTurnEnd(sink.ctx, cumulative);
     return Error.IterationBudgetExceeded;
 }
 
@@ -147,6 +160,7 @@ const TurnState = struct {
     text: std.ArrayList(u8) = .empty,
     tool_uses: std.ArrayList(provider_mod.ToolUse) = .empty,
     stop_reason: ?[]const u8 = null,
+    usage: provider_mod.Usage = .{},
 
     fn cast(ctx: ?*anyopaque) *TurnState {
         return @ptrCast(@alignCast(ctx.?));
@@ -166,6 +180,11 @@ const TurnState = struct {
             .name = try self.arena.dupe(u8, use.name),
             .input = use.input,
         });
+    }
+
+    fn onUsage(ctx: ?*anyopaque, usage: provider_mod.Usage) anyerror!void {
+        const self = cast(ctx);
+        self.usage = usage;
     }
 
     fn onStop(ctx: ?*anyopaque, reason: []const u8) anyerror!void {

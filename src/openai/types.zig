@@ -35,6 +35,12 @@ pub const ToolDef = struct {
     function: ToolFunction,
 };
 
+pub const StreamOptions = struct {
+    /// Ask OpenAI to include a final chunk with token usage. Without
+    /// this, streamed completions never report usage.
+    include_usage: bool = true,
+};
+
 pub const ChatRequest = struct {
     model: []const u8,
     messages: []const Message,
@@ -45,6 +51,7 @@ pub const ChatRequest = struct {
     max_completion_tokens: ?u32 = null,
     tools: ?[]const ToolDef = null,
     stream: ?bool = null,
+    stream_options: ?StreamOptions = null,
 };
 
 // ── Streaming chunk shapes ──
@@ -73,8 +80,20 @@ pub const Choice = struct {
     finish_reason: ?[]const u8 = null,
 };
 
+pub const PromptTokensDetails = struct {
+    cached_tokens: u32 = 0,
+};
+
+pub const ChunkUsage = struct {
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+    total_tokens: u32 = 0,
+    prompt_tokens_details: ?PromptTokensDetails = null,
+};
+
 pub const ChatChunk = struct {
-    choices: []const Choice,
+    choices: []const Choice = &.{},
+    usage: ?ChunkUsage = null,
 };
 
 pub const ApiError = struct {

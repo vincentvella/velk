@@ -84,11 +84,17 @@ pub const ContentBlockStop = struct {
 pub const MessageDelta = struct {
     type: []const u8,
     delta: Delta,
-    usage: ?Usage = null,
+    usage: ?DeltaUsage = null,
 
     pub const Delta = struct {
         stop_reason: ?[]const u8 = null,
         stop_sequence: ?[]const u8 = null,
+    };
+
+    /// `message_delta` events only update output_tokens (the final
+    /// count); the other fields aren't sent again, so default them.
+    pub const DeltaUsage = struct {
+        output_tokens: u32 = 0,
     };
 };
 
@@ -101,6 +107,24 @@ pub const StreamError = struct {
 pub const Usage = struct {
     input_tokens: u32 = 0,
     output_tokens: u32 = 0,
+    cache_creation_input_tokens: u32 = 0,
+    cache_read_input_tokens: u32 = 0,
+};
+
+/// Decoded `data:` payload of a `message_start` SSE event. Carries the
+/// full message envelope including the initial usage (input_tokens +
+/// any cache hits).
+pub const MessageStart = struct {
+    type: []const u8,
+    message: MessageEnvelope,
+
+    pub const MessageEnvelope = struct {
+        id: []const u8,
+        type: []const u8,
+        role: []const u8,
+        model: []const u8,
+        usage: Usage,
+    };
 };
 
 pub const MessagesResponse = struct {

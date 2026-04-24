@@ -8,6 +8,7 @@ const std = @import("std");
 const Io = std.Io;
 const vaxis = @import("vaxis");
 const agent = @import("agent.zig");
+const provider_mod = @import("provider.zig");
 const session_mod = @import("session.zig");
 
 const Event = union(enum) {
@@ -218,9 +219,18 @@ const Tui = struct {
         try self.render();
     }
 
-    fn onTurnEnd(ctx: ?*anyopaque) anyerror!void {
+    fn onTurnEnd(ctx: ?*anyopaque, usage: provider_mod.Usage) anyerror!void {
         const self = cast(ctx);
         try self.flushOpenAssistant();
+        if (usage.input_tokens > 0 or usage.output_tokens > 0) {
+            const summary = if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0)
+                try std.fmt.allocPrint(self.arena, "[tokens: {d} in / {d} out · cache {d} read / {d} write]", .{
+                    usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_creation_tokens,
+                })
+            else
+                try std.fmt.allocPrint(self.arena, "[tokens: {d} in / {d} out]", .{ usage.input_tokens, usage.output_tokens });
+            try self.pushBlock(.notice, summary);
+        }
         try self.render();
     }
 };
