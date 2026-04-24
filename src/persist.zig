@@ -37,6 +37,87 @@ pub fn sessionPath(
     return try std.fmt.allocPrint(arena, "{s}/velk/sessions/{s}.json", .{ base, name });
 }
 
+/// Path to the shared TUI input history file. Stored under
+/// `$XDG_STATE_HOME/velk/history.txt` (or `~/.local/state/velk/...`).
+pub fn historyPath(
+    arena: std.mem.Allocator,
+    env_map: *std.process.Environ.Map,
+) ![]const u8 {
+    const base = if (env_map.get("XDG_STATE_HOME")) |x| x else blk: {
+        const home = env_map.get("HOME") orelse return Error.HomeDirUnknown;
+        break :blk try std.fmt.allocPrint(arena, "{s}/.local/state", .{home});
+    };
+    return try std.fmt.allocPrint(arena, "{s}/velk/history.txt", .{base});
+}
+
+/// Maximum number of entries kept on disk; older lines are dropped on
+/// next save.
+pub const max_history_entries: usize = 1000;
+
+/// Load the history file. Returns oldest-first list (matches the
+/// in-memory order the TUI expects). Missing file → empty slice.
+pub fn loadHistory(
+    arena: std.mem.Allocator,
+    io: Io,
+    abs_path: []const u8,
+) ![]const []const u8 {
+    const cwd = Io.Dir.cwd();
+    const data = cwd.readFileAlloc(io, abs_path, arena, .limited(1 * 1024 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => return &.{},
+        else => return e,
+    };
+    var lines: std.ArrayList([]const u8) = .empty;
+    var iter = std.mem.splitScalar(u8, data, '\n');
+    while (iter.next()) |line| {
+        if (line.len == 0) continue;
+        try lines.append(arena, line);
+    }
+    return lines.items;
+}
+
+/// Append a single entry to the history file, atomically. Truncates
+/// the file to the most recent `max_history_entries` lines after each
+/// write so the file doesn't grow without bound.
+pub fn appendHistory(
+    arena: std.mem.Allocator,
+    io: Io,
+    abs_path: []const u8,
+    entry: []const u8,
+) !void {
+    if (entry.len == 0) return;
+    if (std.mem.indexOfScalar(u8, entry, '\n') != null) return; // skip multi-line for now
+
+    const slash = std.mem.lastIndexOfScalar(u8, abs_path, '/') orelse return;
+    if (slash > 0) try mkdirAllAbsolute(io, abs_path[0..slash]);
+
+    // Read existing, append new, truncate to last N, write back.
+    const cwd = Io.Dir.cwd();
+    const existing = cwd.readFileAlloc(io, abs_path, arena, .limited(1 * 1024 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    var iter = std.mem.splitScalar(u8, existing, '\n');
+    while (iter.next()) |line| {
+        if (line.len == 0) continue;
+        try lines.append(arena, line);
+    }
+    try lines.append(arena, entry);
+
+    const start: usize = if (lines.items.len > max_history_entries)
+        lines.items.len - max_history_entries
+    else
+        0;
+
+    var out: std.ArrayList(u8) = .empty;
+    for (lines.items[start..]) |line| {
+        try out.appendSlice(arena, line);
+        try out.append(arena, '\n');
+    }
+    try cwd.writeFile(io, .{ .sub_path = abs_path, .data = out.items });
+}
+
 /// Load a previously-saved session. Returns null if the file doesn't
 /// exist; propagates other I/O / parse errors.
 pub fn load(

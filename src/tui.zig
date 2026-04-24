@@ -10,6 +10,7 @@ const vaxis = @import("vaxis");
 const agent = @import("agent.zig");
 const provider_mod = @import("provider.zig");
 const session_mod = @import("session.zig");
+const persist = @import("persist.zig");
 const cost = @import("cost.zig");
 
 const Event = union(enum) {
@@ -377,6 +378,17 @@ pub fn run(
     defer vx.setMouseMode(tty.writer(), false) catch {};
 
     var tui: Tui = .{ .arena = arena, .vx = &vx, .tty = &tty, .model = model };
+
+    // Hydrate input history from disk so up-arrow recall works across
+    // launches. Failures are non-fatal — first run, no XDG_STATE_HOME,
+    // etc — we just skip persistence and run with an empty history.
+    const history_path = persist.historyPath(arena, env_map) catch null;
+    if (history_path) |path| {
+        if (persist.loadHistory(arena, io, path)) |hist| {
+            try tui.input_history.appendSlice(arena, hist);
+        } else |_| {}
+    }
+
     try tui.pushBlock(
         .notice,
         "velk REPL — Ctrl-D exit · Enter send · ↑/↓ history · PageUp/PageDown scroll · drag to select · mouse-up copies to clipboard",
@@ -566,6 +578,7 @@ pub fn run(
                     const prompt = try arena.dupe(u8, tui.input.items);
                     try tui.input_history.append(arena, prompt);
                     tui.history_idx = null;
+                    if (history_path) |path| persist.appendHistory(arena, io, path, prompt) catch {};
                     try tui.pushBlock(.user_prompt, prompt);
                     tui.input.clearRetainingCapacity();
                     tui.busy = true;
