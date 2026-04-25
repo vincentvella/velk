@@ -77,10 +77,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // This declares intent for the executable to be installed into the
-    // install prefix when running `zig build` (i.e. when executing the default
-    // step). By default the install prefix is `zig-out/` but can be overridden
-    // by passing `--prefix` or `-p`.
+    // We pull in std.c.write / _exit / kill for the SIGINT handler and
+    // the bash process-group killer. macOS links libc implicitly, but
+    // Linux cross-builds need it spelled out.
+    exe.root_module.link_libc = true;
+
     b.installArtifact(exe);
 
     // This creates a top level step. Top level steps have a name and can be
