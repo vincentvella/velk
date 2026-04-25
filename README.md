@@ -112,6 +112,9 @@ If no prompt is given, velk launches the TUI.
 | `OPENAI_BASE_URL`    | Override OpenAI base URL (defaults to api.openai.com)   |
 | `XDG_DATA_HOME`      | Where sessions live (defaults to `~/.local/share`)      |
 | `XDG_STATE_HOME`     | Where input history lives (defaults to `~/.local/state`)|
+| `VELK_NOTIFY`        | Set to `0` to disable desktop notifications on turn end |
+| `VELK_NOTIFY_AFTER_MS` | Threshold in ms before notifying (default 10000)      |
+| `VELK_NOTIFY_WEBHOOK` | URL to POST a JSON notification to instead of desktop   |
 
 ## Development
 

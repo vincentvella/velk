@@ -13,6 +13,7 @@ const session_mod = @import("session.zig");
 const persist = @import("persist.zig");
 const cost = @import("cost.zig");
 const slash = @import("slash.zig");
+const notify = @import("notify.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -100,6 +101,9 @@ const Turn = struct {
     shim: *ShimSink,
     /// Owned by gpa; freed on turn cleanup (after future has been awaited).
     prompt: []u8,
+    /// Monotonic timestamp captured when the turn started. Used to
+    /// compute elapsed time for the post-turn desktop notification.
+    started_at: Io.Timestamp,
 };
 
 const ShimSink = struct {
@@ -228,6 +232,8 @@ const Tui = struct {
     /// Number of MCP servers attached for this session (for the
     /// status line). 0 when none.
     mcp_count: u8 = 0,
+    /// Process env map. Used for notify thresholds + webhook URL.
+    env_map: *std.process.Environ.Map,
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -468,7 +474,12 @@ const Tui = struct {
             self.gpa.destroy(shim);
             return e;
         };
-        self.turn = .{ .future = future, .shim = shim, .prompt = prompt };
+        self.turn = .{
+            .future = future,
+            .shim = shim,
+            .prompt = prompt,
+            .started_at = Io.Clock.now(.awake, self.io),
+        };
     }
 
     /// Run after we've received the worker's `a_done` event. Awaits the
@@ -1016,6 +1027,7 @@ pub fn run(
         .sess = sess,
         .model = model,
         .mcp_count = mcp_count,
+        .env_map = env_map,
         .lines_arena = &lines_arena,
     };
     defer tui.cancelTurn() catch {}; // ensure worker is awaited if user exits mid-turn
@@ -1493,7 +1505,18 @@ pub fn run(
             },
             .a_done => |result| {
                 if (tui.turn == null) continue;
+                const started_at = tui.turn.?.started_at;
                 try tui.finishTurn();
+                // Fire a desktop notification if the turn was long
+                // enough (default 10s, override via VELK_NOTIFY_AFTER_MS).
+                // Skipped for canceled turns and on errors — only
+                // success notifications.
+                if (result.err == null) {
+                    const elapsed = started_at.untilNow(io, .awake);
+                    const elapsed_ms: u64 = @intCast(@max(@as(i96, 0), @divTrunc(elapsed.nanoseconds, std.time.ns_per_ms)));
+                    const summary = lastAssistantText(&tui) orelse "(turn complete)";
+                    notify.maybe(tui_arena, io, env_map, "velk: turn complete", summary, elapsed_ms);
+                }
                 if (result.err) |err| switch (err) {
                     error.Canceled => try tui.pushBlock(.notice, "[aborted]"),
                     else => {
