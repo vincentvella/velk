@@ -137,6 +137,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // `zig build smoke` builds the binary then runs scripts/smoke.sh
+    // against it. Asserts arg parsing, exit codes, env-var error messages
+    // — no API calls. Runs in <2s.
+    const smoke_cmd = b.addSystemCommand(&.{ "bash", "scripts/smoke.sh" });
+    smoke_cmd.step.dependOn(b.getInstallStep());
+    const smoke_step = b.step("smoke", "Run CLI smoke tests (no API)");
+    smoke_step.dependOn(&smoke_cmd.step);
+
+    // `zig build check` runs both unit tests and smoke tests.
+    const check_step = b.step("check", "Run unit tests + smoke tests");
+    check_step.dependOn(test_step);
+    check_step.dependOn(smoke_step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

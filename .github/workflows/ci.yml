@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: install zig 0.16.0
+        run: |
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig.tar.xz
+          mkdir -p $HOME/zig
+          tar -xJf zig.tar.xz -C $HOME/zig --strip-components=1
+          echo "$HOME/zig" >> $GITHUB_PATH
+
+      - name: zig version
+        run: zig version
+
+      - name: unit tests
+        run: zig build test
+
+      - name: build
+        run: zig build
+
+      - name: smoke tests
+        run: zig build smoke

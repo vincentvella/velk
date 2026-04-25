@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Pre-commit: build, run unit tests, run smoke tests.
+# Skip with `git commit --no-verify` if you really must (don't).
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-commit: zig build check"
+zig build check
