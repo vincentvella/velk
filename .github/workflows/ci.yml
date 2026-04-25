@@ -15,7 +15,7 @@ jobs:
     name: test + smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: install zig 0.16.0
         run: |
