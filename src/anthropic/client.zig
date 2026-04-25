@@ -46,6 +46,9 @@ pub const Client = struct {
     base_url: []const u8 = default_base_url,
     http: std.http.Client,
     last_error_body: ?[]u8 = null,
+    /// When true, dump a one-line request envelope summary to stderr
+    /// before each call. Driven by the CLI `--debug` flag.
+    debug: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, api_key: []const u8, base_url: ?[]const u8) Client {
         return .{
@@ -122,6 +125,8 @@ pub const Client = struct {
         const body = try std.json.Stringify.valueAlloc(self.gpa, streaming_req, .{ .emit_null_optional_fields = false });
         defer self.gpa.free(body);
 
+        if (self.debug) self.dumpRequest(streaming_req, body.len);
+
         const uri = try std.Uri.parse(self.base_url);
         const extra_headers = &[_]std.http.Header{
             .{ .name = "x-api-key", .value = self.api_key },
@@ -181,5 +186,16 @@ pub const Client = struct {
     fn captureErrorBody(self: *Client, bytes: []const u8) !void {
         if (self.last_error_body) |b| self.gpa.free(b);
         self.last_error_body = try self.gpa.dupe(u8, bytes);
+    }
+
+    fn dumpRequest(self: *Client, req: types.MessagesRequest, body_len: usize) void {
+        _ = self;
+        var sys_len: usize = 0;
+        if (req.system) |s| sys_len = s.len;
+        const tool_count = if (req.tools) |t| t.len else 0;
+        std.debug.print(
+            "[debug] anthropic POST · model={s} · msgs={d} · tools={d} · sys={d}b · body={d}b · max_tokens={d}\n",
+            .{ req.model, req.messages.len, tool_count, sys_len, body_len, req.max_tokens },
+        );
     }
 };

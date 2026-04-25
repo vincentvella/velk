@@ -272,6 +272,7 @@ fn setupProvider(
                 .client = anthropic.Client.init(init.gpa, init.io, key, base),
                 .adapter = undefined,
             } };
+            holder.anthropic.client.debug = opts.debug;
             holder.anthropic.adapter = anthropic.Adapter.init(arena, &holder.anthropic.client);
         },
         .openai => {
@@ -285,6 +286,7 @@ fn setupProvider(
                 .client = openai.Client.init(init.gpa, init.io, key, base),
                 .adapter = undefined,
             } };
+            holder.openai.client.debug = opts.debug;
             holder.openai.adapter = openai.Adapter.init(arena, &holder.openai.client);
         },
         .openrouter => {
@@ -298,6 +300,7 @@ fn setupProvider(
                 .client = openai.Client.init(init.gpa, init.io, key, base),
                 .adapter = undefined,
             } };
+            holder.openai.client.debug = opts.debug;
             holder.openai.adapter = openai.Adapter.init(arena, &holder.openai.client);
         },
     }

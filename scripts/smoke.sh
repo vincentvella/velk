@@ -141,6 +141,12 @@ if command -v python3 >/dev/null 2>&1; then
             OPENAI_API_KEY=sk-fake \
             "$VELK" --provider openai --no-tui "anything"
 
+    SMOKE_EXPECT_STDERR="[debug] anthropic POST" run_case \
+        "--debug dumps anthropic request envelope" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui --debug "anything"
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else

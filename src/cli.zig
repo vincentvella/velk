@@ -26,6 +26,9 @@ pub const Options = struct {
     /// Repeatable: each entry is a shell command line for an MCP
     /// server to spawn. Parsed at the call site (split on whitespace).
     mcp_servers: []const []const u8 = &.{},
+    /// Dump request envelopes (model, sys/tool counts, body length) to
+    /// stderr per turn. Useful for cache-window and prompt debugging.
+    debug: bool = false,
 };
 
 pub const ParseError = struct {
@@ -82,6 +85,10 @@ pub fn parse(args: []const []const u8) Action {
             opts.unsafe = true;
             continue;
         }
+        if (eql(arg, "--debug")) {
+            opts.debug = true;
+            continue;
+        }
         if (eql(arg, "--no-tui")) {
             opts.no_tui = true;
             continue;
@@ -136,6 +143,7 @@ pub fn printHelp(w: anytype) !void {
         \\      --max-tokens <n>  max tokens to generate (default: {d})
         \\      --unsafe          allow tools to access paths outside CWD
         \\      --no-tui          force plain output (no TUI)
+        \\      --debug           dump request envelope per turn to stderr
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\      --mcp <command>   spawn an MCP server (repeatable);
@@ -281,6 +289,11 @@ test "parse: --no-tui flag" {
 test "parse: --unsafe flag" {
     const o = try expectRun(parse(&.{ "velk", "--unsafe", "hi" }));
     try testing.expect(o.unsafe);
+}
+
+test "parse: --debug flag" {
+    const o = try expectRun(parse(&.{ "velk", "--debug", "hi" }));
+    try testing.expect(o.debug);
 }
 
 test "parse: flags in any order before positional" {

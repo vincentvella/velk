@@ -23,6 +23,9 @@ pub const Client = struct {
     base_url: []const u8 = default_base_url,
     http: std.http.Client,
     last_error_body: ?[]u8 = null,
+    /// When true, dump a one-line request envelope summary to stderr
+    /// before each call. Driven by the CLI `--debug` flag.
+    debug: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, api_key: []const u8, base_url: ?[]const u8) Client {
         return .{
@@ -54,6 +57,8 @@ pub const Client = struct {
 
         const body = try std.json.Stringify.valueAlloc(self.gpa, streaming_req, .{ .emit_null_optional_fields = false });
         defer self.gpa.free(body);
+
+        if (self.debug) self.dumpRequest(streaming_req, body.len);
 
         const auth_header = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{self.api_key});
         defer self.gpa.free(auth_header);
@@ -111,5 +116,14 @@ pub const Client = struct {
         defer buf.deinit();
         _ = reader.streamRemaining(&buf.writer) catch {};
         self.last_error_body = try self.gpa.dupe(u8, buf.writer.buffered());
+    }
+
+    fn dumpRequest(self: *Client, req: types.ChatRequest, body_len: usize) void {
+        _ = self;
+        const tool_count = if (req.tools) |t| t.len else 0;
+        std.debug.print(
+            "[debug] openai POST · model={s} · msgs={d} · tools={d} · body={d}b\n",
+            .{ req.model, req.messages.len, tool_count, body_len },
+        );
     }
 };
