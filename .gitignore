@@ -2,3 +2,10 @@ zig-out/
 .zig-cache/
 zig-pkg/
 ROADMAP.md
+
+# Local-only tool / editor config
+.claude/
+.DS_Store
+*.swp
+.vscode/
+.idea/
