@@ -12,6 +12,7 @@ const provider_mod = @import("provider.zig");
 const session_mod = @import("session.zig");
 const persist = @import("persist.zig");
 const cost = @import("cost.zig");
+const slash = @import("slash.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -218,6 +219,9 @@ const Tui = struct {
     /// independently from `selection` because normal mode shows just a
     /// caret while visual extends the selection.
     nav_cursor: Point = .{ .line = 0, .col = 0 },
+    /// Rolling sum of every per-turn `Usage` we've seen this session.
+    /// Drives `/cost`. Reset by `/clear`.
+    cumulative_usage: provider_mod.Usage = .{},
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -495,6 +499,10 @@ const Tui = struct {
     /// arrives from the worker.
     fn pushUsageNotice(self: *Tui, usage: provider_mod.Usage) !void {
         if (usage.input_tokens == 0 and usage.output_tokens == 0) return;
+        self.cumulative_usage.input_tokens += usage.input_tokens;
+        self.cumulative_usage.output_tokens += usage.output_tokens;
+        self.cumulative_usage.cache_read_tokens += usage.cache_read_tokens;
+        self.cumulative_usage.cache_creation_tokens += usage.cache_creation_tokens;
         var buf: std.ArrayList(u8) = .empty;
         try buf.print(self.arena, "[tokens: {d} in / {d} out", .{ usage.input_tokens, usage.output_tokens });
         if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0) {
@@ -675,6 +683,217 @@ fn extractSelection(arena: std.mem.Allocator, lines: []const RenderedLine, sel: 
     }
     return buf.items;
 }
+
+// ─── slash commands ──────────────────────────────────────────────
+
+/// Context passed to every slash handler. Lives on the stack of `run()`
+/// for the lifetime of the TUI loop.
+const SlashCtx = struct {
+    tui: *Tui,
+    env_map: *std.process.Environ.Map,
+    /// `null` until we know how to surface non-OSC-52 clipboards. For
+    /// now /copy uses the same OSC-52 escape as mouse-copy.
+    tty_writer: *Io.Writer,
+};
+
+fn slashCtx(ctx: *anyopaque) *SlashCtx {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn slashHelp(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(c.tui.arena, "Available commands:\n");
+    for (slash_registry.commands) |cmd| {
+        try buf.print(c.tui.arena, "  /{s:<10} {s}\n", .{ cmd.name, cmd.description });
+    }
+    // Drop the trailing newline so the block doesn't render an empty row.
+    if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n') _ = buf.pop();
+    try c.tui.pushBlock(.notice, buf.items);
+    return .handled;
+}
+
+fn slashClear(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    c.tui.sess.messages.clearRetainingCapacity();
+    c.tui.blocks.clearRetainingCapacity();
+    c.tui.assistant_buf.clearRetainingCapacity();
+    c.tui.has_open_assistant = false;
+    c.tui.cumulative_usage = .{};
+    c.tui.scroll_offset = 0;
+    try c.tui.pushBlock(.notice, "Cleared scrollback and conversation history.");
+    return .handled;
+}
+
+fn slashExit(_: *anyopaque, _: []const u8) anyerror!slash.Action {
+    return .exit;
+}
+
+fn slashCost(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    const u = c.tui.cumulative_usage;
+    if (u.input_tokens == 0 and u.output_tokens == 0) {
+        try c.tui.pushBlock(.notice, "No turns recorded yet — cost is $0.0000.");
+        return .handled;
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(c.tui.arena, "Session totals · {d} in / {d} out", .{ u.input_tokens, u.output_tokens });
+    if (u.cache_read_tokens > 0 or u.cache_creation_tokens > 0) {
+        try buf.print(c.tui.arena, " · cache {d} read / {d} write", .{ u.cache_read_tokens, u.cache_creation_tokens });
+    }
+    if (cost.turnCost(c.tui.model, u)) |total| {
+        try buf.print(c.tui.arena, " · ${d:.4}", .{total});
+    } else {
+        try buf.print(c.tui.arena, " · cost: model not in price table", .{});
+    }
+    try c.tui.pushBlock(.notice, buf.items);
+    return .handled;
+}
+
+/// Find the most recent assistant text — either an unflushed in-flight
+/// buffer (during a turn) or the last `.assistant_text` block.
+fn lastAssistantText(tui: *Tui) ?[]const u8 {
+    if (tui.has_open_assistant and tui.assistant_buf.items.len > 0) return tui.assistant_buf.items;
+    var i = tui.blocks.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (tui.blocks.items[i].kind == .assistant_text) return tui.blocks.items[i].text;
+    }
+    return null;
+}
+
+fn slashCopy(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    const text = lastAssistantText(c.tui) orelse {
+        try c.tui.pushBlock(.notice, "Nothing to copy — no assistant message yet.");
+        return .handled;
+    };
+    copyToClipboard(c.tui.arena, c.tty_writer, text) catch |err| {
+        const msg = try std.fmt.allocPrint(c.tui.arena, "/copy failed: {s}", .{@errorName(err)});
+        try c.tui.pushBlock(.tool_result_error, msg);
+        return .handled;
+    };
+    const msg = try std.fmt.allocPrint(c.tui.arena, "Copied {d} bytes to clipboard.", .{text.len});
+    try c.tui.pushBlock(.notice, msg);
+    return .handled;
+}
+
+fn slashModel(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    if (args.len == 0) {
+        const msg = try std.fmt.allocPrint(c.tui.arena, "Current model: {s}\nUsage: /model <id>", .{c.tui.model});
+        try c.tui.pushBlock(.notice, msg);
+        return .handled;
+    }
+    const owned = try c.tui.arena.dupe(u8, args);
+    c.tui.model = owned;
+    c.tui.sess.config.model = owned;
+    const msg = try std.fmt.allocPrint(c.tui.arena, "Model set to {s}.", .{owned});
+    try c.tui.pushBlock(.notice, msg);
+    return .handled;
+}
+
+fn slashSystem(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    if (args.len == 0) {
+        const cur = c.tui.sess.config.system orelse "(none)";
+        const msg = try std.fmt.allocPrint(c.tui.arena, "System prompt: {s}\nUsage: /system <text> (or /system clear)", .{cur});
+        try c.tui.pushBlock(.notice, msg);
+        return .handled;
+    }
+    if (std.mem.eql(u8, args, "clear")) {
+        c.tui.sess.config.system = null;
+        try c.tui.pushBlock(.notice, "System prompt cleared.");
+        return .handled;
+    }
+    // Strip a single pair of surrounding quotes so /system "be terse"
+    // doesn't store the quotes literally.
+    var text = args;
+    if (text.len >= 2 and ((text[0] == '"' and text[text.len - 1] == '"') or
+        (text[0] == '\'' and text[text.len - 1] == '\'')))
+    {
+        text = text[1 .. text.len - 1];
+    }
+    const owned = try c.tui.arena.dupe(u8, text);
+    c.tui.sess.config.system = owned;
+    try c.tui.pushBlock(.notice, "System prompt updated.");
+    return .handled;
+}
+
+fn slashSave(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    var path: ?[]const u8 = c.tui.sess.save_path;
+    if (args.len > 0) {
+        path = persist.sessionPath(c.tui.arena, c.env_map, args) catch |err| {
+            const msg = try std.fmt.allocPrint(c.tui.arena, "/save: bad name '{s}': {s}", .{ args, @errorName(err) });
+            try c.tui.pushBlock(.tool_result_error, msg);
+            return .handled;
+        };
+    }
+    const target = path orelse {
+        try c.tui.pushBlock(.notice, "Usage: /save <name>  (or launch with --session <name> to set a default)");
+        return .handled;
+    };
+    persist.save(c.tui.arena, c.tui.io, target, c.tui.sess.messages.items) catch |err| {
+        const msg = try std.fmt.allocPrint(c.tui.arena, "/save failed: {s}", .{@errorName(err)});
+        try c.tui.pushBlock(.tool_result_error, msg);
+        return .handled;
+    };
+    // Promote the path to be the implicit autosave target for the rest
+    // of this session.
+    c.tui.sess.save_path = target;
+    const msg = try std.fmt.allocPrint(c.tui.arena, "Saved {d} message(s) → {s}", .{ c.tui.sess.messages.items.len, target });
+    try c.tui.pushBlock(.notice, msg);
+    return .handled;
+}
+
+fn slashLoad(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    if (args.len == 0) {
+        try c.tui.pushBlock(.notice, "Usage: /load <name>");
+        return .handled;
+    }
+    const path = persist.sessionPath(c.tui.arena, c.env_map, args) catch |err| {
+        const msg = try std.fmt.allocPrint(c.tui.arena, "/load: bad name '{s}': {s}", .{ args, @errorName(err) });
+        try c.tui.pushBlock(.tool_result_error, msg);
+        return .handled;
+    };
+    const loaded = persist.load(c.tui.arena, c.tui.io, path) catch |err| {
+        const msg = try std.fmt.allocPrint(c.tui.arena, "/load failed: {s}", .{@errorName(err)});
+        try c.tui.pushBlock(.tool_result_error, msg);
+        return .handled;
+    };
+    const msgs = loaded orelse {
+        const msg = try std.fmt.allocPrint(c.tui.arena, "/load: no session named '{s}'", .{args});
+        try c.tui.pushBlock(.tool_result_error, msg);
+        return .handled;
+    };
+    c.tui.sess.messages.clearRetainingCapacity();
+    try c.tui.sess.messages.appendSlice(c.tui.arena, msgs);
+    c.tui.blocks.clearRetainingCapacity();
+    c.tui.assistant_buf.clearRetainingCapacity();
+    c.tui.has_open_assistant = false;
+    c.tui.scroll_offset = 0;
+    c.tui.sess.save_path = path;
+    const msg = try std.fmt.allocPrint(c.tui.arena, "Loaded session '{s}' ({d} message(s)).", .{ args, msgs.len });
+    try c.tui.pushBlock(.notice, msg);
+    return .handled;
+}
+
+const slash_commands = [_]slash.Command{
+    .{ .name = "help", .description = "list available commands", .handler = slashHelp },
+    .{ .name = "clear", .description = "clear scrollback and conversation history", .handler = slashClear },
+    .{ .name = "exit", .description = "leave the REPL", .handler = slashExit },
+    .{ .name = "quit", .description = "alias for /exit", .handler = slashExit },
+    .{ .name = "cost", .description = "show cumulative tokens + USD for this session", .handler = slashCost },
+    .{ .name = "copy", .description = "copy the last assistant message to the clipboard", .handler = slashCopy },
+    .{ .name = "model", .description = "show or change the active model id", .handler = slashModel },
+    .{ .name = "system", .description = "show or set the system prompt (use 'clear' to drop it)", .handler = slashSystem },
+    .{ .name = "save", .description = "persist the current session to disk", .handler = slashSave },
+    .{ .name = "load", .description = "replace the current session with a saved one", .handler = slashLoad },
+};
+
+const slash_registry: slash.Registry = .{ .commands = &slash_commands };
 
 fn copyToClipboard(arena: std.mem.Allocator, tty_writer: *Io.Writer, text: []const u8) !void {
     const encoder = std.base64.standard.Encoder;
@@ -1094,6 +1313,35 @@ pub fn run(
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     if (tui.input.items.len == 0) continue;
+
+                    // Slash commands intercept BEFORE we hand the line
+                    // to the model. Suppress agent dispatch + history
+                    // append on success so /help, /clear etc. don't
+                    // pollute the prompt-recall buffer with non-prompts.
+                    if (slash.parse(tui.input.items)) |parsed| {
+                        var slash_ctx: SlashCtx = .{
+                            .tui = &tui,
+                            .env_map = env_map,
+                            .tty_writer = tty.writer(),
+                        };
+                        const cmd_opt = slash_registry.find(parsed.name);
+                        tui.input.clearRetainingCapacity();
+                        if (cmd_opt) |cmd| {
+                            const action = cmd.handler(@ptrCast(&slash_ctx), parsed.args) catch |err| blk: {
+                                const msg = try std.fmt.allocPrint(tui_arena, "/{s} failed: {s}", .{ parsed.name, @errorName(err) });
+                                try tui.pushBlock(.tool_result_error, msg);
+                                break :blk slash.Action.handled;
+                            };
+                            try tui.render();
+                            if (action == .exit) return;
+                        } else {
+                            const msg = try std.fmt.allocPrint(tui_arena, "unknown command: /{s} (try /help)", .{parsed.name});
+                            try tui.pushBlock(.tool_result_error, msg);
+                            try tui.render();
+                        }
+                        continue;
+                    }
+
                     // Two copies of the prompt: one for tui's history (in
                     // tui_arena, lives for the session) and one for the
                     // worker (in gpa, lives until turn cleanup).
