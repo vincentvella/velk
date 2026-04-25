@@ -9,10 +9,6 @@ on:
 permissions:
   contents: write
 
-env:
-  # Opt into Node 24 for JS actions (actions/checkout@v4 etc.) so the
-  # runner stops emitting Node-20-deprecation warnings on every job.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
@@ -31,7 +27,7 @@ jobs:
           - target: x86_64-linux
             artifact: velk-linux-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install zig 0.16.0
         run: |
@@ -51,7 +47,7 @@ jobs:
           tar -czf ${{ matrix.artifact }}.tar.gz -C dist velk LICENSE
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -65,9 +61,9 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: artifacts
           merge-multiple: true
