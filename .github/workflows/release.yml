@@ -63,12 +63,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: artifacts/*
           generate_release_notes: true
