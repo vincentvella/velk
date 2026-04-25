@@ -222,6 +222,12 @@ const Tui = struct {
     /// Rolling sum of every per-turn `Usage` we've seen this session.
     /// Drives `/cost`. Reset by `/clear`.
     cumulative_usage: provider_mod.Usage = .{},
+    /// Frame counter for the status-line spinner. Advances on idle
+    /// ticks while `busy = true`.
+    spinner_tick: u32 = 0,
+    /// Number of MCP servers attached for this session (for the
+    /// status line). 0 when none.
+    mcp_count: u8 = 0,
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -346,9 +352,10 @@ const Tui = struct {
 
         const w = win.width;
         const h = win.height;
-        if (h < 3) return;
+        // Need at least: 1 row scrollback, status, separator, input.
+        if (h < 4) return;
 
-        const scroll_h: u16 = h - 2;
+        const scroll_h: u16 = h - 3;
 
         // Reset (not deinit) so previous render's lines memory is
         // reclaimed AND `all_lines` is repointed to a fresh slab that
@@ -403,6 +410,10 @@ const Tui = struct {
                 .wrap = .none,
             });
         }
+
+        // Status row at h-3: model · tokens · cost · spinner-when-busy.
+        // One row, padded so the cost sits flush right.
+        try self.renderStatusLine(lines_alloc, win, h - 3, w);
 
         const sep_row: u16 = h - 2;
         var sep_buf: std.ArrayList(u8) = .empty;
@@ -497,6 +508,44 @@ const Tui = struct {
     /// Append a turn-summary notice with token counts (and cost when
     /// the model is in our price table). Called when an `a_usage` event
     /// arrives from the worker.
+    /// Paint the status row at `row`. Layout (best-effort, truncates
+    /// gracefully on narrow terminals):
+    ///
+    ///     ⠋ claude-opus-4-7 · 12 in / 7 out · mcp:2          $0.0007
+    ///     ^ spinner / ◆ idle    ^model               ^tokens     ^cost
+    fn renderStatusLine(self: *Tui, gpa: std.mem.Allocator, win: vaxis.Window, row: u16, w: u16) !void {
+        const spinner_glyphs = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+        const head: []const u8 = if (self.busy)
+            spinner_glyphs[self.spinner_tick % spinner_glyphs.len]
+        else
+            "◆";
+
+        var left: std.ArrayList(u8) = .empty;
+        try left.print(gpa, " {s} {s}", .{ head, self.model });
+        const u = self.cumulative_usage;
+        if (u.input_tokens != 0 or u.output_tokens != 0) {
+            try left.print(gpa, " · {d} in / {d} out", .{ u.input_tokens, u.output_tokens });
+        }
+        if (self.mcp_count > 0) try left.print(gpa, " · mcp:{d}", .{self.mcp_count});
+
+        var right: std.ArrayList(u8) = .empty;
+        if (cost.turnCost(self.model, u)) |c| {
+            if (c > 0) try right.print(gpa, "${d:.4} ", .{c});
+        }
+
+        var line: std.ArrayList(u8) = .empty;
+        try line.appendSlice(gpa, left.items);
+        const used = displayWidth(left.items) + displayWidth(right.items);
+        if (used < w) try line.appendNTimes(gpa, ' ', w - used);
+        try line.appendSlice(gpa, right.items);
+
+        const fg: vaxis.Color = if (self.busy) .{ .index = 3 } else .{ .index = 8 };
+        _ = win.print(&.{.{
+            .text = line.items[0..@min(line.items.len, std.math.maxInt(u16))],
+            .style = .{ .fg = fg, .bg = .{ .index = 0 } },
+        }}, .{ .row_offset = row, .wrap = .none });
+    }
+
     fn pushUsageNotice(self: *Tui, usage: provider_mod.Usage) !void {
         if (usage.input_tokens == 0 and usage.output_tokens == 0) return;
         self.cumulative_usage.input_tokens += usage.input_tokens;
@@ -515,6 +564,20 @@ const Tui = struct {
         try self.pushBlock(.notice, buf.items);
     }
 };
+
+/// Approximate visible-column count for a UTF-8 string. Counts the
+/// number of code points (bytes whose top two bits aren't `10`),
+/// treating each as one column. Good enough for the status line where
+/// we only render Latin + a handful of single-cell box-drawing /
+/// braille glyphs — wide East-Asian + emoji would over-count, but we
+/// don't render those here.
+fn displayWidth(text: []const u8) usize {
+    var n: usize = 0;
+    for (text) |b| {
+        if ((b & 0xc0) != 0x80) n += 1;
+    }
+    return n;
+}
 
 fn isWordChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
@@ -913,6 +976,7 @@ pub fn run(
     env_map: *std.process.Environ.Map,
     sess: *session_mod.Session,
     model: []const u8,
+    mcp_count: u8,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -951,6 +1015,7 @@ pub fn run(
         .loop = &loop,
         .sess = sess,
         .model = model,
+        .mcp_count = mcp_count,
         .lines_arena = &lines_arena,
     };
     defer tui.cancelTurn() catch {}; // ensure worker is awaited if user exits mid-turn
@@ -976,6 +1041,14 @@ pub fn run(
         // holding the mouse at the edge scrolls continuously.
         const maybe_event: ?Event = try loop.tryEvent();
         const event = maybe_event orelse {
+            // Spinner tick: when a turn is in flight, advance the
+            // status-line spinner ~every 100ms so it visibly animates
+            // even when no events are arriving.
+            if (tui.busy) {
+                tui.spinner_tick +%= 1;
+                // Idle sleep is 50ms; render every 2nd idle tick.
+                if (tui.spinner_tick % 2 == 0) try tui.render();
+            }
             if (tui.autoscroll != .none and tui.selection.active) {
                 const lines_per_tick: usize = 1;
                 const total = tui.all_lines.len;

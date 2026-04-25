@@ -241,7 +241,8 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
 
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model) catch |err| {
+            const mcp_count: u8 = if (mcp_servers) |s| @intCast(@min(255, s.clients.items.len)) else 0;
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);

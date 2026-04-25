@@ -211,6 +211,7 @@ def run_slash_cases(bin_path: Path) -> None:
     try:
         # Wait for the REPL banner so we know vaxis is up before sending.
         ok = tui.wait_for("velk REPL")
+        case("status line shows idle marker + model", tui.saw("◆ claude-opus-4-7"))
         if not ok:
             print("    (debug) buffer so far:", repr(strip_ansi(tui.buf))[:500])
             print("    (debug) raw bytes head:", repr(tui.buf)[:300])
@@ -230,6 +231,13 @@ def run_slash_cases(bin_path: Path) -> None:
 
         tui.send_line("/model claude-sonnet-4-6")
         case("/model sets new id", tui.wait_for("Model set to claude-sonnet-4-6"))
+        # Note: we don't assert the status-line update for the new
+        # model here. Vaxis emits a *cell-level diff*, so unchanged
+        # cells (the diamond glyph etc.) aren't re-sent — making
+        # "◆ claude-sonnet-4-6" not appear as a contiguous byte run
+        # in the stripped buffer even though the line is correct on
+        # screen. The startup assertion above covers the status line
+        # being rendered at all.
 
         tui.send_line("/system be terse")
         case("/system stores prompt", tui.wait_for("System prompt updated"))
