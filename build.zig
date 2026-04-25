@@ -150,6 +150,14 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(test_step);
     check_step.dependOn(smoke_step);
 
+    // `zig build mock` starts the python mock model server. Use to
+    // develop / demo velk without burning real API tokens. Point velk
+    // at it via ANTHROPIC_BASE_URL or OPENAI_BASE_URL.
+    const mock_cmd = b.addSystemCommand(&.{ "python3", "scripts/mock-server.py" });
+    if (b.args) |args| mock_cmd.addArgs(args);
+    const mock_step = b.step("mock", "Run the mock model server (Ctrl-C to stop)");
+    mock_step.dependOn(&mock_cmd.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

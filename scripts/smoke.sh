@@ -105,6 +105,50 @@ SMOKE_EXPECT_STDOUT="Usage: velk" run_case "no prompt + no tty prints help" 0 \
 
 unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
 
+# Integration: spin up the python mock server and assert velk gets the
+# canned reply end-to-end (network → SSE parser → text deltas → exit).
+# Skipped when python3 isn't available; otherwise gives us real
+# coverage of the agent loop without burning tokens.
+if command -v python3 >/dev/null 2>&1; then
+    MOCK_PORT="${SMOKE_MOCK_PORT:-8765}"
+    python3 scripts/mock-server.py --port "$MOCK_PORT" >/tmp/velk-smoke-mock.log 2>&1 &
+    MOCK_PID=$!
+    trap "kill $MOCK_PID 2>/dev/null || true" EXIT
+
+    # Wait up to 5s for the mock to come up.
+    for _ in $(seq 1 50); do
+        if curl -sf "http://127.0.0.1:$MOCK_PORT/_health" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    SMOKE_EXPECT_STDOUT="Mock reply from velk-mock-server" run_case \
+        "mock anthropic streaming roundtrip" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui "anything"
+
+    SMOKE_EXPECT_STDOUT="arenas bloom" run_case \
+        "mock anthropic scenario auto-pick" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui "write a haiku"
+
+    SMOKE_EXPECT_STDOUT="Mock reply from velk-mock-server" run_case \
+        "mock openai streaming roundtrip" 0 \
+        env "OPENAI_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/chat/completions" \
+            OPENAI_API_KEY=sk-fake \
+            "$VELK" --provider openai --no-tui "anything"
+
+    kill "$MOCK_PID" 2>/dev/null || true
+    trap - EXIT
+else
+    echo "smoke: skipping mock-server cases (python3 not on PATH)"
+fi
+
+unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
 echo
 echo "smoke: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -gt 0 ]]; then

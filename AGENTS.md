@@ -24,11 +24,37 @@ MCP, vim-mode TUI). Single static binary, no runtime.
 ```sh
 zig build                                # debug build → zig-out/bin/velk
 zig build -Doptimize=ReleaseFast         # release build
-zig build test                           # run all `test` blocks
+zig build test                           # unit tests
+zig build smoke                          # CLI smoke tests (no API)
+zig build check                          # test + smoke
+zig build mock                           # start the python mock model server
 zig build -Dtarget=x86_64-linux          # cross-compile (Zig native)
 ```
 
+`scripts/install-hooks.sh` installs a pre-commit hook that runs
+`zig build check`. Run it once per fresh clone.
+
 There is no separate lint or formatter step beyond `zig fmt`.
+
+## Local development without burning tokens
+
+`scripts/mock-server.py` (also `zig build mock`) is a stdlib-only Python
+HTTP server that replays canned SSE responses from `tests/fixtures/`.
+Point velk at it via `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`:
+
+```sh
+zig build mock &     # listens on http://127.0.0.1:8765
+ANTHROPIC_BASE_URL=http://127.0.0.1:8765/v1/messages \
+    ANTHROPIC_API_KEY=sk-fake \
+    ./zig-out/bin/velk "anything"
+```
+
+Fixture picking: an `X-Mock-Scenario: <name>` header wins; otherwise the
+mock substring-matches the user prompt against fixture filenames
+(`tests/fixtures/anthropic/haiku.sse` matches a prompt containing
+"haiku"); finally falls back to `default.sse`. Drop a recorded
+real-API SSE transcript into the fixtures dir to add a scenario — the
+mock streams it byte-for-byte.
 
 ## Layout
 

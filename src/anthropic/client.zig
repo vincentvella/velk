@@ -47,11 +47,12 @@ pub const Client = struct {
     http: std.http.Client,
     last_error_body: ?[]u8 = null,
 
-    pub fn init(gpa: std.mem.Allocator, io: Io, api_key: []const u8) Client {
+    pub fn init(gpa: std.mem.Allocator, io: Io, api_key: []const u8, base_url: ?[]const u8) Client {
         return .{
             .gpa = gpa,
             .io = io,
             .api_key = api_key,
+            .base_url = base_url orelse default_base_url,
             .http = .{ .allocator = gpa, .io = io },
         };
     }

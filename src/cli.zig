@@ -147,6 +147,7 @@ pub fn printHelp(w: anytype) !void {
         \\  ANTHROPIC_API_KEY     required for --provider anthropic (default: {s})
         \\  OPENAI_API_KEY        required for --provider openai
         \\  OPENROUTER_API_KEY    required for --provider openrouter
+        \\  ANTHROPIC_BASE_URL    optional override for anthropic base URL (e.g. mock server)
         \\  OPENAI_BASE_URL       optional override for openai/openrouter base URL
         \\
     , .{ default_max_tokens, default_model });

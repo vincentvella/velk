@@ -108,9 +108,26 @@ If no prompt is given, velk launches the TUI.
 | -------------------- | ------------------------------------------------------- |
 | `ANTHROPIC_API_KEY`  | Anthropic auth                                          |
 | `OPENAI_API_KEY`     | OpenAI / OpenRouter / other OAI-compatible gateway auth |
+| `ANTHROPIC_BASE_URL` | Override Anthropic base URL (e.g. point at the mock server) |
 | `OPENAI_BASE_URL`    | Override OpenAI base URL (defaults to api.openai.com)   |
 | `XDG_DATA_HOME`      | Where sessions live (defaults to `~/.local/share`)      |
 | `XDG_STATE_HOME`     | Where input history lives (defaults to `~/.local/state`)|
+
+## Development
+
+```sh
+zig build test       # unit tests
+zig build smoke      # CLI smoke tests (no API)
+zig build check      # test + smoke
+zig build mock       # mock model server — replays canned SSE
+                     # responses so you can run velk without burning tokens
+scripts/install-hooks.sh   # one-time: install pre-commit hook
+```
+
+CI runs `zig build test` + `zig build smoke` on every push and PR
+(`.github/workflows/ci.yml`); release tarballs are still cut on `v*`
+tags by `release.yml`. See [AGENTS.md](AGENTS.md) for the mock-server
+workflow and project conventions.
 
 ## Project status
 

@@ -266,8 +266,9 @@ fn setupProvider(
                 try errw.flush();
                 return SetupError.MissingApiKey;
             };
+            const base = init.environ_map.get("ANTHROPIC_BASE_URL");
             holder.* = .{ .anthropic = .{
-                .client = anthropic.Client.init(init.gpa, init.io, key),
+                .client = anthropic.Client.init(init.gpa, init.io, key, base),
                 .adapter = undefined,
             } };
             holder.anthropic.adapter = anthropic.Adapter.init(arena, &holder.anthropic.client);
