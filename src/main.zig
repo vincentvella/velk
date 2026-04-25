@@ -11,6 +11,7 @@ const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
 const cost = @import("cost.zig");
+const mcp = @import("mcp.zig");
 const tui = @import("tui.zig");
 
 /// Sink that mirrors the original plain-CLI behavior: assistant text to
@@ -163,7 +164,36 @@ pub fn main(init: std.process.Init) !void {
 
             const settings = try arena.create(tools.Settings);
             settings.* = .{ .io = init.io, .unsafe = opts.unsafe };
-            const tool_set = try tools.buildAll(arena, settings);
+            const builtin_tools = try tools.buildAll(arena, settings);
+
+            // Spawn any MCP servers the user passed via --mcp <cmd>;
+            // their tools merge into the registry alongside built-ins.
+            // Copy the cli's mcp_servers into the arena first (the cli
+            // parser hands us a slice into its now-dead stack frame).
+            var mcp_servers: ?mcp.Servers = null;
+            defer if (mcp_servers) |*s| s.deinit(init.io);
+
+            var tool_set: []const tool.Tool = builtin_tools;
+            if (opts.mcp_servers.len > 0) {
+                const argvs = try arena.alloc([]const []const u8, opts.mcp_servers.len);
+                for (opts.mcp_servers, 0..) |cmd, i| {
+                    const owned_cmd = try arena.dupe(u8, cmd);
+                    argvs[i] = try splitWhitespace(arena, owned_cmd);
+                }
+
+                const servers = try mcp.start(arena, init.gpa, init.io, argvs);
+                mcp_servers = servers;
+
+                if (servers.tools.len > 0) {
+                    const merged = try arena.alloc(tool.Tool, builtin_tools.len + servers.tools.len);
+                    @memcpy(merged[0..builtin_tools.len], builtin_tools);
+                    @memcpy(merged[builtin_tools.len..], servers.tools);
+                    tool_set = merged;
+                }
+
+                try errw.print("velk: mcp · {d} server(s) · {d} tool(s) added\n", .{ servers.clients.items.len, servers.tools.len });
+                try errw.flush();
+            }
 
             const model = opts.model orelse defaultModelFor(opts.provider);
 
@@ -317,6 +347,17 @@ fn redactKey(key: []const u8) []const u8 {
     };
     @memcpy(Static.slot[0..out.len], out);
     return Static.slot[0..out.len];
+}
+
+/// Split a shell-style command string on whitespace runs. Quoting is
+/// not interpreted — pass shell-escaped commands without quotes for
+/// now (e.g. `--mcp 'npx @modelcontextprotocol/server-filesystem /tmp'`
+/// works because the surrounding shell already strips the quotes).
+fn splitWhitespace(arena: std.mem.Allocator, cmd: []const u8) ![]const []const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    var iter = std.mem.tokenizeAny(u8, cmd, " \t");
+    while (iter.next()) |part| try parts.append(arena, part);
+    return parts.items;
 }
 
 fn renderProviderError(errw: *Io.Writer, err: anyerror, provider: provider_mod.Provider) !void {

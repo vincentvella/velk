@@ -23,6 +23,9 @@ pub const Options = struct {
     /// Optional session name. When set, message history is loaded from
     /// (and saved back to) ~/.local/share/velk/sessions/<name>.json.
     session: ?[]const u8 = null,
+    /// Repeatable: each entry is a shell command line for an MCP
+    /// server to spawn. Parsed at the call site (split on whitespace).
+    mcp_servers: []const []const u8 = &.{},
 };
 
 pub const ParseError = struct {
@@ -37,6 +40,12 @@ pub const Action = union(enum) {
     parse_error: ParseError,
 };
 
+/// Static storage for repeated `--mcp` values. Module-scope so the
+/// returned slice on `Options.mcp_servers` outlives the parser's
+/// stack frame (slices into a function-local array would dangle the
+/// moment `parse` returns). 16 is overkill for any reasonable user.
+var mcp_storage: [16][]const u8 = undefined;
+
 pub fn parse(args: []const []const u8) Action {
     if (args.len == 0) {
         return errAction("missing argv[0]", null);
@@ -44,6 +53,7 @@ pub fn parse(args: []const []const u8) Action {
 
     var opts: Options = .{};
     var prompt: ?[]const u8 = null;
+    var mcp_count: usize = 0;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -81,6 +91,13 @@ pub fn parse(args: []const []const u8) Action {
             opts.session = v;
             continue;
         }
+        if (eql(arg, "--mcp")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            if (mcp_count >= mcp_storage.len) return errAction("too many --mcp servers (max 16)", null);
+            mcp_storage[mcp_count] = v;
+            mcp_count += 1;
+            continue;
+        }
         if (eql(arg, "--provider") or eql(arg, "-p")) {
             const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
             if (eql(v, "anthropic")) opts.provider = .anthropic
@@ -99,6 +116,7 @@ pub fn parse(args: []const []const u8) Action {
     }
 
     if (prompt) |p| opts.prompt = p;
+    if (mcp_count > 0) opts.mcp_servers = mcp_storage[0..mcp_count];
     return .{ .run = opts };
 }
 
@@ -120,6 +138,8 @@ pub fn printHelp(w: anytype) !void {
         \\      --no-tui          force plain output (no TUI)
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
+        \\      --mcp <command>   spawn an MCP server (repeatable);
+        \\                        e.g. --mcp 'npx @modelcontextprotocol/server-filesystem /tmp'
         \\  -h, --help            show this help
         \\  -V, --version         show version
         \\
