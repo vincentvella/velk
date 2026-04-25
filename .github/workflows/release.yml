@@ -185,11 +185,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if git diff --quiet Formula/velk.rb; then
+          # Stage first so the up-to-date check works on a brand-new
+          # file too — `git diff --quiet` on an unstaged path treats
+          # untracked files as "no diff" and would silently skip.
+          git add Formula/velk.rb
+          if git diff --cached --quiet -- Formula/velk.rb; then
             echo "tap already up to date for $VERSION — nothing to push"
             exit 0
           fi
 
-          git add Formula/velk.rb
           git commit -m "velk $VERSION"
           git push origin HEAD:main
