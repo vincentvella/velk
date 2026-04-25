@@ -1,32 +1,62 @@
 # Homebrew formula
 
-To publish on Homebrew, push `velk.rb` into a tap repo named
-`vincentvella/homebrew-velk` (the `homebrew-` prefix is required by the
-`brew tap` resolver). Steps:
+`brew/velk.rb` is the source-of-truth template. Publishing to the tap is
+automated by `.github/workflows/release.yml` — the `homebrew` job runs after
+each tagged release, downloads the four `.sha256` files from the GitHub
+release, regenerates the formula with the new version + hashes, and pushes to
+the tap repo.
+
+## One-time setup
+
+1. Create the tap repo (the `homebrew-` prefix is required by `brew tap`):
+
+   ```sh
+   gh repo create vincentvella/homebrew-velk --public --description "Homebrew tap for velk"
+   ```
+
+2. Create a fine-grained Personal Access Token with `Contents: read & write`
+   scoped to `vincentvella/homebrew-velk`. (Or a classic PAT with `repo`
+   scope if you prefer.)
+
+3. Add the token to this repo's secrets as `HOMEBREW_TAP_TOKEN`:
+
+   ```sh
+   gh secret set HOMEBREW_TAP_TOKEN --body "<token>"
+   ```
+
+   Optional: override the tap repo path with a repo variable:
+
+   ```sh
+   gh variable set HOMEBREW_TAP_REPO --body "youruser/homebrew-velk"
+   ```
+
+4. The workflow gates on the secret being present — if it isn't set, the job
+   skips cleanly so the rest of the release still publishes.
+
+## Releasing
+
+Tag and push:
 
 ```sh
-gh repo create vincentvella/homebrew-velk --public --description "Homebrew tap for velk"
-git clone git@github.com:vincentvella/homebrew-velk.git
-cp brew/velk.rb homebrew-velk/Formula/velk.rb
-cd homebrew-velk && git add Formula/velk.rb && git commit -m "velk 0.0.1" && git push
+git tag v0.0.2
+git push origin v0.0.2
 ```
 
-Then anyone can install with:
+The release workflow will:
+1. Build the four target binaries (darwin/linux × arm64/x64)
+2. Upload them + sha256s to the GitHub release
+3. Regenerate `brew/velk.rb` from those sha256s and push it to
+   `Formula/velk.rb` in the tap repo
+
+## Installing
 
 ```sh
 brew tap vincentvella/velk
 brew install velk
 ```
 
-## Bumping the version
+## Manual override
 
-After a new GitHub release is published:
-
-1. Update the `version` line at the top of `velk.rb`.
-2. Replace each `sha256` with the matching value from
-   `https://github.com/vincentvella/velk/releases/download/vX.Y.Z/velk-<os>-<arch>.tar.gz.sha256`.
-3. Commit + push the tap repo.
-
-The CI workflow at `.github/workflows/release.yml` already publishes
-the four `.tar.gz` artifacts plus matching `.sha256` files for every
-tagged release.
+If you need to publish a formula by hand (e.g. tap-only patch release, or the
+PAT expired), the regenerated `brew/velk.rb` from a release run can be copied
+straight into the tap.

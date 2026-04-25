@@ -73,3 +73,123 @@ jobs:
           files: artifacts/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  homebrew:
+    name: bump homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v5
+
+      # Skip cleanly when the tap PAT isn't configured (e.g. in forks).
+      # This lets the rest of the release pipeline succeed even if the
+      # maintainer hasn't set up tap publishing yet.
+      - name: check for tap token
+        id: gate
+        run: |
+          if [[ -z "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN secret not set — skipping tap bump"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: derive version
+        if: steps.gate.outputs.skip != 'true'
+        id: ver
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: download release sha256s
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p sums
+          tag="${{ steps.ver.outputs.tag }}"
+          base="https://github.com/${{ github.repository }}/releases/download/$tag"
+          for art in velk-darwin-arm64 velk-darwin-x64 velk-linux-arm64 velk-linux-x64; do
+            curl -fsSL "$base/$art.tar.gz.sha256" -o "sums/$art.sha256"
+          done
+
+      - name: rewrite formula
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          version="${{ steps.ver.outputs.version }}"
+
+          # `shasum -a 256 <file>` writes "<hash>  <file>" — first field is the hash.
+          hash_for() { awk '{print $1}' "sums/$1.sha256"; }
+          DA=$(hash_for velk-darwin-arm64)
+          DX=$(hash_for velk-darwin-x64)
+          LA=$(hash_for velk-linux-arm64)
+          LX=$(hash_for velk-linux-x64)
+
+          cat > brew/velk.rb <<RUBY
+          class Velk < Formula
+            desc "Zig 0.16 terminal AI harness — Anthropic + OpenAI, MCP, vim mode, OSC-52 clipboard"
+            homepage "https://github.com/${{ github.repository }}"
+            version "$version"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/${{ github.repository }}/releases/download/v#{version}/velk-darwin-arm64.tar.gz"
+                sha256 "$DA"
+              end
+              on_intel do
+                url "https://github.com/${{ github.repository }}/releases/download/v#{version}/velk-darwin-x64.tar.gz"
+                sha256 "$DX"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/${{ github.repository }}/releases/download/v#{version}/velk-linux-arm64.tar.gz"
+                sha256 "$LA"
+              end
+              on_intel do
+                url "https://github.com/${{ github.repository }}/releases/download/v#{version}/velk-linux-x64.tar.gz"
+                sha256 "$LX"
+              end
+            end
+
+            def install
+              bin.install "velk"
+            end
+
+            test do
+              assert_match "velk #{version}", shell_output("#{bin}/velk --version")
+            end
+          end
+          RUBY
+
+      - name: clone tap, copy formula, push
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Owner/repo of the tap. Override via repo variable
+          # HOMEBREW_TAP_REPO if you fork or rename it.
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO || 'vincentvella/homebrew-velk' }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/$TAP_REPO.git" tap
+          mkdir -p tap/Formula
+          cp brew/velk.rb tap/Formula/velk.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet Formula/velk.rb; then
+            echo "tap already up to date for $VERSION — nothing to push"
+            exit 0
+          fi
+
+          git add Formula/velk.rb
+          git commit -m "velk $VERSION"
+          git push origin HEAD:main
