@@ -1319,23 +1319,32 @@ pub fn run(
                     // append on success so /help, /clear etc. don't
                     // pollute the prompt-recall buffer with non-prompts.
                     if (slash.parse(tui.input.items)) |parsed| {
+                        // Dupe name + args into the tui arena before
+                        // clearing the input buffer — `parsed` borrows
+                        // slices of `tui.input.items`, so clearing first
+                        // would let the next keystroke overwrite them
+                        // and the handler would see garbage. (Caught by
+                        // scripts/tui-test.py — corruption appeared as
+                        // `Model set to ����`.)
+                        const name_owned = try tui_arena.dupe(u8, parsed.name);
+                        const args_owned = try tui_arena.dupe(u8, parsed.args);
+                        tui.input.clearRetainingCapacity();
+
                         var slash_ctx: SlashCtx = .{
                             .tui = &tui,
                             .env_map = env_map,
                             .tty_writer = tty.writer(),
                         };
-                        const cmd_opt = slash_registry.find(parsed.name);
-                        tui.input.clearRetainingCapacity();
-                        if (cmd_opt) |cmd| {
-                            const action = cmd.handler(@ptrCast(&slash_ctx), parsed.args) catch |err| blk: {
-                                const msg = try std.fmt.allocPrint(tui_arena, "/{s} failed: {s}", .{ parsed.name, @errorName(err) });
+                        if (slash_registry.find(name_owned)) |cmd| {
+                            const action = cmd.handler(@ptrCast(&slash_ctx), args_owned) catch |err| blk: {
+                                const msg = try std.fmt.allocPrint(tui_arena, "/{s} failed: {s}", .{ name_owned, @errorName(err) });
                                 try tui.pushBlock(.tool_result_error, msg);
                                 break :blk slash.Action.handled;
                             };
                             try tui.render();
                             if (action == .exit) return;
                         } else {
-                            const msg = try std.fmt.allocPrint(tui_arena, "unknown command: /{s} (try /help)", .{parsed.name});
+                            const msg = try std.fmt.allocPrint(tui_arena, "unknown command: /{s} (try /help)", .{name_owned});
                             try tui.pushBlock(.tool_result_error, msg);
                             try tui.render();
                         }

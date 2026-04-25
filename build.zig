@@ -150,6 +150,16 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(test_step);
     check_step.dependOn(smoke_step);
 
+    // `zig build tui-test` drives the TUI under a python pty harness
+    // (scripts/tui-test.py) and asserts on ANSI-stripped output. Lets
+    // us cover slash commands and other interactive behaviour without
+    // a real terminal.
+    const tui_cmd = b.addSystemCommand(&.{ "python3", "scripts/tui-test.py" });
+    tui_cmd.step.dependOn(b.getInstallStep());
+    const tui_test_step = b.step("tui-test", "Run TUI pty harness");
+    tui_test_step.dependOn(&tui_cmd.step);
+    check_step.dependOn(tui_test_step);
+
     // `zig build mock` starts the python mock model server. Use to
     // develop / demo velk without burning real API tokens. Point velk
     // at it via ANTHROPIC_BASE_URL or OPENAI_BASE_URL.

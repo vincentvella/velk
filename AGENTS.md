@@ -26,7 +26,8 @@ zig build                                # debug build → zig-out/bin/velk
 zig build -Doptimize=ReleaseFast         # release build
 zig build test                           # unit tests
 zig build smoke                          # CLI smoke tests (no API)
-zig build check                          # test + smoke
+zig build tui-test                       # python pty harness — drives the TUI + slash commands
+zig build check                          # test + smoke + tui-test
 zig build mock                           # start the python mock model server
 zig build -Dtarget=x86_64-linux          # cross-compile (Zig native)
 ```
@@ -102,6 +103,18 @@ ROADMAP.md          phased plan (gitignored — local working doc)
 - **OpenAI gpt-5+ requires `max_completion_tokens`**, not `max_tokens` — see
   `openai/types.zig`.
 - **No `--no-verify` on git commits.** If a hook fails, fix it.
+- **Slash-command args are slices into `tui.input.items`.** Always dupe
+  `parsed.name` and `parsed.args` into the tui arena BEFORE calling
+  `tui.input.clearRetainingCapacity()` — otherwise the next keystroke
+  overwrites the bytes the handler is reading. Caught by the pty
+  harness as `Model set to ����`.
+- **TUI lifecycle under a pty hangs in macOS `E` state.** Returning
+  from `tui.run()` (via `/exit`, Ctrl-D, or any other path) leaves
+  vaxis's kqueue reader thread blocking `loop.stop()` long enough that
+  even SIGKILL takes seconds to actually reap the process. Real
+  terminal use is unaffected. The pty harness compensates by not
+  asserting on /exit's exit code; the dispatcher is proven via the
+  other slash assertions.
 
 ## Testing
 
