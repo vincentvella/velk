@@ -203,6 +203,117 @@ const Tui = struct {
     /// `null` = composing fresh; otherwise an index into `input_history`
     /// counted from the *end* (0 = last submitted prompt).
     history_idx: ?usize = null,
+    /// Vim-ish modal toggle. Insert is the default and matches the
+    /// pre-vim-mode behavior exactly. Normal mode swallows printable
+    /// keys and reinterprets them as scrollback navigation. Visual
+    /// (charwise) keeps `selection.anchor` pinned and grows
+    /// `selection.cursor` with the nav cursor; visual_line widens
+    /// the selection to whole lines from min(anchor,cursor) to max.
+    mode: enum { insert, normal, visual, visual_line } = .insert,
+    /// In visual_line mode we remember the anchor's line so the
+    /// recomputed selection covers exactly the line range, regardless
+    /// of which direction the cursor moves.
+    visual_line_anchor: usize = 0,
+    /// Logical (line, col) cursor used by normal/visual modes. Tracked
+    /// independently from `selection` because normal mode shows just a
+    /// caret while visual extends the selection.
+    nav_cursor: Point = .{ .line = 0, .col = 0 },
+
+    /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
+    /// be called after touching `nav_cursor.line`. Uses the most recent
+    /// render's `visible_h`; safe before the first render (no-op).
+    fn ensureCursorVisible(self: *Tui) void {
+        if (self.visible_h == 0 or self.all_lines.len == 0) return;
+        const total = self.all_lines.len;
+        const max_offset = if (total > self.visible_h) total - self.visible_h else 0;
+        const top = total -| @min(self.scroll_offset, max_offset) -| self.visible_h;
+        const bot = total -| @min(self.scroll_offset, max_offset);
+        if (self.nav_cursor.line < top) {
+            // cursor is above viewport — increase offset
+            self.scroll_offset = total -| self.nav_cursor.line -| self.visible_h;
+        } else if (self.nav_cursor.line >= bot) {
+            // cursor is at/below viewport — decrease offset
+            self.scroll_offset = total -| self.nav_cursor.line -| 1;
+        }
+    }
+
+    fn lineLen(self: *const Tui, line_idx: usize) usize {
+        if (line_idx >= self.all_lines.len) return 0;
+        return self.all_lines[line_idx].text.len;
+    }
+
+    /// Move `nav_cursor` to the start of the next word, walking across
+    /// lines if the current one has nothing left. No-op at end of
+    /// scrollback.
+    fn moveWordForward(self: *Tui) void {
+        if (self.all_lines.len == 0) return;
+        // First try same line, starting after current col.
+        if (self.nav_cursor.line < self.all_lines.len) {
+            const text = self.all_lines[self.nav_cursor.line].text;
+            if (nextWordStart(text, self.nav_cursor.col)) |c| {
+                self.nav_cursor.col = @intCast(c);
+                return;
+            }
+        }
+        // Scan subsequent lines for the first word.
+        var li: usize = self.nav_cursor.line + 1;
+        while (li < self.all_lines.len) : (li += 1) {
+            const text = self.all_lines[li].text;
+            if (firstWordStart(text)) |c| {
+                self.nav_cursor.line = li;
+                self.nav_cursor.col = @intCast(c);
+                return;
+            }
+        }
+    }
+
+    /// Inverse of `moveWordForward`. No-op at start of scrollback.
+    fn moveWordBackward(self: *Tui) void {
+        if (self.all_lines.len == 0) return;
+        if (self.nav_cursor.line < self.all_lines.len) {
+            const text = self.all_lines[self.nav_cursor.line].text;
+            if (prevWordStart(text, self.nav_cursor.col)) |c| {
+                self.nav_cursor.col = @intCast(c);
+                return;
+            }
+        }
+        var li: usize = self.nav_cursor.line;
+        while (li > 0) {
+            li -= 1;
+            const text = self.all_lines[li].text;
+            if (lastWordStart(text)) |c| {
+                self.nav_cursor.line = li;
+                self.nav_cursor.col = @intCast(c);
+                return;
+            }
+        }
+    }
+
+    /// In visual_line mode, snap `selection` to cover whole lines from
+    /// `visual_line_anchor` through the current nav_cursor's line.
+    fn syncVisualLineSelection(self: *Tui) void {
+        const a_line = self.visual_line_anchor;
+        const c_line = self.nav_cursor.line;
+        const lo = @min(a_line, c_line);
+        const hi = @max(a_line, c_line);
+        const hi_len = self.lineLen(hi);
+        const hi_col: u16 = if (hi_len == 0) 0 else @intCast(hi_len - 1);
+        self.selection.anchor = .{ .line = lo, .col = 0 };
+        self.selection.cursor = .{ .line = hi, .col = hi_col };
+        self.selection.active = true;
+    }
+
+    /// Clamp the nav cursor to the bounds of its current line. Call
+    /// after any line move so the cursor doesn't sit past the right
+    /// edge of a now-shorter row.
+    fn clampNavCol(self: *Tui) void {
+        const len = self.lineLen(self.nav_cursor.line);
+        if (len == 0) {
+            self.nav_cursor.col = 0;
+        } else if (self.nav_cursor.col >= len) {
+            self.nav_cursor.col = @intCast(len - 1);
+        }
+    }
 
     fn pushBlock(self: *Tui, kind: Block.Kind, text: []const u8) !void {
         try self.flushOpenAssistant();
@@ -274,6 +385,21 @@ const Tui = struct {
             }
         }
 
+        // Caret for normal mode (no active selection): paint a single
+        // inverted cell at nav_cursor. Visual mode's selection range
+        // already covers this position.
+        if (self.mode == .normal and self.nav_cursor.line >= start and self.nav_cursor.line < end) {
+            const row: u16 = @intCast(self.nav_cursor.line - start);
+            const line_text = visible[row].text;
+            const col = @min(self.nav_cursor.col, @as(u16, @intCast(if (line_text.len == 0) 0 else line_text.len - 1)));
+            const ch: []const u8 = if (line_text.len == 0) " " else line_text[col .. col + 1];
+            _ = win.print(&.{.{ .text = ch, .style = .{ .reverse = true } }}, .{
+                .row_offset = row,
+                .col_offset = col,
+                .wrap = .none,
+            });
+        }
+
         const sep_row: u16 = h - 2;
         var sep_buf: std.ArrayList(u8) = .empty;
         if (self.scroll_offset > 0) {
@@ -288,9 +414,22 @@ const Tui = struct {
         });
 
         const input_row: u16 = h - 1;
-        const prompt: []const u8 = if (self.busy) "… " else "> ";
+        const prompt: []const u8 = if (self.busy)
+            "… "
+        else switch (self.mode) {
+            .insert => "> ",
+            .normal => "n ",
+            .visual => "v ",
+            .visual_line => "V ",
+        };
+        const prompt_color: u8 = switch (self.mode) {
+            .insert => 4, // blue
+            .normal => 2, // green
+            .visual => 5, // magenta
+            .visual_line => 5,
+        };
         _ = win.print(&.{
-            .{ .text = prompt, .style = .{ .fg = .{ .index = 4 }, .bold = true } },
+            .{ .text = prompt, .style = .{ .fg = .{ .index = prompt_color }, .bold = true } },
             .{ .text = self.input.items },
         }, .{ .row_offset = input_row, .wrap = .none });
 
@@ -364,6 +503,65 @@ const Tui = struct {
         try self.pushBlock(.notice, buf.items);
     }
 };
+
+fn isWordChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+}
+
+/// Position of the next word-start strictly after `from_col`.
+fn nextWordStart(text: []const u8, from_col: u16) ?usize {
+    var i: usize = from_col;
+    if (i >= text.len) return null;
+    // Skip the rest of the current word, then any non-word run.
+    if (isWordChar(text[i])) {
+        while (i < text.len and isWordChar(text[i])) i += 1;
+    } else {
+        i += 1;
+    }
+    while (i < text.len and !isWordChar(text[i])) i += 1;
+    if (i >= text.len) return null;
+    return i;
+}
+
+fn firstWordStart(text: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < text.len and !isWordChar(text[i])) i += 1;
+    return if (i >= text.len) null else i;
+}
+
+/// Position of the previous word-start strictly before `from_col`.
+fn prevWordStart(text: []const u8, from_col: u16) ?usize {
+    if (from_col == 0 or text.len == 0) return null;
+    var i: usize = @min(from_col, text.len) - 1;
+    while (true) {
+        if (!isWordChar(text[i])) {
+            if (i == 0) return null;
+            i -= 1;
+            continue;
+        }
+        // Walk to start of this word.
+        while (i > 0 and isWordChar(text[i - 1])) i -= 1;
+        // If that landed at our caller's position, keep going past.
+        if (i + 1 > from_col) {
+            // unreachable in normal flow — defensive guard
+            return null;
+        }
+        return i;
+    }
+}
+
+fn lastWordStart(text: []const u8) ?usize {
+    if (text.len == 0) return null;
+    var i: usize = text.len - 1;
+    // Skip trailing non-word chars.
+    while (true) {
+        if (isWordChar(text[i])) break;
+        if (i == 0) return null;
+        i -= 1;
+    }
+    while (i > 0 and isWordChar(text[i - 1])) i -= 1;
+    return i;
+}
 
 fn styleFor(kind: Block.Kind) vaxis.Cell.Style {
     return switch (kind) {
@@ -531,7 +729,7 @@ pub fn run(
 
     try tui.pushBlock(
         .notice,
-        "velk REPL — Ctrl-D exit · Ctrl-C abort/cancel · Enter send · ↑/↓ history · PageUp/PageDown scroll · drag to select · mouse-up copies to clipboard",
+        "velk REPL — Ctrl-D exit · Ctrl-C abort/cancel · Esc → normal (hjkl, w/b words, 0/$/I/A line, g/G top/bot, Ctrl-u/d page, v/V visual, y yank, i/a insert, q quit) · Enter send",
     );
     try tui.render();
 
@@ -641,7 +839,9 @@ pub fn run(
                 }
             },
             .key_press => |key| {
-                if (key.matches('d', .{ .ctrl = true })) return;
+                // Ctrl-D exits — but only in insert mode. In normal /
+                // visual it's repurposed as a vim-style half-page jump.
+                if (key.matches('d', .{ .ctrl = true }) and tui.mode == .insert) return;
                 if (key.matches('c', .{ .ctrl = true })) {
                     // Order of precedence: abort in-flight turn → clear
                     // selection → clear input → exit on empty.
@@ -697,6 +897,153 @@ pub fn run(
                     continue;
                 }
                 if (tui.busy) continue;
+
+                // ── Vim-mode toggle, normal & visual navigation ──
+                if (key.matches(vaxis.Key.escape, .{})) {
+                    if (tui.mode == .insert) {
+                        tui.mode = .normal;
+                        // Plant cursor at the bottom-most line so j/k
+                        // immediately make sense.
+                        if (tui.all_lines.len > 0) {
+                            tui.nav_cursor = .{ .line = tui.all_lines.len - 1, .col = 0 };
+                        }
+                        try tui.render();
+                    } else if (tui.mode == .visual or tui.mode == .visual_line) {
+                        tui.mode = .normal;
+                        tui.selection.active = false;
+                        try tui.render();
+                    }
+                    continue;
+                }
+                if (tui.mode == .normal or tui.mode == .visual or tui.mode == .visual_line) {
+                    // Mode switches first.
+                    if (tui.mode == .normal and (key.matches('i', .{}) or key.matches('a', .{}))) {
+                        tui.mode = .insert;
+                        try tui.render();
+                        continue;
+                    }
+                    // Shift-I / Shift-A: jump the nav cursor to start
+                    // / end of the current scrollback line. (Pure
+                    // navigation — no mode switch.)
+                    if (tui.mode == .normal and key.matches('I', .{ .shift = true })) {
+                        tui.nav_cursor.col = 0;
+                        try tui.render();
+                        continue;
+                    }
+                    if (tui.mode == .normal and key.matches('A', .{ .shift = true })) {
+                        const len = tui.lineLen(tui.nav_cursor.line);
+                        tui.nav_cursor.col = if (len == 0) 0 else @intCast(len - 1);
+                        try tui.render();
+                        continue;
+                    }
+                    if (tui.mode == .normal and key.matches('v', .{})) {
+                        tui.mode = .visual;
+                        tui.selection = .{
+                            .anchor = tui.nav_cursor,
+                            .cursor = tui.nav_cursor,
+                            .active = true,
+                        };
+                        try tui.render();
+                        continue;
+                    }
+                    // Shift-V toggles visual_line; pressing it again
+                    // returns to normal.
+                    if (key.matches('V', .{ .shift = true })) {
+                        if (tui.mode == .visual_line) {
+                            tui.mode = .normal;
+                            tui.selection.active = false;
+                        } else {
+                            tui.mode = .visual_line;
+                            tui.visual_line_anchor = tui.nav_cursor.line;
+                            tui.syncVisualLineSelection();
+                        }
+                        try tui.render();
+                        continue;
+                    }
+                    if ((tui.mode == .visual or tui.mode == .visual_line) and key.matches('y', .{})) {
+                        var sa: std.heap.ArenaAllocator = .init(gpa);
+                        defer sa.deinit();
+                        const text = try extractSelection(sa.allocator(), tui.all_lines, tui.selection);
+                        if (text.len > 0) try copyToClipboard(sa.allocator(), tty.writer(), text);
+                        tui.mode = .normal;
+                        tui.selection.active = false;
+                        try tui.pushBlock(.notice, "[yanked to clipboard]");
+                        try tui.render();
+                        continue;
+                    }
+                    if (tui.mode == .normal and key.matches('q', .{})) return;
+
+                    // Movement — applied to nav_cursor; in visual mode
+                    // we mirror it onto the selection cursor too.
+                    var moved = false;
+                    if (key.matches('h', .{})) {
+                        if (tui.nav_cursor.col > 0) tui.nav_cursor.col -= 1;
+                        moved = true;
+                    } else if (key.matches('l', .{})) {
+                        const len = tui.lineLen(tui.nav_cursor.line);
+                        if (len > 0 and tui.nav_cursor.col + 1 < len) tui.nav_cursor.col += 1;
+                        moved = true;
+                    } else if (key.matches('j', .{})) {
+                        if (tui.nav_cursor.line + 1 < tui.all_lines.len) tui.nav_cursor.line += 1;
+                        tui.clampNavCol();
+                        tui.ensureCursorVisible();
+                        moved = true;
+                    } else if (key.matches('k', .{})) {
+                        if (tui.nav_cursor.line > 0) tui.nav_cursor.line -= 1;
+                        tui.clampNavCol();
+                        tui.ensureCursorVisible();
+                        moved = true;
+                    } else if (key.matches('0', .{})) {
+                        tui.nav_cursor.col = 0;
+                        moved = true;
+                    } else if (key.matches('$', .{ .shift = true })) {
+                        const len = tui.lineLen(tui.nav_cursor.line);
+                        tui.nav_cursor.col = if (len == 0) 0 else @intCast(len - 1);
+                        moved = true;
+                    } else if (key.matches('g', .{})) {
+                        tui.nav_cursor = .{ .line = 0, .col = 0 };
+                        tui.ensureCursorVisible();
+                        moved = true;
+                    } else if (key.matches('G', .{ .shift = true })) {
+                        tui.nav_cursor = .{
+                            .line = if (tui.all_lines.len == 0) 0 else tui.all_lines.len - 1,
+                            .col = 0,
+                        };
+                        tui.ensureCursorVisible();
+                        moved = true;
+                    } else if (key.matches('d', .{ .ctrl = true })) {
+                        const half: usize = @max(1, tui.visible_h / 2);
+                        tui.nav_cursor.line = @min(tui.all_lines.len -| 1, tui.nav_cursor.line + half);
+                        tui.clampNavCol();
+                        tui.ensureCursorVisible();
+                        moved = true;
+                    } else if (key.matches('u', .{ .ctrl = true })) {
+                        const half: usize = @max(1, tui.visible_h / 2);
+                        tui.nav_cursor.line -|= half;
+                        tui.clampNavCol();
+                        tui.ensureCursorVisible();
+                        moved = true;
+                    } else if (key.matches('w', .{})) {
+                        tui.moveWordForward();
+                        tui.ensureCursorVisible();
+                        moved = true;
+                    } else if (key.matches('b', .{})) {
+                        tui.moveWordBackward();
+                        tui.ensureCursorVisible();
+                        moved = true;
+                    }
+
+                    if (moved) {
+                        if (tui.mode == .visual) tui.selection.cursor = tui.nav_cursor;
+                        if (tui.mode == .visual_line) tui.syncVisualLineSelection();
+                        try tui.render();
+                        continue;
+                    }
+                    // Swallow anything else in normal/visual mode so
+                    // typed characters don't leak into the input buffer.
+                    continue;
+                }
+
                 // Plain Up/Down (no modifiers) = input history navigation.
                 if (key.matches(vaxis.Key.up, .{})) {
                     if (tui.input_history.items.len == 0) continue;
@@ -801,7 +1148,26 @@ pub fn run(
                 if (result.err) |err| switch (err) {
                     error.Canceled => try tui.pushBlock(.notice, "[aborted]"),
                     else => {
-                        const msg = try std.fmt.allocPrint(tui_arena, "error: {s}", .{@errorName(err)});
+                        // Try to extract `error.message` from the
+                        // provider's captured response body so the
+                        // user sees *why* it failed, not just the
+                        // error name.
+                        const detail = sess.provider.lastErrorBody();
+                        const msg = if (detail) |body| blk: {
+                            const Shape = struct {
+                                @"error": struct {
+                                    type: ?[]const u8 = null,
+                                    message: ?[]const u8 = null,
+                                } = .{},
+                            };
+                            const parsed = std.json.parseFromSlice(Shape, gpa, body, .{ .ignore_unknown_fields = true }) catch
+                                break :blk try std.fmt.allocPrint(tui_arena, "error: {s}\n{s}", .{ @errorName(err), body });
+                            defer parsed.deinit();
+                            const m = parsed.value.@"error".message orelse
+                                break :blk try std.fmt.allocPrint(tui_arena, "error: {s}\n{s}", .{ @errorName(err), body });
+                            const t = parsed.value.@"error".type orelse "";
+                            break :blk try std.fmt.allocPrint(tui_arena, "error ({s}): {s}", .{ t, m });
+                        } else try std.fmt.allocPrint(tui_arena, "error: {s}", .{@errorName(err)});
                         try tui.pushBlock(.tool_result_error, msg);
                     },
                 };

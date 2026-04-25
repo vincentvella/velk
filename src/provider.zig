@@ -92,10 +92,13 @@ pub const Provider = struct {
     }
 };
 
-/// Convenience: build a Message containing a single text block. Allocates
-/// the block array in `arena`.
+/// Convenience: build a Message containing a single text block.
+/// Both the block array AND the text bytes are duped into `arena` so
+/// the resulting Message is independent of any caller-owned buffer
+/// (sessions outlive single turns and the caller's prompt may be
+/// freed before the message is replayed on the next turn).
 pub fn textMessage(arena: std.mem.Allocator, role: Role, text: []const u8) !Message {
     const blocks = try arena.alloc(ContentBlock, 1);
-    blocks[0] = .{ .text = text };
+    blocks[0] = .{ .text = try arena.dupe(u8, text) };
     return .{ .role = role, .content = blocks };
 }
