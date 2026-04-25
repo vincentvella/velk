@@ -35,3 +35,6 @@ jobs:
 
       - name: smoke tests
         run: zig build smoke
+
+      - name: tui pty harness
+        run: zig build tui-test
