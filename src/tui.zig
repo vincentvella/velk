@@ -484,6 +484,10 @@ const Tui = struct {
         }
         self.busy = false;
         try self.flushOpenAssistant();
+        // Drain any agent events the worker had already queued before
+        // it noticed the cancel — those events own gpa-allocated
+        // buffers we have to free, otherwise they leak.
+        while (try self.loop.tryEvent()) |stale| freeAgentEvent(self.gpa, stale);
     }
 
     /// Append a turn-summary notice with token counts (and cost when
@@ -561,6 +565,21 @@ fn lastWordStart(text: []const u8) ?usize {
     }
     while (i > 0 and isWordChar(text[i - 1])) i -= 1;
     return i;
+}
+
+/// Release any gpa allocations carried by an agent-posted Event.
+/// Non-agent variants (key_press, mouse, winsize, a_usage, a_done) own
+/// no heap memory.
+fn freeAgentEvent(gpa: std.mem.Allocator, event: Event) void {
+    switch (event) {
+        .a_text => |text| gpa.free(text),
+        .a_tool_call => |tc| {
+            gpa.free(tc.name);
+            gpa.free(tc.input);
+        },
+        .a_tool_result => |tr| gpa.free(tr.text),
+        else => {},
+    }
 }
 
 fn styleFor(kind: Block.Kind) vaxis.Cell.Style {

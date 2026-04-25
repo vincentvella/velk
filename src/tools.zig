@@ -412,21 +412,9 @@ fn bashExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
     const command = (try getString(input, "command")) orelse return errorOutput(arena, "bash: missing 'command'", .{});
     const timeout_ms: i64 = (try getInt(input, "timeout_ms")) orelse default_bash_timeout_ms;
 
-    const timeout: Io.Timeout = if (timeout_ms <= 0) .none else .{
-        .duration = .{
-            .raw = Io.Duration.fromMilliseconds(timeout_ms),
-            .clock = .awake,
-        },
-    };
-
-    const argv = &[_][]const u8{ "/bin/sh", "-c", command };
-    const result = std.process.run(arena, settings.io, .{
-        .argv = argv,
-        .stdout_limit = .limited(max_output_bytes),
-        .stderr_limit = .limited(max_output_bytes),
-        .timeout = timeout,
-    }) catch |e| switch (e) {
+    const result = runBash(arena, settings.io, command, timeout_ms) catch |e| switch (e) {
         error.Timeout => return errorOutput(arena, "bash: timed out after {d}ms", .{timeout_ms}),
+        error.Canceled => return errorOutput(arena, "bash: aborted", .{}),
         else => return errorOutput(arena, "bash: spawn failed: {s}", .{@errorName(e)}),
     };
 
@@ -444,6 +432,71 @@ fn bashExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
         try out.print(arena, "--- stderr ---\n{s}", .{result.stderr});
     }
     return .{ .text = out.items, .is_error = exit_code != 0 };
+}
+
+/// Mirror of `std.process.run` that spawns the child as a new process
+/// group leader (`pgid: 0`) and, on every exit path, signals the whole
+/// group via `kill(-pgid, SIGKILL)`. Without the group kill, child
+/// processes the shell spawned (e.g. `sleep` in `sleep 30 && echo`)
+/// get reparented and outlive the abort.
+fn runBash(
+    arena: std.mem.Allocator,
+    io: Io,
+    command: []const u8,
+    timeout_ms: i64,
+) !std.process.RunResult {
+    const argv = &[_][]const u8{ "/bin/sh", "-c", command };
+    const timeout: Io.Timeout = if (timeout_ms <= 0) .none else .{
+        .duration = .{
+            .raw = Io.Duration.fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        },
+    };
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0, // make the child its own process-group leader
+    });
+    const child_pid = child.id; // stash before wait clears it
+    defer killGroup(child_pid);
+    defer child.kill(io); // belt-and-suspenders; idempotent after wait
+
+    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: Io.File.MultiReader = undefined;
+    multi_reader.init(arena, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    while (multi_reader.fill(64, timeout)) |_| {
+        if (stdout_reader.buffered().len > max_output_bytes) return error.StreamTooLong;
+        if (stderr_reader.buffered().len > max_output_bytes) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
+    const term = try child.wait(io);
+
+    return .{
+        .stdout = try multi_reader.toOwnedSlice(0),
+        .stderr = try multi_reader.toOwnedSlice(1),
+        .term = term,
+    };
+}
+
+/// Send SIGKILL to a process group. Best-effort — silently ignores
+/// errors so cleanup never panics.
+fn killGroup(pid: ?std.posix.pid_t) void {
+    const id = pid orelse return;
+    if (id <= 0) return;
+    // Negative PID means "this process group" in POSIX kill().
+    _ = std.c.kill(-id, std.posix.SIG.KILL);
 }
 
 // ───────── shared input helpers ─────────
