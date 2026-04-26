@@ -536,6 +536,42 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
                 "turn: token usage line appears",
                 tui.wait_for("[tokens: 12 in / 7 out", screen=True, timeout=3.0),
             )
+
+            # Send a second prompt that the mock matches against the
+            # markdown.sse fixture (substring match on filename stem).
+            tui.send_line("show me a markdown sample")
+            case(
+                "markdown: content of bold marker appears",
+                tui.wait_for("bold-here", screen=True, timeout=3.0),
+            )
+            case(
+                "markdown: ** markers are stripped",
+                "**bold-here**" not in tui.screen(),
+            )
+            case(
+                "markdown: italic content present",
+                tui.saw("italic-here", screen=True),
+            )
+            case(
+                "markdown: italic * markers stripped",
+                "*italic-here*" not in tui.screen(),
+            )
+            case(
+                "markdown: code span content present",
+                tui.saw("code-here", screen=True),
+            )
+            case(
+                "markdown: backtick markers stripped",
+                "`code-here`" not in tui.screen(),
+            )
+            case(
+                "markdown: bullet substitutes •",
+                "• bullet-here one" in tui.screen(),
+            )
+            case(
+                "markdown: header marker stripped",
+                "Heading" in tui.screen() and "# Heading" not in tui.screen(),
+            )
         finally:
             if FAIL > 0 or os.environ.get("TUI_TEST_DUMP"):
                 with open("/tmp/tui-test-turn-buffer.txt", "w") as f:

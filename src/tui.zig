@@ -14,6 +14,7 @@ const persist = @import("persist.zig");
 const cost = @import("cost.zig");
 const slash = @import("slash.zig");
 const notify = @import("notify.zig");
+const markdown = @import("markdown.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -393,6 +394,10 @@ const Tui = struct {
             const base_style = styleFor(line.kind);
             if (self.selection.active and selectionOverlapsLine(self.selection, logical)) {
                 renderRowWithSelection(win, row, line.text, base_style, self.selection, logical);
+            } else if (line.kind == .assistant_text) {
+                // Apply inline markdown styling. Wrapping has already
+                // happened so each `line` is one terminal row of text.
+                try renderMarkdownLine(lines_alloc, win, row, line.text, base_style);
             } else {
                 _ = win.print(&.{.{ .text = line.text, .style = base_style }}, .{
                     .row_offset = row,
@@ -702,6 +707,38 @@ fn wrapBlockInto(
 fn selectionOverlapsLine(sel: Selection, line: usize) bool {
     const n = sel.normalized();
     return line >= n.start.line and line <= n.end.line;
+}
+
+/// Render a single assistant-text line with inline markdown styling.
+/// Tokenises into spans, merges each span's bold/italic/code with the
+/// base style, and emits one vaxis cell segment per span. Each segment
+/// is placed at the running column offset (we count UTF-8 code points,
+/// matching `displayWidth`).
+fn renderMarkdownLine(
+    arena: std.mem.Allocator,
+    win: vaxis.Window,
+    row: u16,
+    text: []const u8,
+    base: vaxis.Cell.Style,
+) !void {
+    const spans = try markdown.tokenize(arena, text);
+    var col: u16 = 0;
+    for (spans) |span| {
+        var style = base;
+        if (span.bold) style.bold = true;
+        if (span.italic) style.italic = true;
+        if (span.code) {
+            // Cyan-ish accent so code spans stand out from prose
+            // without looking like an error highlight.
+            style.fg = .{ .index = 6 };
+        }
+        _ = win.print(&.{.{ .text = span.text, .style = style }}, .{
+            .row_offset = row,
+            .col_offset = col,
+            .wrap = .none,
+        });
+        col +|= @intCast(displayWidth(span.text));
+    }
 }
 
 fn renderRowWithSelection(
