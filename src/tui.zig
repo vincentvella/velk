@@ -46,8 +46,16 @@ const WorkerResult = struct {
 };
 
 const Block = struct {
+    /// Stable, monotonic id assigned at push-time. RenderedLine carries
+    /// it as a back-pointer so the Tab-toggle handler can find the
+    /// source block from a logical row.
+    id: u32,
     kind: Kind,
     text: []const u8,
+    /// When true, the wrapper renders a one-line summary instead of
+    /// the full text. Only honoured for `tool_call` / `tool_result*`.
+    /// Tab in normal mode toggles this for the block under the cursor.
+    collapsed: bool = false,
 
     const Kind = enum {
         user_prompt,
@@ -57,13 +65,30 @@ const Block = struct {
         tool_result_error,
         notice,
     };
+
+    /// Tool-block kinds the user can collapse. Other kinds ignore the
+    /// `collapsed` flag entirely.
+    fn isCollapsible(self: Block) bool {
+        return switch (self.kind) {
+            .tool_call, .tool_result, .tool_result_error => true,
+            else => false,
+        };
+    }
 };
 
 const RenderedLine = struct {
     kind: Block.Kind,
     /// Bytes as they appear on the row (no trailing newline, already wrapped).
     text: []const u8,
+    /// id of the source `Block` this row came from, or 0 when this row
+    /// has no associated block (e.g. live assistant streaming buffer).
+    block_id: u32 = 0,
 };
+
+/// Auto-collapse threshold: tool blocks taller than this many wrapped
+/// rows render as a one-line summary on push. The user can still
+/// expand with Tab.
+const auto_collapse_lines: usize = 8;
 
 /// A selection coordinate in logical scrollback space: which wrapped
 /// line (0 = topmost ever), at which column. Logical positions stay
@@ -185,6 +210,9 @@ const Tui = struct {
     /// at the start of each render so memory is reclaimed.
     lines_arena: *std.heap.ArenaAllocator,
     blocks: std.ArrayList(Block) = .empty,
+    /// Next id to assign on `pushBlock`. Starts at 1 — id 0 means
+    /// "no associated block" on a `RenderedLine`.
+    next_block_id: u32 = 1,
     assistant_buf: std.ArrayList(u8) = .empty,
     has_open_assistant: bool = false,
     input: std.ArrayList(u8) = .empty,
@@ -335,7 +363,17 @@ const Tui = struct {
     fn pushBlock(self: *Tui, kind: Block.Kind, text: []const u8) !void {
         try self.flushOpenAssistant();
         const owned = try self.arena.dupe(u8, text);
-        try self.blocks.append(self.arena, .{ .kind = kind, .text = owned });
+        const id = self.next_block_id;
+        self.next_block_id += 1;
+        var block: Block = .{ .id = id, .kind = kind, .text = owned };
+        // Auto-collapse tool blocks whose text spans more than the
+        // threshold (counted as newline-terminated rows; long single
+        // lines also auto-collapse since wrapping will multiply the
+        // visible row count).
+        if (block.isCollapsible() and naturalLineCount(owned) > auto_collapse_lines) {
+            block.collapsed = true;
+        }
+        try self.blocks.append(self.arena, block);
         self.scroll_offset = 0;
     }
 
@@ -348,9 +386,28 @@ const Tui = struct {
     fn flushOpenAssistant(self: *Tui) !void {
         if (!self.has_open_assistant) return;
         const owned = try self.arena.dupe(u8, self.assistant_buf.items);
-        try self.blocks.append(self.arena, .{ .kind = .assistant_text, .text = owned });
+        const id = self.next_block_id;
+        self.next_block_id += 1;
+        try self.blocks.append(self.arena, .{ .id = id, .kind = .assistant_text, .text = owned });
         self.assistant_buf.clearRetainingCapacity();
         self.has_open_assistant = false;
+    }
+
+    /// Toggle the `collapsed` flag of the block under the nav cursor.
+    /// No-op when nothing collapsible is selected. Returns true if a
+    /// toggle happened, so the caller can re-render.
+    fn toggleCollapseAtCursor(self: *Tui) bool {
+        if (self.all_lines.len == 0) return false;
+        if (self.nav_cursor.line >= self.all_lines.len) return false;
+        const target_id = self.all_lines[self.nav_cursor.line].block_id;
+        if (target_id == 0) return false;
+        for (self.blocks.items) |*b| {
+            if (b.id != target_id) continue;
+            if (!b.isCollapsible()) return false;
+            b.collapsed = !b.collapsed;
+            return true;
+        }
+        return false;
     }
 
     fn render(self: *Tui) !void {
@@ -374,7 +431,7 @@ const Tui = struct {
         var lines: std.ArrayList(RenderedLine) = .empty;
         for (self.blocks.items) |block| try wrapBlockInto(lines_alloc, &lines, block, w);
         if (self.has_open_assistant) {
-            const tmp: Block = .{ .kind = .assistant_text, .text = self.assistant_buf.items };
+            const tmp: Block = .{ .id = 0, .kind = .assistant_text, .text = self.assistant_buf.items };
             try wrapBlockInto(lines_alloc, &lines, tmp, w);
         }
 
@@ -686,8 +743,13 @@ fn wrapBlockInto(
     block: Block,
     width: u16,
 ) !void {
+    if (block.collapsed and block.isCollapsible()) {
+        const summary = try collapseSummary(arena, block);
+        try out.append(arena, .{ .kind = block.kind, .text = summary, .block_id = block.id });
+        return;
+    }
     if (block.text.len == 0) {
-        try out.append(arena, .{ .kind = block.kind, .text = "" });
+        try out.append(arena, .{ .kind = block.kind, .text = "", .block_id = block.id });
         return;
     }
     var rest = block.text;
@@ -696,12 +758,58 @@ fn wrapBlockInto(
         const line_end = nl orelse rest.len;
         var line = rest[0..line_end];
         while (line.len > width) {
-            try out.append(arena, .{ .kind = block.kind, .text = line[0..width] });
+            try out.append(arena, .{ .kind = block.kind, .text = line[0..width], .block_id = block.id });
             line = line[width..];
         }
-        try out.append(arena, .{ .kind = block.kind, .text = line });
+        try out.append(arena, .{ .kind = block.kind, .text = line, .block_id = block.id });
         rest = if (nl) |n| rest[n + 1 ..] else rest[line_end..];
     }
+}
+
+/// Build a one-line summary for a collapsed tool block. Format:
+///   "→ <head> [N lines, Tab to expand]"   (tool_call)
+///   "← <head> [N lines, Tab to expand]"   (tool_result / tool_result_error)
+/// `head` is the first line of the block's text, truncated to ~80 cols.
+fn collapseSummary(arena: std.mem.Allocator, block: Block) ![]const u8 {
+    const total = naturalLineCount(block.text);
+    const first_nl = std.mem.indexOfScalar(u8, block.text, '\n') orelse block.text.len;
+    var head = block.text[0..first_nl];
+    // Strip the kind-specific arrow prefix from the head if present —
+    // we re-add it below, formatted for the summary.
+    const arrow_call: []const u8 = "→ ";
+    const arrow_res: []const u8 = "← ";
+    const arrow_err: []const u8 = "← (error) ";
+    if (block.kind == .tool_call and std.mem.startsWith(u8, head, arrow_call)) {
+        head = head[arrow_call.len..];
+    } else if (block.kind == .tool_result and std.mem.startsWith(u8, head, arrow_res)) {
+        head = head[arrow_res.len..];
+    } else if (block.kind == .tool_result_error and std.mem.startsWith(u8, head, arrow_err)) {
+        head = head[arrow_err.len..];
+    } else if (block.kind == .tool_result_error and std.mem.startsWith(u8, head, arrow_res)) {
+        head = head[arrow_res.len..];
+    }
+    if (head.len > 80) head = head[0..80];
+
+    const arrow: []const u8 = switch (block.kind) {
+        .tool_call => "→ ",
+        .tool_result => "← ",
+        .tool_result_error => "← (error) ",
+        else => "",
+    };
+    return std.fmt.allocPrint(arena, "{s}{s} [{d} lines, Tab to expand]", .{ arrow, head, total });
+}
+
+/// Count the natural newline-terminated rows in `text`. A trailing
+/// non-newline run counts as one extra row.
+fn naturalLineCount(text: []const u8) usize {
+    if (text.len == 0) return 1;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\n') n += 1;
+    }
+    if (text[text.len - 1] != '\n') n += 1;
+    return n;
 }
 
 fn selectionOverlapsLine(sel: Selection, line: usize) bool {
@@ -1333,6 +1441,15 @@ pub fn run(
                     }
                     if (tui.mode == .normal and key.matches('q', .{})) return;
 
+                    // Tab in normal mode toggles the collapsed state
+                    // of the tool block under the cursor. No-op for
+                    // non-collapsible blocks (assistant text, notice,
+                    // user_prompt).
+                    if (tui.mode == .normal and key.matches(vaxis.Key.tab, .{})) {
+                        if (tui.toggleCollapseAtCursor()) try tui.render();
+                        continue;
+                    }
+
                     // Movement — applied to nav_cursor; in visual mode
                     // we mirror it onto the selection cursor too.
                     var moved = false;
@@ -1584,4 +1701,142 @@ pub fn run(
             },
         }
     }
+}
+
+// ───────── tests ─────────
+
+const testing = std.testing;
+
+test "naturalLineCount: empty is one row" {
+    try testing.expectEqual(@as(usize, 1), naturalLineCount(""));
+}
+
+test "naturalLineCount: single line no newline" {
+    try testing.expectEqual(@as(usize, 1), naturalLineCount("hello"));
+}
+
+test "naturalLineCount: single line trailing newline" {
+    try testing.expectEqual(@as(usize, 1), naturalLineCount("hello\n"));
+}
+
+test "naturalLineCount: two lines no trailing newline" {
+    try testing.expectEqual(@as(usize, 2), naturalLineCount("a\nb"));
+}
+
+test "naturalLineCount: two lines trailing newline" {
+    try testing.expectEqual(@as(usize, 2), naturalLineCount("a\nb\n"));
+}
+
+test "naturalLineCount: many lines" {
+    try testing.expectEqual(@as(usize, 5), naturalLineCount("a\nb\nc\nd\ne"));
+}
+
+test "collapseSummary: tool_call shows arrow + name + count" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const block: Block = .{
+        .id = 1,
+        .kind = .tool_call,
+        .text = "→ bash({\"cmd\":\"ls\"})\nbig\nlong\noutput\nrun\nlots\nof\nlines\nhere",
+        .collapsed = true,
+    };
+    const s = try collapseSummary(arena.allocator(), block);
+    try testing.expect(std.mem.startsWith(u8, s, "→ "));
+    try testing.expect(std.mem.indexOf(u8, s, "bash") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "9 lines") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "Tab to expand") != null);
+}
+
+test "collapseSummary: tool_result strips prior arrow before re-prefixing" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const block: Block = .{
+        .id = 1,
+        .kind = .tool_result,
+        .text = "← stdout line\nline 2\nline 3",
+        .collapsed = true,
+    };
+    const s = try collapseSummary(arena.allocator(), block);
+    try testing.expect(std.mem.startsWith(u8, s, "← stdout line"));
+    // Should NOT contain a doubled arrow ("← ← ").
+    try testing.expect(std.mem.indexOf(u8, s, "← ← ") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "3 lines") != null);
+}
+
+test "collapseSummary: tool_result_error gets (error) prefix" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const block: Block = .{
+        .id = 1,
+        .kind = .tool_result_error,
+        .text = "← (error) bash failed\nstack\ntrace\nhere",
+        .collapsed = true,
+    };
+    const s = try collapseSummary(arena.allocator(), block);
+    try testing.expect(std.mem.indexOf(u8, s, "(error)") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "bash failed") != null);
+}
+
+test "wrapBlockInto: collapsed tool block emits one row with summary" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var lines: std.ArrayList(RenderedLine) = .empty;
+    const block: Block = .{
+        .id = 7,
+        .kind = .tool_result,
+        .text = "← line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9",
+        .collapsed = true,
+    };
+    try wrapBlockInto(arena, &lines, block, 120);
+    try testing.expectEqual(@as(usize, 1), lines.items.len);
+    try testing.expectEqual(@as(u32, 7), lines.items[0].block_id);
+    try testing.expect(std.mem.indexOf(u8, lines.items[0].text, "9 lines") != null);
+}
+
+test "wrapBlockInto: not-collapsed tool block emits all rows" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var lines: std.ArrayList(RenderedLine) = .empty;
+    const block: Block = .{
+        .id = 9,
+        .kind = .tool_result,
+        .text = "a\nb\nc",
+        .collapsed = false,
+    };
+    try wrapBlockInto(arena, &lines, block, 120);
+    try testing.expectEqual(@as(usize, 3), lines.items.len);
+    for (lines.items) |line| {
+        try testing.expectEqual(@as(u32, 9), line.block_id);
+    }
+}
+
+test "wrapBlockInto: collapsed flag ignored on non-collapsible kinds" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var lines: std.ArrayList(RenderedLine) = .empty;
+    // assistant_text isn't collapsible — even with collapsed=true,
+    // wrapBlockInto must emit the full text.
+    const block: Block = .{
+        .id = 3,
+        .kind = .assistant_text,
+        .text = "alpha\nbeta\ngamma",
+        .collapsed = true,
+    };
+    try wrapBlockInto(arena, &lines, block, 120);
+    try testing.expectEqual(@as(usize, 3), lines.items.len);
+}
+
+test "Block.isCollapsible: only tool kinds" {
+    try testing.expect((Block{ .id = 1, .kind = .tool_call, .text = "" }).isCollapsible());
+    try testing.expect((Block{ .id = 1, .kind = .tool_result, .text = "" }).isCollapsible());
+    try testing.expect((Block{ .id = 1, .kind = .tool_result_error, .text = "" }).isCollapsible());
+    try testing.expect(!(Block{ .id = 1, .kind = .assistant_text, .text = "" }).isCollapsible());
+    try testing.expect(!(Block{ .id = 1, .kind = .user_prompt, .text = "" }).isCollapsible());
+    try testing.expect(!(Block{ .id = 1, .kind = .notice, .text = "" }).isCollapsible());
 }
