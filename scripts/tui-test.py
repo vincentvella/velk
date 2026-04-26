@@ -572,6 +572,18 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
                 "markdown: header marker stripped",
                 "Heading" in tui.screen() and "# Heading" not in tui.screen(),
             )
+            case(
+                "markdown: numbered list keeps the number",
+                "1. numbered-step uno" in tui.screen(),
+            )
+            case(
+                "markdown: block quote gets │ marker",
+                "│ quoted-thought here" in tui.screen(),
+            )
+            case(
+                "markdown: inline HTML passes through",
+                "<em>raw-html</em>" in tui.screen(),
+            )
         finally:
             if FAIL > 0 or os.environ.get("TUI_TEST_DUMP"):
                 with open("/tmp/tui-test-turn-buffer.txt", "w") as f:

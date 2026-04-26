@@ -54,6 +54,14 @@ pub fn tokenize(arena: std.mem.Allocator, line: []const u8) Error![]Span {
     return spans.toOwnedSlice(arena);
 }
 
+/// Per-list bookkeeping so ordered lists keep their numbers. Pushed on
+/// ENTER LIST, popped on EXIT LIST. The TUI only ever sees one line at
+/// a time so the stack is shallow in practice; depth 16 is overkill.
+const ListCtx = struct {
+    ordered: bool,
+    counter: i32,
+};
+
 const WalkState = struct {
     arena: std.mem.Allocator,
     out: *std.ArrayList(Span),
@@ -62,17 +70,33 @@ const WalkState = struct {
     /// Set when we're inside a HEADING node — every TEXT under it
     /// renders bold. Cleared on EXIT HEADING.
     in_heading: bool = false,
+    /// Block-quote depth — text inside a quote renders italic and
+    /// gets a leading `│ ` marker.
+    quote_depth: u8 = 0,
+    list_stack: [16]ListCtx = undefined,
+    list_depth: u8 = 0,
 
     fn currentBold(self: WalkState) bool {
         return self.bold_depth > 0 or self.in_heading;
     }
 
     fn currentItalic(self: WalkState) bool {
-        return self.italic_depth > 0;
+        return self.italic_depth > 0 or self.quote_depth > 0;
     }
 
     fn pushSpan(self: *WalkState, text_z: [*c]const u8, code: bool) !void {
         const text = std.mem.span(text_z);
+        if (text.len == 0) return;
+        const owned = try self.arena.dupe(u8, text);
+        try self.out.append(self.arena, .{
+            .text = owned,
+            .bold = self.currentBold(),
+            .italic = self.currentItalic() and !code,
+            .code = code,
+        });
+    }
+
+    fn pushLiteral(self: *WalkState, text: []const u8, code: bool) !void {
         if (text.len == 0) return;
         const owned = try self.arena.dupe(u8, text);
         try self.out.append(self.arena, .{
@@ -99,15 +123,56 @@ const WalkState = struct {
                 if (ev == c.CMARK_EVENT_ENTER) self.in_heading = true;
                 if (ev == c.CMARK_EVENT_EXIT) self.in_heading = false;
             },
-            c.CMARK_NODE_ITEM => {
-                // Each list item gets a "• " marker prepended on
-                // entry. For nested items cmark fires this for each
-                // inner ITEM as well.
+            c.CMARK_NODE_BLOCK_QUOTE => {
                 if (ev == c.CMARK_EVENT_ENTER) {
                     try self.out.append(self.arena, .{
-                        .text = "• ",
+                        .text = "│ ",
                         .bold = self.currentBold(),
                     });
+                    self.quote_depth += 1;
+                }
+                if (ev == c.CMARK_EVENT_EXIT and self.quote_depth > 0) self.quote_depth -= 1;
+            },
+            c.CMARK_NODE_LIST => {
+                if (ev == c.CMARK_EVENT_ENTER) {
+                    if (self.list_depth < self.list_stack.len) {
+                        const lt = c.cmark_node_get_list_type(n);
+                        const start = c.cmark_node_get_list_start(n);
+                        self.list_stack[self.list_depth] = .{
+                            .ordered = lt == c.CMARK_ORDERED_LIST,
+                            .counter = if (start == 0) 1 else start,
+                        };
+                        self.list_depth += 1;
+                    }
+                }
+                if (ev == c.CMARK_EVENT_EXIT and self.list_depth > 0) {
+                    self.list_depth -= 1;
+                }
+            },
+            c.CMARK_NODE_ITEM => {
+                if (ev == c.CMARK_EVENT_ENTER) {
+                    if (self.list_depth > 0) {
+                        const top = &self.list_stack[self.list_depth - 1];
+                        if (top.ordered) {
+                            const marker = try std.fmt.allocPrint(self.arena, "{d}. ", .{top.counter});
+                            try self.out.append(self.arena, .{
+                                .text = marker,
+                                .bold = self.currentBold(),
+                            });
+                            top.counter += 1;
+                        } else {
+                            try self.out.append(self.arena, .{
+                                .text = "• ",
+                                .bold = self.currentBold(),
+                            });
+                        }
+                    } else {
+                        // Defensive: ITEM without a parent LIST.
+                        try self.out.append(self.arena, .{
+                            .text = "• ",
+                            .bold = self.currentBold(),
+                        });
+                    }
                 }
             },
             c.CMARK_NODE_TEXT => {
@@ -120,14 +185,19 @@ const WalkState = struct {
                     if (c.cmark_node_get_literal(n)) |lit| try self.pushSpan(lit, true);
                 }
             },
+            c.CMARK_NODE_HTML_INLINE, c.CMARK_NODE_HTML_BLOCK => {
+                // Pass HTML through as literal text so users see what
+                // the model wrote rather than a silent gap. No
+                // styling — the chars themselves carry intent.
+                if (ev == c.CMARK_EVENT_ENTER) {
+                    if (c.cmark_node_get_literal(n)) |lit| try self.pushSpan(lit, false);
+                }
+            },
             c.CMARK_NODE_SOFTBREAK, c.CMARK_NODE_LINEBREAK => {
                 // Per-line input shouldn't see these, but guard
                 // anyway: render as a single space.
                 if (ev == c.CMARK_EVENT_ENTER) {
-                    try self.out.append(self.arena, .{
-                        .text = " ",
-                        .bold = self.currentBold(),
-                    });
+                    try self.pushLiteral(" ", false);
                 }
             },
             c.CMARK_NODE_LINK, c.CMARK_NODE_IMAGE => {
@@ -247,4 +317,82 @@ test "tokenize: link emits italic text" {
         if (std.mem.eql(u8, s.text, "the docs") and s.italic) has_link_text = true;
     }
     try testing.expect(has_link_text);
+}
+
+test "tokenize: numbered list keeps the number" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const spans = try tokenize(arena.allocator(), "1. step one");
+    try testing.expectEqualStrings("1. ", spans[0].text);
+    try testing.expectEqualStrings("step one", spans[1].text);
+}
+
+test "tokenize: numbered list respects start number" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // cmark only sees one ITEM in single-line input — verify it
+    // honours the explicit start (5. not 1.).
+    const spans = try tokenize(arena.allocator(), "5. step five");
+    try testing.expectEqualStrings("5. ", spans[0].text);
+}
+
+test "tokenize: block quote gets │ marker and italic body" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const spans = try tokenize(arena.allocator(), "> a quoted thought");
+    try testing.expectEqualStrings("│ ", spans[0].text);
+    var has_italic_body = false;
+    for (spans) |s| {
+        if (std.mem.eql(u8, s.text, "a quoted thought") and s.italic) has_italic_body = true;
+    }
+    try testing.expect(has_italic_body);
+}
+
+test "tokenize: inline HTML passes through as literal" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const spans = try tokenize(arena.allocator(), "see <em>this</em> raw");
+    var found_open = false;
+    var found_close = false;
+    for (spans) |s| {
+        if (std.mem.eql(u8, s.text, "<em>")) found_open = true;
+        if (std.mem.eql(u8, s.text, "</em>")) found_close = true;
+    }
+    try testing.expect(found_open);
+    try testing.expect(found_close);
+}
+
+test "tokenize: backslash escape renders literal marker" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const spans = try tokenize(arena.allocator(), "5 \\* 4 = 20");
+    // No italic span — the \* is a literal asterisk.
+    for (spans) |s| try testing.expect(!s.italic);
+    // Reassemble plain text and confirm the asterisk survived.
+    var sum: std.ArrayList(u8) = .empty;
+    defer sum.deinit(testing.allocator);
+    for (spans) |s| try sum.appendSlice(testing.allocator, s.text);
+    try testing.expect(std.mem.indexOf(u8, sum.items, "*") != null);
+}
+
+test "tokenize: underscore italic" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const spans = try tokenize(arena.allocator(), "yo _gentle_ ok");
+    var has_italic = false;
+    for (spans) |s| {
+        if (std.mem.eql(u8, s.text, "gentle") and s.italic) has_italic = true;
+    }
+    try testing.expect(has_italic);
+}
+
+test "tokenize: double-underscore bold" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const spans = try tokenize(arena.allocator(), "yo __strong__ ok");
+    var has_bold = false;
+    for (spans) |s| {
+        if (std.mem.eql(u8, s.text, "strong") and s.bold) has_bold = true;
+    }
+    try testing.expect(has_bold);
 }

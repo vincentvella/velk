@@ -14,7 +14,16 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"- bullet-here one\n"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"- bullet-here two"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"- bullet-here two\n"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"1. numbered-step uno\n"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"> quoted-thought here\n"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"see <em>raw-html</em> here"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}
