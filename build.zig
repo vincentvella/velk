@@ -63,6 +63,13 @@ pub fn build(b: *std.Build) void {
     const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const vaxis_mod = vaxis_dep.module("vaxis");
 
+    // cmark-gfm — vendored C library, full CommonMark + GFM. We link
+    // it statically; the Zig wrapper exposes the standard cmark.h
+    // header which we @cImport from src/markdown.zig.
+    const cmark_dep = b.dependency("cmark_gfm", .{ .target = target, .optimize = optimize });
+    const cmark_lib = cmark_dep.artifact("cmark-gfm");
+    const cmark_extensions_lib = cmark_dep.artifact("cmark-gfm-extensions");
+
     const exe = b.addExecutable(.{
         .name = "velk",
         .root_module = b.createModule(.{
@@ -76,6 +83,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.linkLibrary(cmark_lib);
+    exe.root_module.linkLibrary(cmark_extensions_lib);
 
     // We pull in std.c.write / _exit / kill for the SIGINT handler and
     // the bash process-group killer. macOS links libc implicitly, but

@@ -40,6 +40,10 @@
             .url = "https://github.com/jcollie/libvaxis/archive/6dff795b77e930fc9c9a4dc5851faf1d6e703636.tar.gz",
             .hash = "vaxis-0.6.0-BWNV_EnQCQArQLgoFAs30nhVr6dIHdso3NNXJ9PKcdTH",
         },
+        .cmark_gfm = .{
+            .url = "https://github.com/kristoff-it/cmark-gfm/archive/cd0aba87cc89f0c8aa9393e59505db271ea30239.tar.gz",
+            .hash = "cmark_gfm-0.1.0-uQgTKymaFwDK0jVZszXfDtQtW6BnS44Bp0GS55TVBD4p",
+        },
     },
     .paths = .{
         "build.zig",

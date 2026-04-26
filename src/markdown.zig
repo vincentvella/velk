@@ -1,21 +1,22 @@
-//! Inline markdown tokeniser. Converts a single line of text into a
-//! sequence of styled `Span`s the TUI can hand to vaxis as cell
-//! segments. Scope is deliberately limited:
+//! Inline markdown tokeniser. Per-line input → sequence of styled
+//! `Span`s the TUI hands to vaxis as cell segments.
 //!
-//!   **bold**       → bold
-//!   *italic*       → italic (also `_italic_`)
-//!   `code`         → code (rendered with a dim/contrast bg by the TUI)
-//!   # / ## / ###   → header (whole line bold)
-//!   - bullet       → leading `• ` substitution + same-line inline parse
+//! Backed by the vendored cmark-gfm C library — full CommonMark
+//! parsing including the corner cases (`**bold *with italic* end**`,
+//! snake_case underscore guards, escaped markers, etc.). We feed each
+//! TUI line to cmark independently and walk its AST. Multi-line
+//! constructs (fenced code blocks, nested lists) aren't reached
+//! through this entry point — they'd require feeding the whole
+//! assistant buffer to cmark, which is a bigger TUI integration.
 //!
-//! Per-line only — multi-line code fences (```...```) are NOT handled
-//! so they render as literal backticks. That keeps the parser simple
-//! and matches the wrap-then-render TUI pipeline.
-//!
-//! Unmatched markers (`**bold no close`) fall back to literal text so
-//! we never lose characters.
+//! Public surface is unchanged from the previous hand-rolled parser:
+//! callers just see `Span` and `tokenize`.
 
 const std = @import("std");
+
+const c = @cImport({
+    @cInclude("cmark-gfm.h");
+});
 
 pub const Span = struct {
     text: []const u8,
@@ -24,173 +25,132 @@ pub const Span = struct {
     code: bool = false,
 };
 
-/// Produce a span list for `line`. Spans live in the supplied arena
-/// (the `text` slices may be slices of `line` OR fresh arena
-/// allocations when we need to substitute, e.g. bullets).
-pub fn tokenize(arena: std.mem.Allocator, line: []const u8) ![]Span {
+pub const Error = error{CmarkParseFailed} || std.mem.Allocator.Error;
+
+/// Produce a span list for `line`. All `Span.text` slices are owned
+/// by `arena` (we copy out of cmark's owned strings since the AST is
+/// freed before we return).
+pub fn tokenize(arena: std.mem.Allocator, line: []const u8) Error![]Span {
     var spans: std.ArrayList(Span) = .empty;
 
-    // Header: leading `#`, `##`, `###` followed by a space → whole line
-    // bold. Strip the marker.
-    var rest = line;
-    var line_bold = false;
-    if (rest.len >= 2 and rest[0] == '#') {
-        var i: usize = 0;
-        while (i < rest.len and i < 6 and rest[i] == '#') i += 1;
-        if (i < rest.len and rest[i] == ' ') {
-            line_bold = true;
-            rest = rest[i + 1 ..];
-        }
+    const root = c.cmark_parse_document(
+        line.ptr,
+        line.len,
+        c.CMARK_OPT_DEFAULT,
+    ) orelse return Error.CmarkParseFailed;
+    defer c.cmark_node_free(root);
+
+    const iter = c.cmark_iter_new(root) orelse return Error.CmarkParseFailed;
+    defer c.cmark_iter_free(iter);
+
+    var state: WalkState = .{ .arena = arena, .out = &spans };
+
+    while (true) {
+        const ev = c.cmark_iter_next(iter);
+        if (ev == c.CMARK_EVENT_DONE) break;
+        try state.visit(ev, c.cmark_iter_get_node(iter));
     }
 
-    // Bullet: leading `- ` → render as "• " (note the U+2022). The
-    // substitution span lives on its own; rest of the line parses as
-    // normal inline.
-    if (rest.len >= 2 and rest[0] == '-' and rest[1] == ' ') {
-        try spans.append(arena, .{ .text = "• ", .bold = line_bold });
-        rest = rest[2..];
-    }
-
-    try parseInline(arena, &spans, rest, line_bold);
     return spans.toOwnedSlice(arena);
 }
 
-/// Walk `text` left-to-right. Emit a plain span up to the next marker,
-/// then the styled span, then continue. If a marker has no closer,
-/// emit it literally.
-fn parseInline(
+const WalkState = struct {
     arena: std.mem.Allocator,
     out: *std.ArrayList(Span),
-    text: []const u8,
-    line_bold: bool,
-) !void {
-    var i: usize = 0;
-    var plain_start: usize = 0;
+    bold_depth: u8 = 0,
+    italic_depth: u8 = 0,
+    /// Set when we're inside a HEADING node — every TEXT under it
+    /// renders bold. Cleared on EXIT HEADING.
+    in_heading: bool = false,
 
-    while (i < text.len) {
-        const c = text[i];
+    fn currentBold(self: WalkState) bool {
+        return self.bold_depth > 0 or self.in_heading;
+    }
 
-        // Code span: backtick-delimited. Highest precedence — contents
-        // are NOT re-parsed.
-        if (c == '`') {
-            if (findClose(text, i + 1, "`")) |close_idx| {
-                try flushPlain(arena, out, text[plain_start..i], line_bold);
-                try out.append(arena, .{
-                    .text = text[i + 1 .. close_idx],
-                    .code = true,
-                    .bold = line_bold,
-                });
-                i = close_idx + 1;
-                plain_start = i;
-                continue;
-            }
-        }
+    fn currentItalic(self: WalkState) bool {
+        return self.italic_depth > 0;
+    }
 
-        // Bold: `**...**`
-        if (c == '*' and i + 1 < text.len and text[i + 1] == '*') {
-            if (findClose(text, i + 2, "**")) |close_idx| {
-                try flushPlain(arena, out, text[plain_start..i], line_bold);
-                // Recurse to allow italic/code inside bold.
-                try parseInline(arena, out, text[i + 2 .. close_idx], true);
-                // Mark every span we just appended as bold (recursion
-                // started with line_bold; inner already-bold remains
-                // bold — we just need to ensure bold transfers across).
-                // Implementation: parseInline received `line_bold=true`
-                // so all child spans are already bold.
-                i = close_idx + 2;
-                plain_start = i;
-                continue;
-            }
-        }
+    fn pushSpan(self: *WalkState, text_z: [*c]const u8, code: bool) !void {
+        const text = std.mem.span(text_z);
+        if (text.len == 0) return;
+        const owned = try self.arena.dupe(u8, text);
+        try self.out.append(self.arena, .{
+            .text = owned,
+            .bold = self.currentBold(),
+            .italic = self.currentItalic() and !code,
+            .code = code,
+        });
+    }
 
-        // Italic: `*...*` (single asterisk) or `_..._`. We require the
-        // marker NOT be touching whitespace internally so legit prose
-        // like "5 * 4" doesn't trip — real markdown does this.
-        if ((c == '*' or c == '_') and !(c == '*' and i + 1 < text.len and text[i + 1] == '*')) {
-            const m = c;
-            // Skip if this `_` is inside a word (e.g. snake_case).
-            if (m == '_' and i > 0 and isWord(text[i - 1])) {
-                i += 1;
-                continue;
-            }
-            const close_marker = [_]u8{m};
-            if (findCloseSingle(text, i + 1, m)) |close_idx| {
-                // Reject empty `**` already handled above; also reject
-                // open-marker followed by space (not real italic).
-                if (text[i + 1] == ' ') {
-                    i += 1;
-                    continue;
+    fn visit(self: *WalkState, ev: c.cmark_event_type, node: ?*c.cmark_node) !void {
+        const n = node orelse return;
+        const t = c.cmark_node_get_type(n);
+        switch (t) {
+            c.CMARK_NODE_STRONG => {
+                if (ev == c.CMARK_EVENT_ENTER) self.bold_depth += 1;
+                if (ev == c.CMARK_EVENT_EXIT and self.bold_depth > 0) self.bold_depth -= 1;
+            },
+            c.CMARK_NODE_EMPH => {
+                if (ev == c.CMARK_EVENT_ENTER) self.italic_depth += 1;
+                if (ev == c.CMARK_EVENT_EXIT and self.italic_depth > 0) self.italic_depth -= 1;
+            },
+            c.CMARK_NODE_HEADING => {
+                if (ev == c.CMARK_EVENT_ENTER) self.in_heading = true;
+                if (ev == c.CMARK_EVENT_EXIT) self.in_heading = false;
+            },
+            c.CMARK_NODE_ITEM => {
+                // Each list item gets a "• " marker prepended on
+                // entry. For nested items cmark fires this for each
+                // inner ITEM as well.
+                if (ev == c.CMARK_EVENT_ENTER) {
+                    try self.out.append(self.arena, .{
+                        .text = "• ",
+                        .bold = self.currentBold(),
+                    });
                 }
-                _ = close_marker;
-                try flushPlain(arena, out, text[plain_start..i], line_bold);
-                try out.append(arena, .{
-                    .text = text[i + 1 .. close_idx],
-                    .italic = true,
-                    .bold = line_bold,
-                });
-                i = close_idx + 1;
-                plain_start = i;
-                continue;
-            }
+            },
+            c.CMARK_NODE_TEXT => {
+                if (ev == c.CMARK_EVENT_ENTER) {
+                    if (c.cmark_node_get_literal(n)) |lit| try self.pushSpan(lit, false);
+                }
+            },
+            c.CMARK_NODE_CODE => {
+                if (ev == c.CMARK_EVENT_ENTER) {
+                    if (c.cmark_node_get_literal(n)) |lit| try self.pushSpan(lit, true);
+                }
+            },
+            c.CMARK_NODE_SOFTBREAK, c.CMARK_NODE_LINEBREAK => {
+                // Per-line input shouldn't see these, but guard
+                // anyway: render as a single space.
+                if (ev == c.CMARK_EVENT_ENTER) {
+                    try self.out.append(self.arena, .{
+                        .text = " ",
+                        .bold = self.currentBold(),
+                    });
+                }
+            },
+            c.CMARK_NODE_LINK, c.CMARK_NODE_IMAGE => {
+                // For now we render link text inline with italic so
+                // users can see the anchor; the URL is dropped. A
+                // future commit can add a separate underlined style
+                // or print `text (url)`.
+                if (ev == c.CMARK_EVENT_ENTER) self.italic_depth += 1;
+                if (ev == c.CMARK_EVENT_EXIT and self.italic_depth > 0) self.italic_depth -= 1;
+            },
+            else => {},
         }
-
-        i += 1;
     }
-
-    if (plain_start < text.len) {
-        try flushPlain(arena, out, text[plain_start..text.len], line_bold);
-    }
-}
-
-fn flushPlain(
-    arena: std.mem.Allocator,
-    out: *std.ArrayList(Span),
-    text: []const u8,
-    line_bold: bool,
-) !void {
-    if (text.len == 0) return;
-    try out.append(arena, .{ .text = text, .bold = line_bold });
-}
-
-/// Find the next occurrence of `marker` (multi-byte) in `haystack`
-/// starting at `from`. Returns absolute index of marker start, or null.
-fn findClose(haystack: []const u8, from: usize, marker: []const u8) ?usize {
-    if (from >= haystack.len) return null;
-    return std.mem.indexOfPos(u8, haystack, from, marker);
-}
-
-/// Specialised single-char close-marker finder that rejects matches
-/// where the closer is touching word characters from the wrong side
-/// (mirroring how italic markers behave around words).
-fn findCloseSingle(haystack: []const u8, from: usize, marker: u8) ?usize {
-    var i: usize = from;
-    while (i < haystack.len) : (i += 1) {
-        if (haystack[i] != marker) continue;
-        // Reject if preceded by whitespace (open and close swapped).
-        if (i > 0 and haystack[i - 1] == ' ') continue;
-        // For `_`, reject if followed by a word char (snake_case).
-        if (marker == '_' and i + 1 < haystack.len and isWord(haystack[i + 1])) continue;
-        return i;
-    }
-    return null;
-}
-
-fn isWord(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
-}
+};
 
 // ───────── tests ─────────
 
 const testing = std.testing;
 
-fn parseToList(arena: std.mem.Allocator, line: []const u8) ![]Span {
-    return tokenize(arena, line);
-}
-
 test "tokenize: plain text → single plain span" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "hello world");
+    const spans = try tokenize(arena.allocator(), "hello world");
     try testing.expectEqual(@as(usize, 1), spans.len);
     try testing.expectEqualStrings("hello world", spans[0].text);
     try testing.expect(!spans[0].bold);
@@ -199,7 +159,7 @@ test "tokenize: plain text → single plain span" {
 test "tokenize: bold" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "yo **emphasis** ok");
+    const spans = try tokenize(arena.allocator(), "yo **emphasis** ok");
     try testing.expectEqual(@as(usize, 3), spans.len);
     try testing.expectEqualStrings("yo ", spans[0].text);
     try testing.expectEqualStrings("emphasis", spans[1].text);
@@ -210,7 +170,7 @@ test "tokenize: bold" {
 test "tokenize: italic" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "yo *gentle* ok");
+    const spans = try tokenize(arena.allocator(), "yo *gentle* ok");
     try testing.expectEqual(@as(usize, 3), spans.len);
     try testing.expectEqualStrings("gentle", spans[1].text);
     try testing.expect(spans[1].italic);
@@ -219,16 +179,16 @@ test "tokenize: italic" {
 test "tokenize: code span" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "use `arena.dupe(u8, x)` to copy");
+    const spans = try tokenize(arena.allocator(), "use `arena.dupe(u8, x)` to copy");
     try testing.expectEqual(@as(usize, 3), spans.len);
     try testing.expectEqualStrings("arena.dupe(u8, x)", spans[1].text);
     try testing.expect(spans[1].code);
 }
 
-test "tokenize: header sets line_bold and strips prefix" {
+test "tokenize: header sets line_bold" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "## Setup");
+    const spans = try tokenize(arena.allocator(), "## Setup");
     try testing.expectEqual(@as(usize, 1), spans.len);
     try testing.expectEqualStrings("Setup", spans[0].text);
     try testing.expect(spans[0].bold);
@@ -237,7 +197,7 @@ test "tokenize: header sets line_bold and strips prefix" {
 test "tokenize: bullet substitutes •" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "- first item");
+    const spans = try tokenize(arena.allocator(), "- first item");
     try testing.expectEqualStrings("• ", spans[0].text);
     try testing.expectEqualStrings("first item", spans[1].text);
 }
@@ -245,8 +205,7 @@ test "tokenize: bullet substitutes •" {
 test "tokenize: snake_case is not italic" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "set my_var to 1");
-    // No italic span — single plain run.
+    const spans = try tokenize(arena.allocator(), "set my_var to 1");
     try testing.expectEqual(@as(usize, 1), spans.len);
     try testing.expect(!spans[0].italic);
 }
@@ -254,7 +213,7 @@ test "tokenize: snake_case is not italic" {
 test "tokenize: unmatched marker is literal" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "**not closed");
+    const spans = try tokenize(arena.allocator(), "**not closed");
     try testing.expectEqual(@as(usize, 1), spans.len);
     try testing.expectEqualStrings("**not closed", spans[0].text);
 }
@@ -262,7 +221,7 @@ test "tokenize: unmatched marker is literal" {
 test "tokenize: code is opaque (no nested formatting)" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "see `**not bold**` literally");
+    const spans = try tokenize(arena.allocator(), "see `**not bold**` literally");
     try testing.expectEqualStrings("**not bold**", spans[1].text);
     try testing.expect(spans[1].code);
     try testing.expect(!spans[1].bold);
@@ -271,7 +230,7 @@ test "tokenize: code is opaque (no nested formatting)" {
 test "tokenize: bold can wrap italic" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "**bold *with italic* end**");
+    const spans = try tokenize(arena.allocator(), "**bold *with italic* end**");
     var has_bold_italic = false;
     for (spans) |s| {
         if (s.bold and s.italic) has_bold_italic = true;
@@ -279,12 +238,13 @@ test "tokenize: bold can wrap italic" {
     try testing.expect(has_bold_italic);
 }
 
-test "tokenize: header + bullet do not stack" {
-    // `- ` after a header marker: header strip, then bullet detection.
+test "tokenize: link emits italic text" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const spans = try parseToList(arena.allocator(), "# - heading");
-    try testing.expect(spans[0].bold);
-    // The "- " inside a header is treated as a bullet substitution.
-    try testing.expectEqualStrings("• ", spans[0].text);
+    const spans = try tokenize(arena.allocator(), "see [the docs](https://example.com)");
+    var has_link_text = false;
+    for (spans) |s| {
+        if (std.mem.eql(u8, s.text, "the docs") and s.italic) has_link_text = true;
+    }
+    try testing.expect(has_link_text);
 }
