@@ -1377,6 +1377,47 @@ const compact_prompt: []const u8 =
     "Capture the user's goal, key decisions, files touched, " ++
     "and any open questions. Be concrete, no preamble.";
 
+const init_prompt: []const u8 =
+    "Generate a concise VELK.md for this project so future agents " ++
+    "have project context on launch. Inspect the repo with `ls`, " ++
+    "`grep`, and `read_file` first. Pull out:\n" ++
+    "  - Toolchain version + how to build / test / lint\n" ++
+    "  - Top-level layout (one line per dir, what lives there)\n" ++
+    "  - Non-obvious conventions and gotchas (memory invariants, " ++
+    "thread boundaries, anything that's bit a reader before)\n" ++
+    "  - Out-of-scope explicitly listed\n\n" ++
+    "Skip what's already obvious from a `cat` of the source — " ++
+    "VELK.md is for what isn't. Aim for under 80 lines. Once the " ++
+    "draft is ready, write it to ./VELK.md via the write_file tool.";
+
+fn slashInit(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    if (c.tui.turn != null) {
+        try c.tui.pushBlock(.notice, "/init: a turn is in flight — wait for it to finish.");
+        return .handled;
+    }
+    // Hand off to the regular turn machinery: pushes the canned
+    // prompt as a user message and starts the agent worker. The
+    // worker can call read_file / ls / grep freely; write_file
+    // goes through the existing diff-approval flow.
+    const prompt_for_history = try c.tui.arena.dupe(u8, init_prompt);
+    const prompt_for_worker = try c.tui.gpa.dupe(u8, init_prompt);
+    try c.tui.pushBlock(.user_prompt, "/init — generating VELK.md");
+    c.tui.busy = true;
+    c.tui.startTurn(prompt_for_worker) catch |err| {
+        c.tui.gpa.free(prompt_for_worker);
+        const msg = try std.fmt.allocPrint(c.tui.arena, "/init: spawn failed: {s}", .{@errorName(err)});
+        try c.tui.pushBlock(.tool_result_error, msg);
+        c.tui.busy = false;
+        return .handled;
+    };
+    // Append to input history so /init shows up under Up-arrow if
+    // the user wants to retry / tweak.
+    try c.tui.input_history.append(c.tui.arena, prompt_for_history);
+    c.tui.history_idx = null;
+    return .handled;
+}
+
 fn slashCompact(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     const c = slashCtx(ctx);
     if (c.tui.sess.messages.items.len == 0) {
@@ -1540,6 +1581,7 @@ const slash_commands = [_]slash.Command{
     .{ .name = "resume", .description = "list saved sessions or resume one by name", .handler = slashResume },
     .{ .name = "doctor", .description = "show env / session / cost-log diagnostics", .handler = slashDoctor },
     .{ .name = "compact", .description = "summarize the conversation so far and replace history with the summary", .handler = slashCompact },
+    .{ .name = "init", .description = "generate a VELK.md tailored to this repo (uses tools + write_file)", .handler = slashInit },
     .{ .name = "multiline", .description = "toggle multi-line input (Enter inserts newline, Ctrl-D submits)", .handler = slashMultiline },
 };
 

@@ -506,6 +506,14 @@ def run_slash_cases(bin_path: Path) -> None:
             tui.wait_for("Saved sessions") or tui.saw("No saved sessions"),
         )
 
+        # /init dispatches an agent turn. We can't drive it without
+        # the mock backing, so just confirm it shows up in /help.
+        tui.send_line("/help")
+        case(
+            "/help mentions /init",
+            tui.wait_for("/init", timeout=2.0),
+        )
+
         tui.send_line("/doctor")
         case(
             "/doctor lists env keys",
