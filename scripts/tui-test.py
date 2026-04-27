@@ -495,6 +495,16 @@ def run_slash_cases(bin_path: Path) -> None:
         tui.send_line("/clear")
         case("/clear drops scrollback", tui.wait_for("Cleared scrollback"))
 
+        # /resume with no args lists saved sessions; with no XDG dir
+        # set the test inherits the dev's $XDG_DATA_HOME, but we
+        # only care that the command runs and prints something
+        # plausible (either "No saved sessions" or "Saved sessions").
+        tui.send_line("/resume")
+        case(
+            "/resume runs and prints a list or empty notice",
+            tui.wait_for("Saved sessions") or tui.saw("No saved sessions"),
+        )
+
         # /multiline test runs LAST in this block — once ON, plain
         # Enter no longer submits, so any subsequent slash command
         # would get stuck in the buffer. We just verify the toggle

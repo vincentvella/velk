@@ -134,6 +134,67 @@ pub fn load(
     return parsed.messages;
 }
 
+pub const SessionMeta = struct {
+    /// Name without the `.json` suffix.
+    name: []const u8,
+    /// Absolute path to the session file.
+    path: []const u8,
+    /// Bytes on disk (rough proxy for size).
+    size_bytes: u64,
+};
+
+/// Enumerate every saved session (directory listing of
+/// `<XDG_DATA_HOME>/velk/sessions/*.json`). Names are returned in
+/// reverse-alphabetical order so the most-recently created shows
+/// first in typical naming schemes (`turn-2026-04-26-…`). Missing
+/// directory yields an empty slice.
+pub fn listSessions(
+    arena: std.mem.Allocator,
+    io: Io,
+    env_map: *std.process.Environ.Map,
+) ![]const SessionMeta {
+    const base = if (env_map.get("XDG_DATA_HOME")) |x| x else blk: {
+        const home = env_map.get("HOME") orelse return Error.HomeDirUnknown;
+        break :blk try std.fmt.allocPrint(arena, "{s}/.local/share", .{home});
+    };
+    const dir_path = try std.fmt.allocPrint(arena, "{s}/velk/sessions", .{base});
+
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return &.{},
+        else => return e,
+    };
+    defer dir.close(io);
+
+    var out: std.ArrayList(SessionMeta) = .empty;
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.name;
+        if (!std.mem.endsWith(u8, name, ".json")) continue;
+        const stem = name[0 .. name.len - ".json".len];
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, name });
+        var size: u64 = 0;
+        if (Io.Dir.cwd().statFile(io, path, .{})) |st| {
+            size = st.size;
+        } else |_| {}
+        try out.append(arena, .{
+            .name = try arena.dupe(u8, stem),
+            .path = path,
+            .size_bytes = size,
+        });
+    }
+
+    // Reverse-alphabetical: caller treats the front of the list as
+    // most-recent under timestamped names.
+    std.mem.sort(SessionMeta, out.items, {}, struct {
+        fn lessThan(_: void, a: SessionMeta, b: SessionMeta) bool {
+            return std.mem.order(u8, a.name, b.name) == .gt;
+        }
+    }.lessThan);
+
+    return out.items;
+}
+
 /// Save the current message list. Creates parent directories as needed.
 pub fn save(
     arena: std.mem.Allocator,

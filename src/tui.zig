@@ -1308,6 +1308,36 @@ fn slashLoad(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
     return .handled;
 }
 
+fn slashResume(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    if (args.len == 0) {
+        const sessions = persist.listSessions(c.tui.arena, c.tui.io, c.env_map) catch |err| {
+            const msg = try std.fmt.allocPrint(c.tui.arena, "/resume: {s}", .{@errorName(err)});
+            try c.tui.pushBlock(.tool_result_error, msg);
+            return .handled;
+        };
+        if (sessions.len == 0) {
+            try c.tui.pushBlock(.notice, "No saved sessions found. Start one with /save <name>.");
+            return .handled;
+        }
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(c.tui.arena, "Saved sessions (newest first):\n");
+        const limit = @min(sessions.len, 10);
+        for (sessions[0..limit]) |s| {
+            try buf.print(c.tui.arena, "  /resume {s}    ({d} bytes)\n", .{ s.name, s.size_bytes });
+        }
+        if (sessions.len > limit) {
+            try buf.print(c.tui.arena, "  … and {d} more.", .{sessions.len - limit});
+        } else if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n') {
+            _ = buf.pop();
+        }
+        try c.tui.pushBlock(.notice, buf.items);
+        return .handled;
+    }
+    // Loading by name reuses /load's exact logic.
+    return slashLoad(ctx, args);
+}
+
 fn slashMultiline(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     const c = slashCtx(ctx);
     c.tui.multiline = !c.tui.multiline;
@@ -1330,6 +1360,7 @@ const slash_commands = [_]slash.Command{
     .{ .name = "system", .description = "show or set the system prompt (use 'clear' to drop it)", .handler = slashSystem },
     .{ .name = "save", .description = "persist the current session to disk", .handler = slashSave },
     .{ .name = "load", .description = "replace the current session with a saved one", .handler = slashLoad },
+    .{ .name = "resume", .description = "list saved sessions or resume one by name", .handler = slashResume },
     .{ .name = "multiline", .description = "toggle multi-line input (Enter inserts newline, Ctrl-D submits)", .handler = slashMultiline },
 };
 
@@ -1418,6 +1449,21 @@ pub fn run(
         .notice,
         "velk REPL — Ctrl-D exit · Ctrl-C abort/cancel · Esc → normal (hjkl, w/b words, 0/$/I/A line, g/G top/bot, Ctrl-u/d page, v/V visual, y yank, i/a insert, q quit) · Enter send",
     );
+    // Crash-recovery v1: when launched without --session and at
+    // least one saved session exists, point the user at /resume so
+    // a forgotten previous session is one keystroke away.
+    if (sess.save_path == null) {
+        const sessions = persist.listSessions(tui_arena, io, env_map) catch &[_]persist.SessionMeta{};
+        if (sessions.len > 0) {
+            const recent = sessions[0];
+            const msg = try std.fmt.allocPrint(
+                tui_arena,
+                "Tip: {d} saved session(s). Most recent: '{s}'. Type /resume to list, /resume {s} to load.",
+                .{ sessions.len, recent.name, recent.name },
+            );
+            try tui.pushBlock(.notice, msg);
+        }
+    }
     try tui.render();
 
     while (true) {
