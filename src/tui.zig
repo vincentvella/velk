@@ -77,6 +77,11 @@ const Block = struct {
         /// while `awaiting_approval` is true. Removed after the user
         /// responds.
         approval_prompt,
+        /// Fenced code block extracted from assistant text on
+        /// flush. Rendered with a header showing the language tag
+        /// and body in dim cyan; markdown inline parsing is skipped
+        /// for the body (verbatim).
+        code_block,
     };
 
     /// Tool-block kinds the user can collapse. Other kinds ignore the
@@ -407,10 +412,31 @@ const Tui = struct {
 
     fn flushOpenAssistant(self: *Tui) !void {
         if (!self.has_open_assistant) return;
-        const owned = try self.arena.dupe(u8, self.assistant_buf.items);
-        const id = self.next_block_id;
-        self.next_block_id += 1;
-        try self.blocks.append(self.arena, .{ .id = id, .kind = .assistant_text, .text = owned });
+        // Whole-buffer parse: split into prose + fenced code blocks
+        // so each renders with the right styling. Streaming text
+        // stays in `assistant_buf` until a turn ends, so this only
+        // runs once per turn (or once per pushBlock that closes the
+        // open assistant).
+        const segments = try markdown.parseBlocks(self.arena, self.assistant_buf.items);
+        for (segments) |seg| {
+            const id = self.next_block_id;
+            self.next_block_id += 1;
+            switch (seg) {
+                .text => |t| try self.blocks.append(self.arena, .{
+                    .id = id,
+                    .kind = .assistant_text,
+                    .text = t,
+                }),
+                .code => |c| {
+                    const formatted = try formatCodeBlock(self.arena, c);
+                    try self.blocks.append(self.arena, .{
+                        .id = id,
+                        .kind = .code_block,
+                        .text = formatted,
+                    });
+                },
+            }
+        }
         self.assistant_buf.clearRetainingCapacity();
         self.has_open_assistant = false;
     }
@@ -799,7 +825,17 @@ fn styleFor(kind: Block.Kind) vaxis.Cell.Style {
         // used only for the `--- a/...` / `+++ b/...` headers.
         .diff => .{ .fg = .{ .index = 8 } },
         .approval_prompt => .{ .fg = .{ .index = 4 }, .bold = true },
+        .code_block => .{ .fg = .{ .index = 6 } },
     };
+}
+
+/// Format a fenced code block as a styled text payload. The header
+/// shows the language tag (or `code` when the fence had no info
+/// string); body is verbatim. Trailing rule line bookends the block
+/// visually.
+fn formatCodeBlock(arena: std.mem.Allocator, c: markdown.CodeBlock) ![]const u8 {
+    const lang_label: []const u8 = if (c.language.len > 0) c.language else "code";
+    return std.fmt.allocPrint(arena, "─── {s} ───\n{s}\n─────────────", .{ lang_label, c.body });
 }
 
 /// Per-row colour for diff text. Looks at the leading char to colour

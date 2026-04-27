@@ -601,6 +601,23 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
                 "markdown: inline HTML passes through",
                 "<em>raw-html</em>" in tui.screen(),
             )
+            case(
+                "markdown: fenced code block — language header rendered",
+                "─── zig ───" in tui.screen(),
+            )
+            case(
+                "markdown: fenced code block — body verbatim",
+                "const fenced_marker = 42;" in tui.screen()
+                and "const still_in_fence = true;" in tui.screen(),
+            )
+            case(
+                "markdown: post-fence prose continues as text",
+                "after-fence" in tui.screen(),
+            )
+            case(
+                "markdown: triple-backtick markers stripped",
+                "```zig" not in tui.screen() and "```\n" not in tui.screen(),
+            )
 
             # ── diff preview before apply ──────────────────────
             # Multi-step `diffwrite/` fixture: step 1 emits a

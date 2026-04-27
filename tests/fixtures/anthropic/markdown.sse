@@ -23,7 +23,10 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"> quoted-thought here\n"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"see <em>raw-html</em> here"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"see <em>raw-html</em> here\n"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"```zig\nconst fenced_marker = 42;\nconst still_in_fence = true;\n```\nafter-fence"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}

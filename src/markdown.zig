@@ -25,6 +25,24 @@ pub const Span = struct {
     code: bool = false,
 };
 
+/// Top-level segment produced by `parseBlocks`. Splits a full
+/// assistant-text buffer into prose runs and fenced code blocks so
+/// the TUI can render the latter as a distinct block kind without
+/// trying to inline-parse triple-backtick markers.
+pub const Segment = union(enum) {
+    text: []const u8,
+    code: CodeBlock,
+};
+
+pub const CodeBlock = struct {
+    /// Fence info string (e.g. "zig", "python"). Empty when the
+    /// opening fence has no tag.
+    language: []const u8,
+    /// Verbatim body bytes (without the surrounding ``` lines or
+    /// the closing fence's trailing \n).
+    body: []const u8,
+};
+
 pub const Error = error{CmarkParseFailed} || std.mem.Allocator.Error;
 
 /// Produce a span list for `line`. All `Span.text` slices are owned
@@ -213,6 +231,79 @@ const WalkState = struct {
     }
 };
 
+/// Walk `source` line-by-line and split it into a sequence of prose
+/// `text` runs and fenced `code` blocks. Triple-backtick fences
+/// (` ``` ` or ` ```lang `) at the start of a line open / close a
+/// block. An unclosed fence at the end of the buffer is emitted as
+/// a code block anyway — useful while the assistant is still
+/// streaming a fence body.
+pub fn parseBlocks(arena: std.mem.Allocator, source: []const u8) ![]Segment {
+    var out: std.ArrayList(Segment) = .empty;
+    var text_buf: std.ArrayList(u8) = .empty;
+    var code_buf: std.ArrayList(u8) = .empty;
+    var in_fence = false;
+    var fence_lang: []const u8 = "";
+
+    var iter = std.mem.splitScalar(u8, source, '\n');
+    while (iter.next()) |raw| {
+        const trimmed = std.mem.trimStart(u8, raw, " \t");
+        if (std.mem.startsWith(u8, trimmed, "```")) {
+            if (in_fence) {
+                // Closing fence: emit accumulated code block, drop
+                // the trailing \n we appended after the last body line.
+                var body = code_buf.items;
+                if (body.len > 0 and body[body.len - 1] == '\n') body = body[0 .. body.len - 1];
+                try out.append(arena, .{ .code = .{
+                    .language = try arena.dupe(u8, fence_lang),
+                    .body = try arena.dupe(u8, body),
+                } });
+                code_buf.clearRetainingCapacity();
+                fence_lang = "";
+                in_fence = false;
+            } else {
+                // Opening fence: flush pending text, capture lang.
+                try flushTextBuf(arena, &out, &text_buf);
+                fence_lang = std.mem.trim(u8, trimmed[3..], " \t\r");
+                in_fence = true;
+            }
+            continue;
+        }
+        if (in_fence) {
+            try code_buf.appendSlice(arena, raw);
+            try code_buf.append(arena, '\n');
+        } else {
+            try text_buf.appendSlice(arena, raw);
+            try text_buf.append(arena, '\n');
+        }
+    }
+
+    // Streaming-friendly: if we ended inside a fence, emit whatever
+    // we have so the TUI shows partial code instead of nothing.
+    if (in_fence and code_buf.items.len > 0) {
+        var body = code_buf.items;
+        if (body.len > 0 and body[body.len - 1] == '\n') body = body[0 .. body.len - 1];
+        try out.append(arena, .{ .code = .{
+            .language = try arena.dupe(u8, fence_lang),
+            .body = try arena.dupe(u8, body),
+        } });
+    }
+    try flushTextBuf(arena, &out, &text_buf);
+
+    return out.toOwnedSlice(arena);
+}
+
+fn flushTextBuf(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(Segment),
+    buf: *std.ArrayList(u8),
+) !void {
+    if (buf.items.len == 0) return;
+    var t = buf.items;
+    if (t.len > 0 and t[t.len - 1] == '\n') t = t[0 .. t.len - 1];
+    if (t.len > 0) try out.append(arena, .{ .text = try arena.dupe(u8, t) });
+    buf.clearRetainingCapacity();
+}
+
 // ───────── tests ─────────
 
 const testing = std.testing;
@@ -395,4 +486,64 @@ test "tokenize: double-underscore bold" {
         if (std.mem.eql(u8, s.text, "strong") and s.bold) has_bold = true;
     }
     try testing.expect(has_bold);
+}
+
+test "parseBlocks: prose only is one text segment" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const segs = try parseBlocks(arena.allocator(), "hello\nworld");
+    try testing.expectEqual(@as(usize, 1), segs.len);
+    try testing.expectEqualStrings("hello\nworld", segs[0].text);
+}
+
+test "parseBlocks: empty input is no segments" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const segs = try parseBlocks(arena.allocator(), "");
+    try testing.expectEqual(@as(usize, 0), segs.len);
+}
+
+test "parseBlocks: fenced code block with language tag" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const segs = try parseBlocks(arena.allocator(),
+        "Here you go:\n```zig\nconst x = 1;\nconst y = 2;\n```\nThat's it.");
+    try testing.expectEqual(@as(usize, 3), segs.len);
+    try testing.expectEqualStrings("Here you go:", segs[0].text);
+    try testing.expectEqualStrings("zig", segs[1].code.language);
+    try testing.expectEqualStrings("const x = 1;\nconst y = 2;", segs[1].code.body);
+    try testing.expectEqualStrings("That's it.", segs[2].text);
+}
+
+test "parseBlocks: fence without language tag" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const segs = try parseBlocks(arena.allocator(),
+        "```\nplain block\n```");
+    try testing.expectEqual(@as(usize, 1), segs.len);
+    try testing.expectEqualStrings("", segs[0].code.language);
+    try testing.expectEqualStrings("plain block", segs[0].code.body);
+}
+
+test "parseBlocks: unclosed fence still emits as code (streaming-friendly)" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const segs = try parseBlocks(arena.allocator(),
+        "intro\n```py\npartial body\nstill streaming");
+    try testing.expectEqual(@as(usize, 2), segs.len);
+    try testing.expectEqualStrings("intro", segs[0].text);
+    try testing.expectEqualStrings("py", segs[1].code.language);
+    try testing.expectEqualStrings("partial body\nstill streaming", segs[1].code.body);
+}
+
+test "parseBlocks: two adjacent fences" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const segs = try parseBlocks(arena.allocator(),
+        "```js\nfoo\n```\n```py\nbar\n```");
+    try testing.expectEqual(@as(usize, 2), segs.len);
+    try testing.expectEqualStrings("js", segs[0].code.language);
+    try testing.expectEqualStrings("foo", segs[0].code.body);
+    try testing.expectEqualStrings("py", segs[1].code.language);
+    try testing.expectEqualStrings("bar", segs[1].code.body);
 }
