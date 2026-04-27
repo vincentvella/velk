@@ -138,12 +138,25 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _pick_step(dir_: Path, payload: dict) -> Optional[Path]:
-        """Multi-step scenario: serve step N where N == len(messages).
-        Lets a single tool-use round trip through 3 .sse files
-        (user-only=1, after-tool-result=3, etc) without per-process
-        state."""
-        n = len(payload.get("messages") or []) or 1
-        candidate = dir_ / f"{n}.sse"
+        """Multi-step scenario: serve step (k+1).sse where k = number
+        of `tool_result` blocks already present in the message
+        history. Counting tool_results — instead of total messages —
+        keeps the step index invariant across earlier turns in the
+        same session (prior turns inflate `len(messages)` but never
+        add tool_results from THIS scenario)."""
+        msgs = payload.get("messages") or []
+        tool_results = 0
+        for m in msgs:
+            if m.get("role") != "user":
+                continue
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_results += 1
+        step = tool_results + 1
+        candidate = dir_ / f"{step}.sse"
         if candidate.exists():
             return candidate
         # Fall back to the highest-numbered file we have so the

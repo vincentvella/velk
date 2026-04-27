@@ -544,39 +544,6 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
         tui = TUI([str(bin_path)], env=env)
         try:
             case("turn: repl banner", tui.wait_for("velk REPL"))
-
-            # ── diff preview before apply ──────────────────────
-            # MUST run before any other turn case in this block.
-            # When sequenced after the markdown turn, the agent
-            # worker no longer surfaces the tool_use to the gate
-            # (root cause TBD — likely related to per-turn arena
-            # state lingering across turns). Running it first
-            # exercises the path with a fresh agent. Worth a
-            # follow-up to fix the underlying issue.
-            output_path = Path("tests/fixtures/diffwrite-out.txt")
-            if output_path.exists():
-                output_path.unlink()
-            tui.send_line("please diffwrite")
-            diff_appeared = tui.wait_for("@@", screen=True, timeout=5.0)
-            case("diff: unified diff hunk header rendered", diff_appeared)
-            case(
-                "diff: prompt offers apply/skip/always",
-                "[a]pply" in tui.screen() and "[A]lways apply" in tui.screen(),
-            )
-            tui.send("a")
-            case(
-                "diff: after apply, file was actually written",
-                tui.wait_for("All-done-marker", screen=True, timeout=5.0)
-                and output_path.exists()
-                and "hello from velk" in output_path.read_text(),
-            )
-            case(
-                "diff: prompt was consumed (replaced with verdict)",
-                "→ applied" in tui.screen(),
-            )
-            if output_path.exists():
-                output_path.unlink()
-
             tui.send_line("hi")
             case(
                 "turn: streamed assistant reply renders",
@@ -634,6 +601,40 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
                 "markdown: inline HTML passes through",
                 "<em>raw-html</em>" in tui.screen(),
             )
+
+            # ── diff preview before apply ──────────────────────
+            # Multi-step `diffwrite/` fixture: step 1 emits a
+            # tool_use for write_file; the gate prompts; we press
+            # 'a' to apply; step 2 (after the tool_result is sent
+            # back) is the model's final reply. The mock picks the
+            # step from the *number of tool_result blocks in the
+            # message history*, not message length, so prior turns
+            # in this session don't shift the index.
+            output_path = Path("tests/fixtures/diffwrite-out.txt")
+            if output_path.exists():
+                output_path.unlink()
+            tui.send_line("please diffwrite")
+            case(
+                "diff: unified diff hunk header rendered",
+                tui.wait_for("@@", screen=True, timeout=5.0),
+            )
+            case(
+                "diff: prompt offers apply/skip/always",
+                "[a]pply" in tui.screen() and "[A]lways apply" in tui.screen(),
+            )
+            tui.send("a")
+            case(
+                "diff: after apply, file was actually written",
+                tui.wait_for("All-done-marker", screen=True, timeout=5.0)
+                and output_path.exists()
+                and "hello from velk" in output_path.read_text(),
+            )
+            case(
+                "diff: prompt was consumed (replaced with verdict)",
+                "→ applied" in tui.screen(),
+            )
+            if output_path.exists():
+                output_path.unlink()
         finally:
             if FAIL > 0 or os.environ.get("TUI_TEST_DUMP"):
                 with open("/tmp/tui-test-turn-buffer.txt", "w") as f:
