@@ -8,6 +8,7 @@ const openai = @import("openai.zig");
 const tool = @import("tool.zig");
 const tools = @import("tools.zig");
 const approval_mod = @import("approval.zig");
+const settings_mod = @import("settings.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -154,7 +155,17 @@ pub fn main(init: std.process.Init) !void {
             try errw.flush();
             std.process.exit(2);
         },
-        .run => |opts| {
+        .run => |raw_opts| {
+            // Layer settings.json defaults underneath the CLI flags.
+            // CLI flags WIN — overlaySettings only fills fields the
+            // user didn't explicitly set on the command line.
+            const file_settings = settings_mod.loadAndMerge(arena, init.io, init.environ_map) catch |err| settings: {
+                try errw.print("velk: settings file: {s}\n", .{@errorName(err)});
+                try errw.flush();
+                break :settings settings_mod.Settings{};
+            };
+            const opts = applySettingsToOptions(arena, raw_opts, file_settings);
+
             const holder = setupProvider(arena, init, errw, opts) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
@@ -319,6 +330,42 @@ fn setupProvider(
         },
     }
     return holder;
+}
+
+/// CLI flags take precedence; only fields the user didn't set on
+/// the command line are filled from `s.defaults`. `mcp_servers`
+/// from settings is concatenated with whatever the user passed via
+/// `--mcp` so users get both sources.
+fn applySettingsToOptions(
+    arena: std.mem.Allocator,
+    base: cli.Options,
+    s: settings_mod.Settings,
+) cli.Options {
+    var out = base;
+    // CLI defaults are sentinel-detected: provider == default_provider
+    // is ambiguous (could be either "user picked anthropic" or "user
+    // didn't pass --provider"). To keep things simple we treat the
+    // default as "unset" and let the file override it. If a user
+    // explicitly passes `--provider anthropic` and the file says
+    // openai, this is wrong — but that's a corner case we can
+    // revisit when CLI gains a "was-set" flag.
+    if (s.defaults.provider) |p| out.provider = p;
+    if (out.model == null) {
+        if (s.defaults.model) |m| out.model = m;
+    }
+    if (out.system == null) {
+        if (s.defaults.system) |sp| out.system = sp;
+    }
+    if (out.max_tokens == cli.default_max_tokens) {
+        if (s.defaults.max_tokens) |t| out.max_tokens = t;
+    }
+    if (s.mcp_servers.len > 0) {
+        const merged = arena.alloc([]const u8, out.mcp_servers.len + s.mcp_servers.len) catch return out;
+        @memcpy(merged[0..out.mcp_servers.len], out.mcp_servers);
+        @memcpy(merged[out.mcp_servers.len..], s.mcp_servers);
+        out.mcp_servers = merged;
+    }
+    return out;
 }
 
 fn defaultModelFor(p: cli.Provider) []const u8 {

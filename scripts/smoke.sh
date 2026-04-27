@@ -147,6 +147,30 @@ if command -v python3 >/dev/null 2>&1; then
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "anything"
 
+    # Settings file: a user-level settings.json with `defaults.model`
+    # set should be picked up when --model is omitted. Use a tmp
+    # XDG_CONFIG_HOME so we don't touch the real config.
+    SETTINGS_TMP="$(mktemp -d)"
+    mkdir -p "$SETTINGS_TMP/velk"
+    cat >"$SETTINGS_TMP/velk/settings.json" <<'JSON'
+{ "defaults": { "model": "claude-from-settings" } }
+JSON
+    SMOKE_EXPECT_STDERR="model=claude-from-settings" run_case \
+        "settings.json defaults.model is applied" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "XDG_CONFIG_HOME=$SETTINGS_TMP" \
+            "$VELK" --no-tui --debug "anything"
+
+    # CLI --model wins over settings.json.
+    SMOKE_EXPECT_STDERR="model=cli-override" run_case \
+        "CLI --model overrides settings.json" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "XDG_CONFIG_HOME=$SETTINGS_TMP" \
+            "$VELK" --no-tui --debug --model cli-override "anything"
+    rm -rf "$SETTINGS_TMP"
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else
