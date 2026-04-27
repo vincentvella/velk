@@ -10,6 +10,7 @@ const tools = @import("tools.zig");
 const approval_mod = @import("approval.zig");
 const settings_mod = @import("settings.zig");
 const permissions_mod = @import("permissions.zig");
+const workspace_mod = @import("workspace.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -237,10 +238,23 @@ pub fn main(init: std.process.Init) !void {
 
             try printProviderBanner(errw, init.environ_map, opts.provider, model);
 
+            // Project-context auto-load: walk up from CWD looking
+            // for a git repo root, then look for AGENTS.md /
+            // VELK.md / CLAUDE.md in either CWD or root and prepend
+            // the contents to the system prompt. Failures here are
+            // non-fatal — we just run with the user's --system as-is.
+            const repo_root = workspace_mod.findRepoRoot(arena, init.io) catch null;
+            const ctx_loaded = workspace_mod.findContextFile(arena, init.io, repo_root) catch null;
+            const final_system: ?[]const u8 = if (ctx_loaded) |loaded| blk: {
+                try errw.print("velk: auto-loaded {s} ({d} bytes)\n", .{ loaded.path, loaded.contents.len });
+                try errw.flush();
+                break :blk try workspace_mod.buildSystemPrompt(arena, opts.system, loaded.contents, loaded.path);
+            } else opts.system;
+
             var sess: session.Session = .init(arena, provider, .{
                 .model = model,
                 .max_tokens = opts.max_tokens,
-                .system = opts.system,
+                .system = final_system,
                 .tools = tool_set,
             });
 

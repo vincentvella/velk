@@ -181,6 +181,14 @@ JSON
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --mode totally-bogus "anything"
 
+    # AGENTS.md auto-load: velk's own AGENTS.md should be detected
+    # on launch (we run from the repo root). Banner reports it.
+    SMOKE_EXPECT_STDERR="auto-loaded" run_case \
+        "AGENTS.md is auto-loaded into the system prompt" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui "anything"
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else
