@@ -267,6 +267,37 @@ JSON
     rm -rf "$HOOK_SETTINGS_TMP"
     unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
 
+    # Skills v1: a project-level .velk/skills/<name>/SKILL.md with
+    # name + description in frontmatter is discovered and the
+    # banner reports the load. Use a tmp project dir so we don't
+    # pollute the repo.
+    SKILLS_TMP="$(mktemp -d)"
+    mkdir -p "$SKILLS_TMP/.velk/skills/sample-skill"
+    cat >"$SKILLS_TMP/.velk/skills/sample-skill/SKILL.md" <<'MD'
+---
+name: sample-skill
+description: Used by smoke tests to verify skill discovery
+---
+
+Body content goes here.
+MD
+    # Discovery walks .velk/skills relative to the cwd we run
+    # from, so cd into the tmp dir for this case. Resolve the
+    # binary's absolute path first since the relative
+    # ./zig-out/bin/velk would break under pushd.
+    VELK_ABS="$(cd "$(dirname "$VELK")" && pwd)/$(basename "$VELK")"
+    pushd "$SKILLS_TMP" >/dev/null
+    SMOKE_EXPECT_STDERR="1 skill(s) loaded" run_case \
+        "skills: project SKILL.md is discovered" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            HOME="$SKILLS_TMP" \
+            XDG_CONFIG_HOME="$SKILLS_TMP/empty" \
+            "$VELK_ABS" --no-tui "anything"
+    popd >/dev/null
+    rm -rf "$SKILLS_TMP"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else

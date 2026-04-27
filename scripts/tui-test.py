@@ -741,6 +741,52 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
             if output_path.exists():
                 output_path.unlink()
 
+            # ── ask_user_question ───────────────────────────────
+            # `askwhich/` fixture: step 1 emits a tool_use for
+            # ask_user_question; the TUI shows a numbered picker;
+            # we press '2'; step 2 is the model's wrap-up.
+            tui.send_line("please askwhich")
+            case(
+                "ask: question rendered",
+                tui.wait_for("Which framework?", screen=True, timeout=5.0),
+            )
+            case(
+                "ask: options numbered",
+                "1. option-zig" in tui.screen() and "2. option-rust" in tui.screen(),
+            )
+            case(
+                "ask: hint about keys shown",
+                "[1-9 to pick" in tui.screen(),
+            )
+            tui.send("2")
+            case(
+                "ask: verdict notice replaces prompt",
+                tui.wait_for("→ selected option 2", screen=True, timeout=5.0),
+            )
+            case(
+                "ask: turn continued after selection",
+                tui.wait_for("ask-confirmed", screen=True, timeout=5.0),
+            )
+
+            # ── todo_write ──────────────────────────────────────
+            # `todowrite/` fixture: step 1 emits a tool_use with two
+            # items; the tool runs and the store is mutated; step 2
+            # is the model's wrap-up. After the turn, the panel sits
+            # above the status row showing both items.
+            tui.send_line("please todowrite")
+            case(
+                "todo_write: panel shows in_progress glyph",
+                tui.wait_for("[~] draft tests", screen=True, timeout=5.0),
+            )
+            case(
+                "todo_write: panel shows pending glyph",
+                "[ ] ship phase 12" in tui.screen(),
+            )
+            case(
+                "todo_write: panel header rendered",
+                "── todos" in tui.screen(),
+            )
+
             # ── /compact ────────────────────────────────────────
             # The /compact handler builds a request whose final user
             # message contains "summarize", which the mock maps to

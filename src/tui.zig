@@ -20,6 +20,8 @@ const approval = @import("approval.zig");
 const mentions = @import("mentions.zig");
 const git_commit = @import("git_commit.zig");
 const hooks = @import("hooks.zig");
+const todos = @import("todos.zig");
+const ask = @import("ask.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -38,6 +40,10 @@ const Event = union(enum) {
     /// the diff + prompt, captures the user's decision, calls
     /// gate.deliver(...). Strings are gpa-owned; main thread frees.
     a_approval: approval.Request,
+    /// Posted by AskGate.ask — main thread renders the question +
+    /// numbered options, captures a digit (or Esc), calls
+    /// gate.deliver(...). Strings are gpa-owned; main thread frees.
+    a_ask: ask.Request,
 };
 
 const AgentToolCall = struct {
@@ -86,6 +92,9 @@ const Block = struct {
         /// and body in dim cyan; markdown inline parsing is skipped
         /// for the body (verbatim).
         code_block,
+        /// `ask_user_question` prompt awaiting a digit keystroke.
+        /// Rendered in cyan, removed after the user picks.
+        question_prompt,
     };
 
     /// Tool-block kinds the user can collapse. Other kinds ignore the
@@ -308,6 +317,20 @@ const Tui = struct {
     /// every prompt submit (stdout prepended to the worker's prompt)
     /// and Stop fires after every turn (notification only).
     hook_engine: ?*const hooks.Engine = null,
+    /// Optional todo store. When non-null, the `todo_write` tool is
+    /// registered and the renderer shows the list above the status
+    /// bar whenever it has any entries.
+    todos: ?*todos.Store = null,
+    /// Optional ask gate. When non-null, the `ask_user_question`
+    /// tool is registered; pressing 1-9 while a question_prompt is
+    /// active delivers the selection.
+    ask_gate: ?*ask.AskGate = null,
+    /// Block id of the active question prompt (0 = none). Set when
+    /// `a_ask` arrives, cleared after deliver.
+    ask_block_id: u32 = 0,
+    /// Number of options for the active question prompt. Used to
+    /// validate the digit keystroke.
+    ask_options_n: usize = 0,
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -459,6 +482,22 @@ const Tui = struct {
         self.has_open_assistant = false;
     }
 
+    /// Replace the pending question_prompt block with a verdict
+    /// notice and clear the ask state so subsequent keys go to the
+    /// input box again.
+    fn consumeAskPrompt(self: *Tui, verdict: []const u8) !void {
+        const prompt_id = self.ask_block_id;
+        if (prompt_id == 0) return;
+        self.ask_block_id = 0;
+        self.ask_options_n = 0;
+        for (self.blocks.items) |*b| {
+            if (b.id != prompt_id) continue;
+            b.kind = .notice;
+            b.text = try std.fmt.allocPrint(self.arena, "→ {s}", .{verdict});
+            return;
+        }
+    }
+
     /// Replace the pending approval-prompt block with a one-line
     /// notice recording the user's choice, and clear the awaiting
     /// flag so subsequent keys go to the input box again.
@@ -514,15 +553,27 @@ const Tui = struct {
         const input_cap: u16 = @max(1, @divTrunc(h, 3));
         if (input_rows > input_cap) input_rows = input_cap;
 
-        const reserved: u16 = 2 + input_rows; // status + separator + input rows
-        const scroll_h: u16 = if (h > reserved) h - reserved else 0;
-
         // Reset (not deinit) so previous render's lines memory is
         // reclaimed AND `all_lines` is repointed to a fresh slab that
         // outlives this render call. Mouse handlers that read
         // `tui.all_lines` between renders see valid bytes.
         _ = self.lines_arena.reset(.retain_capacity);
         const lines_alloc = self.lines_arena.allocator();
+
+        // Snapshot the todo list once per render (under the store's
+        // lock). When non-empty we reserve a panel above the status
+        // line: one header row + N item rows, capped at h/3 so the
+        // scrollback never collapses.
+        var todo_snap: []const todos.Item = &.{};
+        if (self.todos) |store| {
+            todo_snap = store.snapshot(self.io, lines_alloc) catch &.{};
+        }
+        const todo_rows_uncapped: u16 = if (todo_snap.len == 0) 0 else @intCast(@min(@as(usize, std.math.maxInt(u16)), todo_snap.len + 1));
+        const panel_cap: u16 = @max(1, @divTrunc(h, 3));
+        const todo_rows: u16 = @min(todo_rows_uncapped, panel_cap);
+
+        const reserved: u16 = 2 + input_rows + todo_rows; // status + separator + input + todos
+        const scroll_h: u16 = if (h > reserved) h - reserved else 0;
 
         var lines: std.ArrayList(RenderedLine) = .empty;
         for (self.blocks.items) |block| try wrapBlockInto(lines_alloc, &lines, block, w);
@@ -576,6 +627,37 @@ const Tui = struct {
                 .col_offset = col,
                 .wrap = .none,
             });
+        }
+
+        // Todo panel sits directly above the status row when the
+        // model has emitted any items. Header + one row per item,
+        // truncated by panel_cap. Glyph color tracks status:
+        // green=completed, yellow=in_progress, dim=pending.
+        if (todo_rows > 0) {
+            const panel_top: u16 = h - 3 - todo_rows;
+            const header = "── todos ";
+            var hdr_buf: std.ArrayList(u8) = .empty;
+            try hdr_buf.appendSlice(lines_alloc, header);
+            while (hdr_buf.items.len < w) try hdr_buf.append(lines_alloc, '-');
+            _ = win.print(&.{.{
+                .text = hdr_buf.items[0..@min(hdr_buf.items.len, w)],
+                .style = .{ .fg = .{ .index = 8 } },
+            }}, .{ .row_offset = panel_top, .wrap = .none });
+
+            const visible_items = todo_snap[0..@min(todo_snap.len, @as(usize, todo_rows - 1))];
+            for (visible_items, 0..) |it, i| {
+                const row: u16 = panel_top + 1 + @as(u16, @intCast(i));
+                const color: u8 = switch (it.status) {
+                    .completed => 2, // green
+                    .in_progress => 3, // yellow
+                    .pending => 8, // dim
+                };
+                const line = try std.fmt.allocPrint(lines_alloc, "  {s} {s}", .{ it.status.glyph(), it.content });
+                _ = win.print(&.{.{
+                    .text = line[0..@min(line.len, w)],
+                    .style = .{ .fg = .{ .index = color } },
+                }}, .{ .row_offset = row, .wrap = .none });
+            }
         }
 
         // Status row at h-3: model · tokens · cost · spinner-when-busy.
@@ -870,6 +952,15 @@ fn postApprovalEvent(ctx: ?*anyopaque, request: approval.Request) anyerror!void 
     try tui.loop.postEvent(.{ .a_approval = request });
 }
 
+/// Ask-gate post hook. Called from the WORKER THREAD when the model
+/// invokes `ask_user_question`. We post an `a_ask` event; the
+/// worker blocks on the gate until the main thread captures a
+/// digit/Esc and calls deliver.
+fn postAskEvent(ctx: ?*anyopaque, request: ask.Request) anyerror!void {
+    const tui: *Tui = @ptrCast(@alignCast(ctx.?));
+    try tui.loop.postEvent(.{ .a_ask = request });
+}
+
 /// Hand the contents of `tui.input` to the slash dispatcher, or to
 /// the agent worker if it's not a slash command. Shared by the
 /// Enter (single-line) path and the Ctrl-D (multi-line submit)
@@ -1001,6 +1092,7 @@ fn styleFor(kind: Block.Kind) vaxis.Cell.Style {
         .diff => .{ .fg = .{ .index = 8 } },
         .approval_prompt => .{ .fg = .{ .index = 4 }, .bold = true },
         .code_block => .{ .fg = .{ .index = 6 } },
+        .question_prompt => .{ .fg = .{ .index = 6 }, .bold = true },
     };
 }
 
@@ -1660,6 +1752,8 @@ pub fn run(
     approval_gate: *approval.ApprovalGate,
     auto_commit: bool,
     hook_engine: ?*const hooks.Engine,
+    todos_store: ?*todos.Store,
+    ask_gate: ?*ask.AskGate,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -1704,7 +1798,14 @@ pub fn run(
         .approval_gate = approval_gate,
         .auto_commit = auto_commit,
         .hook_engine = hook_engine,
+        .todos = todos_store,
+        .ask_gate = ask_gate,
     };
+    defer if (todos_store) |s| s.deinit(io);
+    if (ask_gate) |g| {
+        g.post_fn = postAskEvent;
+        g.post_ctx = &tui;
+    }
     // Wire the gate's event-poster so worker-side approval requests
     // surface as `a_approval` events on the main thread.
     approval_gate.post_fn = postApprovalEvent;
@@ -1885,6 +1986,28 @@ pub fn run(
                         // Ignore other keys while waiting for approval.
                         continue;
                     }
+                }
+                // ask_user_question: digit picks, Esc cancels.
+                if (tui.ask_block_id != 0 and tui.ask_gate != null) {
+                    if (key.matches('c', .{ .ctrl = true })) {
+                        // Fall through to abort handler.
+                    } else if (key.matches(vaxis.Key.escape, .{})) {
+                        tui.ask_gate.?.deliver(.canceled);
+                        try tui.consumeAskPrompt("canceled");
+                        try tui.render();
+                        continue;
+                    } else if (key.text) |t| if (t.len == 1 and t[0] >= '1' and t[0] <= '9') {
+                        const idx: usize = @intCast(t[0] - '1');
+                        if (idx < tui.ask_options_n) {
+                            tui.ask_gate.?.deliver(.{ .selected = idx });
+                            const verdict = try std.fmt.allocPrint(tui_arena, "selected option {d}", .{idx + 1});
+                            try tui.consumeAskPrompt(verdict);
+                            try tui.render();
+                            continue;
+                        }
+                    };
+                    // Ignore everything else while a question is open.
+                    if (!key.matches('c', .{ .ctrl = true })) continue;
                 }
                 // Ctrl-D in insert mode: submits the buffered input
                 // when in multi-line mode; otherwise exits the REPL.
@@ -2229,6 +2352,34 @@ pub fn run(
                 );
                 try tui.pushBlock(.approval_prompt, prompt_text);
                 tui.awaiting_prompt_id = tui.blocks.items[tui.blocks.items.len - 1].id;
+                try tui.render();
+            },
+            .a_ask => |req| {
+                // Worker is blocked on AskGate.cond.wait. Render the
+                // question + numbered options, mark ask_block_id so
+                // digit keys route to deliver(). If the turn was
+                // canceled, deliver canceled so the worker unwinds.
+                defer gpa.free(req.question);
+                defer {
+                    for (req.options) |o| gpa.free(@constCast(o));
+                    gpa.free(@constCast(req.options));
+                }
+                const gate = tui.ask_gate orelse {
+                    continue;
+                };
+                if (tui.turn == null) {
+                    gate.deliver(.canceled);
+                    continue;
+                }
+                var buf: std.ArrayList(u8) = .empty;
+                try buf.print(tui_arena, "{s}\n", .{req.question});
+                for (req.options, 0..) |o, i| {
+                    try buf.print(tui_arena, "  {d}. {s}\n", .{ i + 1, o });
+                }
+                try buf.appendSlice(tui_arena, "[1-9 to pick · Esc to cancel]");
+                try tui.pushBlock(.question_prompt, buf.items);
+                tui.ask_block_id = tui.blocks.items[tui.blocks.items.len - 1].id;
+                tui.ask_options_n = req.options.len;
                 try tui.render();
             },
             .a_done => |result| {

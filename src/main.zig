@@ -14,6 +14,9 @@ const workspace_mod = @import("workspace.zig");
 const mentions_mod = @import("mentions.zig");
 const repo_map_mod = @import("repo_map.zig");
 const hooks_mod = @import("hooks.zig");
+const todos_mod = @import("todos.zig");
+const ask_mod = @import("ask.zig");
+const skills_mod = @import("skills.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -198,6 +201,23 @@ pub fn main(init: std.process.Init) !void {
             // Trust modes auto-apply via the gate's bypass.
             if (mode.bypassesPrompts()) approval_gate.bypass = true;
 
+            // Todo store. Lives only when running interactively — a
+            // one-shot prompt has no surface to show the list, so the
+            // tool would just be a black hole. Allocated once in the
+            // arena; the worker mutates it and the TUI snapshots.
+            const todos_store: ?*todos_mod.Store = if (opts.no_tui or opts.prompt != null) null else blk: {
+                const s = try arena.create(todos_mod.Store);
+                s.* = todos_mod.Store.init(init.gpa);
+                break :blk s;
+            };
+            // Ask gate. Same restriction as todos — only meaningful
+            // when there's a TUI to render the picker.
+            const ask_gate: ?*ask_mod.AskGate = if (opts.no_tui or opts.prompt != null) null else blk: {
+                const g = try arena.create(ask_mod.AskGate);
+                g.* = ask_mod.AskGate.init(init.gpa, init.io);
+                break :blk g;
+            };
+
             const settings = try arena.create(tools.Settings);
             settings.* = .{
                 .io = init.io,
@@ -207,6 +227,8 @@ pub fn main(init: std.process.Init) !void {
                 .mode = mode,
                 .include_ignored = opts.include_ignored,
                 .env_map = init.environ_map,
+                .todos = todos_store,
+                .ask = ask_gate,
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 
@@ -255,6 +277,21 @@ pub fn main(init: std.process.Init) !void {
                 try errw.flush();
                 break :blk try workspace_mod.buildSystemPrompt(arena, opts.system, loaded.contents, loaded.path);
             } else opts.system;
+
+            // Skills catalog: walk the discovery roots, prepend a
+            // catalog summary so the model knows what's available.
+            // Bodies stay on disk; the model reads via `read_file`
+            // when it picks one. Failures are silent — a typo'd
+            // SKILL.md in someone's home shouldn't break a session.
+            const skill_list = skills_mod.loadAll(arena, init.io, init.environ_map) catch &.{};
+            if (skill_list.len > 0) {
+                const catalog = skills_mod.formatCatalog(arena, skill_list) catch "";
+                if (catalog.len > 0) {
+                    final_system = try workspace_mod.buildSystemPrompt(arena, final_system, catalog, "skills");
+                    try errw.print("velk: {d} skill(s) loaded\n", .{skill_list.len});
+                    try errw.flush();
+                }
+            }
 
             // Repo map (opt-in): prepend a cached filtered tree
             // listing so the model has the project shape without
@@ -354,7 +391,7 @@ pub fn main(init: std.process.Init) !void {
 
             const mcp_count: u8 = if (mcp_servers) |s| @intCast(@min(255, s.clients.items.len)) else 0;
             const hook_engine_ptr: ?*const hooks_mod.Engine = if (file_settings.hook_engine.isEmpty()) null else &file_settings.hook_engine;
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr) catch |err| {
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);

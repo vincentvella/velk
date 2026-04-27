@@ -16,6 +16,8 @@ const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
 const ignore = @import("ignore.zig");
 const web = @import("web.zig");
+const todos_mod = @import("todos.zig");
+const ask_mod = @import("ask.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
 /// so any tool that touches the filesystem can consult `unsafe` and reuse
@@ -41,6 +43,13 @@ pub const Settings = struct {
     include_ignored: bool = false,
     /// Process env (for XDG_CACHE_HOME etc). Nullable for tests.
     env_map: ?*std.process.Environ.Map = null,
+    /// Optional todo store. When set, the `todo_write` tool is
+    /// registered and writes here; the TUI renders from a snapshot.
+    todos: ?*todos_mod.Store = null,
+    /// Optional ask gate. When set, the `ask_user_question` tool is
+    /// registered; calls block on the gate until the TUI delivers a
+    /// selection (or Esc cancels).
+    ask: ?*ask_mod.AskGate = null,
 };
 
 pub const Error = error{
@@ -64,6 +73,8 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildBash(arena, settings));
     try list.append(arena, try buildWebFetch(arena, settings));
     try list.append(arena, try buildWebSearch(arena, settings));
+    if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
+    if (settings.ask != null) try list.append(arena, try buildAskUserQuestion(arena, settings));
     return list.items;
 }
 
@@ -688,6 +699,162 @@ fn killGroup(pid: ?std.posix.pid_t) void {
     if (id <= 0) return;
     // Negative PID means "this process group" in POSIX kill().
     _ = std.c.kill(-id, std.posix.SIG.KILL);
+}
+
+// ───────── todo_write ─────────
+
+const todo_write_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "todos":{"type":"array","description":"The full task list. Replaces any prior list.",
+    \\     "items":{"type":"object",
+    \\       "properties":{
+    \\         "content":{"type":"string","description":"What needs to be done."},
+    \\         "status":{"type":"string","enum":["pending","in_progress","completed"],"description":"Current state."}
+    \\       },
+    \\       "required":["content","status"]}}
+    \\ },
+    \\ "required":["todos"]}
+;
+
+pub fn buildTodoWrite(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, todo_write_schema_json, .{});
+    return .{
+        .name = "todo_write",
+        .description = "Replace the working todo list. Pass the full list every call (the previous list is discarded). Each item has `content` and `status` (pending|in_progress|completed). The user sees the list in the TUI; use it to track multi-step work.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = todoWriteExecute,
+    };
+}
+
+fn todoWriteExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const store = settings.todos orelse return errorOutput(arena, "todo_write: no store wired (TUI-only feature)", .{});
+
+    const arr_v = switch (input) {
+        .object => |o| o.get("todos") orelse return errorOutput(arena, "todo_write: missing 'todos'", .{}),
+        else => return errorOutput(arena, "todo_write: input must be an object", .{}),
+    };
+    const arr = switch (arr_v) {
+        .array => |a| a,
+        else => return errorOutput(arena, "todo_write: 'todos' must be an array", .{}),
+    };
+
+    var built: std.ArrayList(todos_mod.Item) = .empty;
+    for (arr.items, 0..) |item, idx| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => return errorOutput(arena, "todo_write: todos[{d}] must be an object", .{idx}),
+        };
+        const content_v = obj.get("content") orelse return errorOutput(arena, "todo_write: todos[{d}].content missing", .{idx});
+        const content = switch (content_v) {
+            .string => |s| s,
+            else => return errorOutput(arena, "todo_write: todos[{d}].content must be a string", .{idx}),
+        };
+        const status_str: []const u8 = blk: {
+            const v = obj.get("status") orelse break :blk "pending";
+            break :blk switch (v) {
+                .string => |s| s,
+                else => return errorOutput(arena, "todo_write: todos[{d}].status must be a string", .{idx}),
+            };
+        };
+        const status = todos_mod.Status.fromString(status_str) orelse
+            return errorOutput(arena, "todo_write: todos[{d}].status invalid: {s}", .{ idx, status_str });
+        try built.append(arena, .{ .content = content, .status = status });
+    }
+
+    try store.set(settings.io, built.items);
+
+    // Render a compact summary back to the model so it can re-cite
+    // the list without re-emitting it. Format: one line per item,
+    // glyph + content.
+    var out: std.ArrayList(u8) = .empty;
+    if (built.items.len == 0) {
+        try out.appendSlice(arena, "todo list cleared.");
+    } else {
+        try out.print(arena, "todo list updated ({d} item(s)):\n", .{built.items.len});
+        for (built.items) |it| {
+            try out.print(arena, "{s} {s}\n", .{ it.status.glyph(), it.content });
+        }
+    }
+    return .{ .text = out.items };
+}
+
+// ───────── ask_user_question ─────────
+
+const ask_user_question_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "question":{"type":"string","description":"The question to put to the user. One short sentence."},
+    \\   "options":{"type":"array","description":"Numbered choices. The user picks one by number (1-9). Up to 9.",
+    \\     "items":{"type":"string"}}
+    \\ },
+    \\ "required":["question","options"]}
+;
+
+pub fn buildAskUserQuestion(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, ask_user_question_schema_json, .{});
+    return .{
+        .name = "ask_user_question",
+        .description = "Ask the user a structured multiple-choice question. Pass a question and a list of options (max 9). Blocks until the user picks one. Returns the selected option text. Use sparingly — only when you genuinely cannot proceed without the user's input.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = askUserQuestionExecute,
+    };
+}
+
+fn askUserQuestionExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const gate = settings.ask orelse return errorOutput(arena, "ask_user_question: no UI gate (TUI-only)", .{});
+
+    const question = (try getString(input, "question")) orelse return errorOutput(arena, "ask_user_question: missing 'question'", .{});
+
+    const arr_v = switch (input) {
+        .object => |o| o.get("options") orelse return errorOutput(arena, "ask_user_question: missing 'options'", .{}),
+        else => return errorOutput(arena, "ask_user_question: input must be an object", .{}),
+    };
+    const arr = switch (arr_v) {
+        .array => |a| a,
+        else => return errorOutput(arena, "ask_user_question: 'options' must be an array", .{}),
+    };
+    if (arr.items.len == 0) return errorOutput(arena, "ask_user_question: 'options' must be non-empty", .{});
+    if (arr.items.len > 9) return errorOutput(arena, "ask_user_question: at most 9 options supported", .{});
+
+    // Strings handed to the gate live on `gpa` because the TUI
+    // outlives this arena turn (Block.text takes a copy when we
+    // pushBlock, but the gate-side Request is held until deliver).
+    const q_dup = try settings.gpa.dupe(u8, question);
+    const opts = try settings.gpa.alloc([]const u8, arr.items.len);
+    var built: usize = 0;
+    errdefer {
+        settings.gpa.free(@constCast(q_dup));
+        for (opts[0..built]) |o| settings.gpa.free(@constCast(o));
+        settings.gpa.free(opts);
+    }
+    for (arr.items, 0..) |item, i| {
+        const s = switch (item) {
+            .string => |x| x,
+            else => return errorOutput(arena, "ask_user_question: options[{d}] must be a string", .{i}),
+        };
+        opts[i] = try settings.gpa.dupe(u8, s);
+        built = i + 1;
+    }
+
+    const r = try gate.ask(q_dup, opts);
+    switch (r) {
+        .selected => |idx| {
+            // The gate has freed the request; we have only the
+            // arena-borrowed copy of the input options.
+            const choice = switch (arr.items[idx]) {
+                .string => |s| s,
+                else => "?",
+            };
+            const text = try std.fmt.allocPrint(arena, "user selected: {s}", .{choice});
+            return .{ .text = text };
+        },
+        .canceled => return errorOutput(arena, "ask_user_question: canceled by user", .{}),
+    }
 }
 
 // ───────── shared input helpers ─────────

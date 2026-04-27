@@ -139,22 +139,36 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _pick_step(dir_: Path, payload: dict) -> Optional[Path]:
         """Multi-step scenario: serve step (k+1).sse where k = number
-        of `tool_result` blocks already present in the message
-        history. Counting tool_results — instead of total messages —
-        keeps the step index invariant across earlier turns in the
-        same session (prior turns inflate `len(messages)` but never
-        add tool_results from THIS scenario)."""
+        of `tool_result` blocks emitted *since the most recent fresh
+        user text turn*. Walking back from the end and stopping at a
+        text-only user message scopes the count to the current
+        scenario, so prior tool turns in the same session don't
+        bleed into this scenario's step index."""
         msgs = payload.get("messages") or []
         tool_results = 0
-        for m in msgs:
+        for m in reversed(msgs):
             if m.get("role") != "user":
                 continue
             content = m.get("content")
+            if isinstance(content, str):
+                # Plain user text — start of this scenario. Stop.
+                break
             if not isinstance(content, list):
                 continue
+            has_tool_result = False
+            has_text = False
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    tool_results += 1
+                if isinstance(block, dict):
+                    t = block.get("type")
+                    if t == "tool_result":
+                        tool_results += 1
+                        has_tool_result = True
+                    elif t == "text":
+                        has_text = True
+            # A user message containing only text marks the start of
+            # the current scenario; everything before it is history.
+            if has_text and not has_tool_result:
+                break
         step = tool_results + 1
         candidate = dir_ / f"{step}.sse"
         if candidate.exists():
