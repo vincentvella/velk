@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 const provider_mod = @import("provider.zig");
 const tool = @import("tool.zig");
+const hooks = @import("hooks.zig");
 
 /// Callbacks the agent fires as a turn unfolds. All slices passed in
 /// are only valid for the duration of the call — copy if you need to
@@ -31,6 +32,15 @@ pub const Config = struct {
     max_iterations: u32 = 10,
     /// Optional starting message history.
     history: []const provider_mod.Message = &.{},
+    /// Optional hook engine. Fired around each tool execution.
+    hook_engine: ?*const hooks.Engine = null,
+    /// gpa for hook payload allocation. Required when `hook_engine`
+    /// is non-null — the engine spawns child processes which need
+    /// long-lived buffers separate from the per-turn arena.
+    hook_gpa: ?std.mem.Allocator = null,
+    /// Io for spawning hook commands. Required when `hook_engine`
+    /// is non-null.
+    hook_io: ?Io = null,
 };
 
 pub const Error = error{
@@ -98,7 +108,7 @@ pub fn run(
         // Run each tool_use, gather tool_results into one user message.
         var results: std.ArrayList(provider_mod.ContentBlock) = .empty;
         for (state.tool_uses.items) |use| {
-            const result = try executeOne(arena, config.tools, use, sink);
+            const result = try executeOne(arena, config, use, sink);
             try results.append(arena, .{ .tool_result = result });
         }
         try messages.append(arena, .{ .role = .user, .content = results.items });
@@ -130,19 +140,42 @@ fn buildAssistantBlocks(arena: std.mem.Allocator, state: *TurnState) ![]const pr
 
 fn executeOne(
     arena: std.mem.Allocator,
-    tools: []const tool.Tool,
+    config: Config,
     use: provider_mod.ToolUse,
     sink: Sink,
 ) !provider_mod.ToolResult {
     const input_str = try std.json.Stringify.valueAlloc(arena, use.input, .{});
     try sink.onToolCall(sink.ctx, use.name, input_str);
 
-    const reg: tool.Registry = .{ .tools = tools };
+    const reg: tool.Registry = .{ .tools = config.tools };
     const t = reg.find(use.name) orelse {
         const msg = try std.fmt.allocPrint(arena, "unknown tool: {s}", .{use.name});
         try sink.onToolResult(sink.ctx, msg, true);
         return .{ .tool_use_id = use.id, .content = msg, .is_error = true };
     };
+
+    // PreToolUse: a hook returning exit-2 short-circuits execution.
+    if (config.hook_engine) |engine| {
+        if (engine.hooks.len > 0) {
+            const gpa = config.hook_gpa orelse arena;
+            const io = config.hook_io orelse return Error.InvalidToolInput;
+            const outcome = engine.dispatch(gpa, io, .pre_tool_use, .{
+                .tool_name = use.name,
+                .tool_input = use.input,
+            }) catch |e| blk: {
+                std.log.warn("hook dispatch failed: {s}", .{@errorName(e)});
+                break :blk hooks.Outcome{};
+            };
+            defer if (outcome.inject) |s| gpa.free(s);
+            defer if (outcome.notice) |s| gpa.free(s);
+            if (outcome.blocked) |reason| {
+                defer gpa.free(reason);
+                const msg = try std.fmt.allocPrint(arena, "blocked by PreToolUse hook: {s}", .{reason});
+                try sink.onToolResult(sink.ctx, msg, true);
+                return .{ .tool_use_id = use.id, .content = msg, .is_error = true };
+            }
+        }
+    }
 
     const out = t.execute(t.context, arena, use.input) catch |e| {
         const msg = try std.fmt.allocPrint(arena, "tool errored: {s}", .{@errorName(e)});
@@ -151,6 +184,28 @@ fn executeOne(
     };
 
     try sink.onToolResult(sink.ctx, out.text, out.is_error);
+
+    // PostToolUse: notification only. Errors are swallowed.
+    if (config.hook_engine) |engine| {
+        if (engine.hooks.len > 0) {
+            const gpa = config.hook_gpa orelse arena;
+            if (config.hook_io) |io| {
+                if (engine.dispatch(gpa, io, .post_tool_use, .{
+                    .tool_name = use.name,
+                    .tool_input = use.input,
+                    .tool_output = out.text,
+                    .tool_error = out.is_error,
+                })) |outcome| {
+                    if (outcome.inject) |s| gpa.free(s);
+                    if (outcome.notice) |s| gpa.free(s);
+                    if (outcome.blocked) |s| gpa.free(s);
+                } else |e| {
+                    std.log.warn("PostToolUse dispatch failed: {s}", .{@errorName(e)});
+                }
+            }
+        }
+    }
+
     return .{ .tool_use_id = use.id, .content = out.text, .is_error = out.is_error };
 }
 

@@ -19,6 +19,7 @@ const markdown = @import("markdown.zig");
 const approval = @import("approval.zig");
 const mentions = @import("mentions.zig");
 const git_commit = @import("git_commit.zig");
+const hooks = @import("hooks.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -303,6 +304,10 @@ const Tui = struct {
     /// Last user prompt text — used as the auto-commit message
     /// (truncated). Populated on every successful submit.
     last_prompt: []const u8 = "",
+    /// Optional hook engine. When non-null, UserPromptSubmit fires on
+    /// every prompt submit (stdout prepended to the worker's prompt)
+    /// and Stop fires after every turn (notification only).
+    hook_engine: ?*const hooks.Engine = null,
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -917,7 +922,45 @@ fn submitInputBuffer(
     const prompt_for_history = try tui_arena.dupe(u8, tui.input.items);
     tui.last_prompt = prompt_for_history; // remembered for auto-commit
     const expanded = try mentions.expand(tui_arena, io, prompt_for_history, false);
-    const prompt_for_worker = try gpa.dupe(u8, expanded);
+
+    // UserPromptSubmit hook: stdout (or `prompt`-type body) is
+    // prepended as a `<context source="hook">` block ahead of the
+    // user prompt. Hook errors surface as a non-fatal notice; a
+    // hook returning exit-2 aborts the submit entirely.
+    var prompt_with_hook: []const u8 = expanded;
+    if (tui.hook_engine) |engine| {
+        if (!engine.isEmpty()) {
+            const outcome = engine.dispatch(gpa, io, .user_prompt_submit, .{
+                .prompt = prompt_for_history,
+            }) catch |e| blk: {
+                const m = try std.fmt.allocPrint(tui_arena, "[hook] UserPromptSubmit dispatch failed: {s}", .{@errorName(e)});
+                try tui.pushBlock(.tool_result_error, m);
+                break :blk hooks.Outcome{};
+            };
+            defer if (outcome.notice) |s| gpa.free(s);
+            defer if (outcome.blocked) |s| gpa.free(s);
+            if (outcome.notice) |n| {
+                const m = try std.fmt.allocPrint(tui_arena, "[hook] {s}", .{n});
+                try tui.pushBlock(.notice, m);
+            }
+            if (outcome.blocked) |b| {
+                const m = try std.fmt.allocPrint(tui_arena, "[hook] UserPromptSubmit blocked: {s}", .{b});
+                try tui.pushBlock(.tool_result_error, m);
+                tui.input.clearRetainingCapacity();
+                try tui.render();
+                return .handled;
+            }
+            if (outcome.inject) |inj| {
+                defer gpa.free(inj);
+                prompt_with_hook = try std.fmt.allocPrint(
+                    tui_arena,
+                    "<context source=\"hook\">\n{s}\n</context>\n\n{s}",
+                    .{ inj, expanded },
+                );
+            }
+        }
+    }
+    const prompt_for_worker = try gpa.dupe(u8, prompt_with_hook);
     try tui.input_history.append(tui_arena, prompt_for_history);
     tui.history_idx = null;
     if (history_path) |path| persist.appendHistory(tui_arena, io, path, prompt_for_history) catch {};
@@ -1616,6 +1659,7 @@ pub fn run(
     mcp_count: u8,
     approval_gate: *approval.ApprovalGate,
     auto_commit: bool,
+    hook_engine: ?*const hooks.Engine,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -1659,6 +1703,7 @@ pub fn run(
         .lines_arena = &lines_arena,
         .approval_gate = approval_gate,
         .auto_commit = auto_commit,
+        .hook_engine = hook_engine,
     };
     // Wire the gate's event-poster so worker-side approval requests
     // surface as `a_approval` events on the main thread.
@@ -2199,6 +2244,27 @@ pub fn run(
                     const elapsed_ms: u64 = @intCast(@max(@as(i96, 0), @divTrunc(elapsed.nanoseconds, std.time.ns_per_ms)));
                     const summary = lastAssistantText(&tui) orelse "(turn complete)";
                     notify.maybe(tui_arena, io, env_map, "velk: turn complete", summary, elapsed_ms);
+
+                    // Stop hook: notification only — no decision. Errors
+                    // surface as a non-fatal notice. Fired before any
+                    // git auto-commit so a Stop hook can race a `git
+                    // status` against the same dirty tree if it wants.
+                    if (tui.hook_engine) |engine| {
+                        if (!engine.isEmpty()) {
+                            const stop_outcome = engine.dispatch(gpa, io, .stop, .{}) catch |e| blk: {
+                                const m = try std.fmt.allocPrint(tui_arena, "[hook] Stop dispatch failed: {s}", .{@errorName(e)});
+                                try tui.pushBlock(.tool_result_error, m);
+                                break :blk hooks.Outcome{};
+                            };
+                            if (stop_outcome.inject) |s| gpa.free(s);
+                            if (stop_outcome.blocked) |s| gpa.free(s);
+                            if (stop_outcome.notice) |n| {
+                                defer gpa.free(n);
+                                const m = try std.fmt.allocPrint(tui_arena, "[hook] {s}", .{n});
+                                try tui.pushBlock(.notice, m);
+                            }
+                        }
+                    }
 
                     // Auto-commit hook: only on successful turns,
                     // only when enabled, only when the tree is

@@ -8,6 +8,7 @@ const provider_mod = @import("provider.zig");
 const tool = @import("tool.zig");
 const agent = @import("agent.zig");
 const persist = @import("persist.zig");
+const hooks = @import("hooks.zig");
 
 pub const Config = struct {
     model: []const u8,
@@ -15,6 +16,13 @@ pub const Config = struct {
     system: ?[]const u8 = null,
     tools: []const tool.Tool = &.{},
     max_iterations: u32 = 10,
+    /// Optional. Forwarded to the agent loop so PreToolUse /
+    /// PostToolUse hooks fire around every tool invocation.
+    hook_engine: ?*const hooks.Engine = null,
+    /// gpa + io for hook child-process spawning. Required when
+    /// `hook_engine` is non-null.
+    hook_gpa: ?std.mem.Allocator = null,
+    hook_io: ?Io = null,
 };
 
 pub const Session = struct {
@@ -41,6 +49,9 @@ pub const Session = struct {
             .tools = self.config.tools,
             .max_iterations = self.config.max_iterations,
             .history = self.messages.items,
+            .hook_engine = self.config.hook_engine,
+            .hook_gpa = self.config.hook_gpa,
+            .hook_io = self.config.hook_io,
         });
         self.messages.clearRetainingCapacity();
         try self.messages.appendSlice(self.arena, final);

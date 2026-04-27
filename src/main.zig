@@ -13,6 +13,7 @@ const permissions_mod = @import("permissions.zig");
 const workspace_mod = @import("workspace.zig");
 const mentions_mod = @import("mentions.zig");
 const repo_map_mod = @import("repo_map.zig");
+const hooks_mod = @import("hooks.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -276,6 +277,9 @@ pub fn main(init: std.process.Init) !void {
                 .max_tokens = opts.max_tokens,
                 .system = final_system,
                 .tools = tool_set,
+                .hook_engine = if (file_settings.hook_engine.isEmpty()) null else &file_settings.hook_engine,
+                .hook_gpa = init.gpa,
+                .hook_io = init.io,
             });
 
             if (opts.session) |name| {
@@ -299,7 +303,41 @@ pub fn main(init: std.process.Init) !void {
             if (opts.prompt) |p| {
                 var plain: PlainSink = .{ .text_out = w, .progress_out = errw, .arena = arena, .model = model };
                 const expanded = mentions_mod.expand(arena, init.io, p, opts.unsafe) catch p;
-                sess.ask(expanded, plain.sink()) catch |err| {
+
+                // UserPromptSubmit hook for the one-shot path. Exit-2
+                // blocks (we print the reason and exit 1); successful
+                // hooks prepend stdout / `prompt`-body as a context
+                // block ahead of the user's prompt.
+                var prompt_with_hook: []const u8 = expanded;
+                if (!file_settings.hook_engine.isEmpty()) {
+                    const outcome = file_settings.hook_engine.dispatch(init.gpa, init.io, .user_prompt_submit, .{
+                        .prompt = p,
+                    }) catch |e| blk: {
+                        try errw.print("velk: hook UserPromptSubmit dispatch failed: {s}\n", .{@errorName(e)});
+                        try errw.flush();
+                        break :blk hooks_mod.Outcome{};
+                    };
+                    if (outcome.notice) |n| {
+                        defer init.gpa.free(n);
+                        try errw.print("velk: [hook] {s}\n", .{n});
+                        try errw.flush();
+                    }
+                    if (outcome.blocked) |b| {
+                        defer init.gpa.free(b);
+                        try errw.print("velk: prompt blocked by UserPromptSubmit hook: {s}\n", .{b});
+                        try errw.flush();
+                        std.process.exit(1);
+                    }
+                    if (outcome.inject) |inj| {
+                        defer init.gpa.free(inj);
+                        prompt_with_hook = try std.fmt.allocPrint(
+                            arena,
+                            "<context source=\"hook\">\n{s}\n</context>\n\n{s}",
+                            .{ inj, expanded },
+                        );
+                    }
+                }
+                sess.ask(prompt_with_hook, plain.sink()) catch |err| {
                     try renderProviderError(errw, err, provider);
                     try errw.flush();
                     std.process.exit(1);
@@ -315,7 +353,8 @@ pub fn main(init: std.process.Init) !void {
             }
 
             const mcp_count: u8 = if (mcp_servers) |s| @intCast(@min(255, s.clients.items.len)) else 0;
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit) catch |err| {
+            const hook_engine_ptr: ?*const hooks_mod.Engine = if (file_settings.hook_engine.isEmpty()) null else &file_settings.hook_engine;
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);

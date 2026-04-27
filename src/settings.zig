@@ -14,6 +14,7 @@
 const std = @import("std");
 const Io = std.Io;
 const cli = @import("cli.zig");
+const hooks = @import("hooks.zig");
 
 pub const default_filename: []const u8 = "settings.json";
 pub const project_dir_name: []const u8 = ".velk";
@@ -38,6 +39,10 @@ pub const Settings = struct {
     permissions: ?std.json.Value = null,
     hooks: ?std.json.Value = null,
     skills: ?std.json.Value = null,
+    /// Compiled hook engine. Built lazily by `compileHooks` once
+    /// settings have been merged so project-level hooks override the
+    /// user-level set wholesale (no concatenation — last one wins).
+    hook_engine: hooks.Engine = .{},
 
     /// `Defaults` section overlay: every non-null field of `b`
     /// replaces the matching field on `self`.
@@ -63,6 +68,15 @@ pub const Settings = struct {
         if (b.permissions) |v| self.permissions = v;
         if (b.hooks) |v| self.hooks = v;
         if (b.skills) |v| self.skills = v;
+    }
+
+    /// Compile the merged `hooks` JSON into a typed engine. Safe to
+    /// call multiple times; later calls just overwrite. No-op when
+    /// `hooks` is null.
+    pub fn compileHooks(self: *Settings, arena: std.mem.Allocator) !void {
+        if (self.hooks) |v| {
+            self.hook_engine = try hooks.Engine.parse(arena, v);
+        }
     }
 };
 
@@ -119,6 +133,7 @@ pub fn loadAndMerge(
     } else |_| {}
     const pp = try projectPath(arena);
     if (try loadFile(arena, io, pp)) |p| try out.merge(arena, p);
+    try out.compileHooks(arena);
     return out;
 }
 

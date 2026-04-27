@@ -223,6 +223,50 @@ JSON
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "anything"
 
+    # Hook system: a UserPromptSubmit hook that exits 2 should
+    # block the prompt — velk exits 1 with the hook's stderr as
+    # the reason. Tests the engine end-to-end (parse, dispatch,
+    # spawn, exit-code semantics).
+    HOOK_SETTINGS_TMP="$(mktemp -d)"
+    mkdir -p "$HOOK_SETTINGS_TMP/velk"
+    cat >"$HOOK_SETTINGS_TMP/velk/settings.json" <<'JSON'
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {"type": "command", "command": "echo SMOKE_HOOK_BLOCKED >&2; exit 2"}
+    ]
+  }
+}
+JSON
+    SMOKE_EXPECT_STDERR="SMOKE_HOOK_BLOCKED" run_case \
+        "UserPromptSubmit hook exit-2 blocks the prompt" 1 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "XDG_CONFIG_HOME=$HOOK_SETTINGS_TMP" \
+            "$VELK" --no-tui "anything"
+
+    # Hook injection: a `prompt`-type UserPromptSubmit hook adds
+    # extra context to the request body. The body grows in the
+    # debug envelope's body=NN bytes count.
+    cat >"$HOOK_SETTINGS_TMP/velk/settings.json" <<'JSON'
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {"type": "prompt", "prompt": "INJECTED_HOOK_CONTEXT"}
+    ]
+  }
+}
+JSON
+    SMOKE_EXPECT_STDERR="body=" run_case \
+        "UserPromptSubmit prompt-type hook injects context" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "XDG_CONFIG_HOME=$HOOK_SETTINGS_TMP" \
+            "$VELK" --no-tui --debug "anything"
+
+    rm -rf "$HOOK_SETTINGS_TMP"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else
