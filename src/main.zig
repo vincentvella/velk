@@ -11,6 +11,7 @@ const approval_mod = @import("approval.zig");
 const settings_mod = @import("settings.zig");
 const permissions_mod = @import("permissions.zig");
 const workspace_mod = @import("workspace.zig");
+const mentions_mod = @import("mentions.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -279,7 +280,8 @@ pub fn main(init: std.process.Init) !void {
 
             if (opts.prompt) |p| {
                 var plain: PlainSink = .{ .text_out = w, .progress_out = errw, .arena = arena, .model = model };
-                sess.ask(p, plain.sink()) catch |err| {
+                const expanded = mentions_mod.expand(arena, init.io, p, opts.unsafe) catch p;
+                sess.ask(expanded, plain.sink()) catch |err| {
                     try renderProviderError(errw, err, provider);
                     try errw.flush();
                     std.process.exit(1);

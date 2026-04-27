@@ -189,6 +189,17 @@ JSON
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui "anything"
 
+    # @file mention: when the prompt references @LICENSE, the
+    # expanded body fed to the worker is much bigger than the raw
+    # prompt — visible via --debug's body= byte count. We compare
+    # roughly: the LICENSE file is ~11k bytes; an expanded request
+    # should have body=20000+ bytes, vs ~3000 without.
+    SMOKE_EXPECT_STDERR="body=" run_case \
+        "@file mention attaches file content to the request" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui --debug "summarize @LICENSE"
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else

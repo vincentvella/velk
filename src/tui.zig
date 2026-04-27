@@ -17,6 +17,7 @@ const slash = @import("slash.zig");
 const notify = @import("notify.zig");
 const markdown = @import("markdown.zig");
 const approval = @import("approval.zig");
+const mentions = @import("mentions.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -901,15 +902,26 @@ fn submitInputBuffer(
         return .handled;
     }
 
-    // Two copies of the prompt: one for tui's history (in tui_arena,
-    // lives for the session) and one for the worker (in gpa, lives
-    // until turn cleanup).
+    // History keeps the literal text the user typed (with the
+    // `@mention` syntax intact) so Up/Down recall stays clean.
+    // The worker sees an expanded prompt with each `@path`'s
+    // contents prepended in an `<attachments>` block — which the
+    // session's persisted messages then capture as the user turn.
     const prompt_for_history = try tui_arena.dupe(u8, tui.input.items);
-    const prompt_for_worker = try gpa.dupe(u8, tui.input.items);
+    const expanded = try mentions.expand(tui_arena, io, prompt_for_history, false);
+    const prompt_for_worker = try gpa.dupe(u8, expanded);
     try tui.input_history.append(tui_arena, prompt_for_history);
     tui.history_idx = null;
     if (history_path) |path| persist.appendHistory(tui_arena, io, path, prompt_for_history) catch {};
     try tui.pushBlock(.user_prompt, prompt_for_history);
+    if (expanded.len != prompt_for_history.len) {
+        const note = try std.fmt.allocPrint(
+            tui_arena,
+            "(attached {d} byte(s) of @-referenced file context)",
+            .{expanded.len - prompt_for_history.len},
+        );
+        try tui.pushBlock(.notice, note);
+    }
     tui.input.clearRetainingCapacity();
     tui.busy = true;
     try tui.render();
