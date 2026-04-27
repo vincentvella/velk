@@ -36,6 +36,9 @@ pub const Options = struct {
     /// etc.) when listing / grepping. Off by default — explicitly
     /// asking the model to scan a build output is the rare case.
     include_ignored: bool = false,
+    /// After every turn, if the tree is dirty + we're in a git
+    /// repo, run `git add -A && git commit -m …`. Off by default.
+    auto_commit: bool = false,
 };
 
 pub const ParseError = struct {
@@ -105,6 +108,10 @@ pub fn parse(args: []const []const u8) Action {
             opts.include_ignored = true;
             continue;
         }
+        if (eql(arg, "--auto-commit")) {
+            opts.auto_commit = true;
+            continue;
+        }
         if (eql(arg, "--no-tui")) {
             opts.no_tui = true;
             continue;
@@ -164,6 +171,8 @@ pub fn printHelp(w: anytype) !void {
         \\                        acceptAll | bypass | plan
         \\      --include-ignored ls/grep also descend into ignored dirs
         \\                        (node_modules, .git, .zig-cache, ...)
+        \\      --auto-commit     git add -A + git commit at every dirty
+        \\                        turn end (best-effort, requires git repo)
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\      --mcp <command>   spawn an MCP server (repeatable);

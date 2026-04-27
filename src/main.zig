@@ -297,7 +297,7 @@ pub fn main(init: std.process.Init) !void {
             }
 
             const mcp_count: u8 = if (mcp_servers) |s| @intCast(@min(255, s.clients.items.len)) else 0;
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate) catch |err| {
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);

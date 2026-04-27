@@ -18,6 +18,7 @@ const notify = @import("notify.zig");
 const markdown = @import("markdown.zig");
 const approval = @import("approval.zig");
 const mentions = @import("mentions.zig");
+const git_commit = @import("git_commit.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -296,6 +297,12 @@ const Tui = struct {
     /// the input buffer and Ctrl-D submits (instead of exiting).
     /// Toggled by the `/multiline` slash command.
     multiline: bool = false,
+    /// When true, run `git add -A && git commit -m …` at the end
+    /// of every dirty turn. Off by default.
+    auto_commit: bool = false,
+    /// Last user prompt text — used as the auto-commit message
+    /// (truncated). Populated on every successful submit.
+    last_prompt: []const u8 = "",
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -908,6 +915,7 @@ fn submitInputBuffer(
     // contents prepended in an `<attachments>` block — which the
     // session's persisted messages then capture as the user turn.
     const prompt_for_history = try tui_arena.dupe(u8, tui.input.items);
+    tui.last_prompt = prompt_for_history; // remembered for auto-commit
     const expanded = try mentions.expand(tui_arena, io, prompt_for_history, false);
     const prompt_for_worker = try gpa.dupe(u8, expanded);
     try tui.input_history.append(tui_arena, prompt_for_history);
@@ -1607,6 +1615,7 @@ pub fn run(
     model: []const u8,
     mcp_count: u8,
     approval_gate: *approval.ApprovalGate,
+    auto_commit: bool,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -1649,6 +1658,7 @@ pub fn run(
         .env_map = env_map,
         .lines_arena = &lines_arena,
         .approval_gate = approval_gate,
+        .auto_commit = auto_commit,
     };
     // Wire the gate's event-poster so worker-side approval requests
     // surface as `a_approval` events on the main thread.
@@ -2189,6 +2199,23 @@ pub fn run(
                     const elapsed_ms: u64 = @intCast(@max(@as(i96, 0), @divTrunc(elapsed.nanoseconds, std.time.ns_per_ms)));
                     const summary = lastAssistantText(&tui) orelse "(turn complete)";
                     notify.maybe(tui_arena, io, env_map, "velk: turn complete", summary, elapsed_ms);
+
+                    // Auto-commit hook: only on successful turns,
+                    // only when enabled, only when the tree is
+                    // dirty (git_commit.maybeCommit checks). Best-
+                    // effort — failures are surfaced as a notice
+                    // but never propagated.
+                    if (tui.auto_commit) {
+                        const cap: usize = @min(tui.last_prompt.len, 80);
+                        const subject = tui.last_prompt[0..cap];
+                        const msg = try std.fmt.allocPrint(tui_arena, "velk: {s}", .{subject});
+                        const outcome = git_commit.maybeCommit(io, gpa, msg);
+                        switch (outcome) {
+                            .committed => try tui.pushBlock(.notice, "[auto-commit] git commit succeeded"),
+                            .failed => try tui.pushBlock(.tool_result_error, "[auto-commit] git commit failed (no repo, hook rejected, or git missing)"),
+                            .clean => {}, // nothing changed — silent
+                        }
+                    }
                 }
                 if (result.err) |err| switch (err) {
                     error.Canceled => try tui.pushBlock(.notice, "[aborted]"),
