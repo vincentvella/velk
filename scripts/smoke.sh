@@ -215,6 +215,14 @@ JSON
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "explain @maybeRequestApproval"
 
+    # Tools registry includes web_fetch + web_search → tools=9 in
+    # the debug envelope (was tools=7 before this batch).
+    SMOKE_EXPECT_STDERR="tools=9" run_case \
+        "web_fetch + web_search are registered tools" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui --debug "anything"
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else

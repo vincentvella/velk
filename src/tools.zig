@@ -15,6 +15,7 @@ const diff = @import("diff.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
 const ignore = @import("ignore.zig");
+const web = @import("web.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
 /// so any tool that touches the filesystem can consult `unsafe` and reuse
@@ -38,6 +39,8 @@ pub const Settings = struct {
     /// When true, `ls` and `grep` descend into / list paths that
     /// match the common-ignore set (node_modules, .git, etc).
     include_ignored: bool = false,
+    /// Process env (for XDG_CACHE_HOME etc). Nullable for tests.
+    env_map: ?*std.process.Environ.Map = null,
 };
 
 pub const Error = error{
@@ -59,6 +62,8 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildLs(arena, settings));
     try list.append(arena, try buildGrep(arena, settings));
     try list.append(arena, try buildBash(arena, settings));
+    try list.append(arena, try buildWebFetch(arena, settings));
+    try list.append(arena, try buildWebSearch(arena, settings));
     return list.items;
 }
 
@@ -479,6 +484,94 @@ fn grepOneFile(
 }
 
 // ───────── bash ─────────
+
+// ───────── web_search ─────────
+
+const web_search_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "query":{"type":"string","description":"Search query."},
+    \\   "max_results":{"type":"integer","description":"Cap on results returned (default 5, max 10)."}
+    \\ },
+    \\ "required":["query"]}
+;
+
+pub fn buildWebSearch(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, web_search_schema_json, .{});
+    return .{
+        .name = "web_search",
+        .description = "Search the web. Uses Brave Search API when BRAVE_API_KEY is set; otherwise falls back to DuckDuckGo's HTML endpoint. Returns title, url, snippet for each hit.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = webSearchExecute,
+    };
+}
+
+fn webSearchExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const query = (try getString(input, "query")) orelse return errorOutput(arena, "web_search: missing 'query'", .{});
+    if (query.len == 0) return errorOutput(arena, "web_search: empty query", .{});
+    const max_int = (try getInt(input, "max_results")) orelse 5;
+    const max_results: usize = @intCast(@min(@max(max_int, 1), 10));
+    const env_map = settings.env_map orelse return errorOutput(arena, "web_search: env not configured", .{});
+
+    if (env_map.get("BRAVE_API_KEY")) |key| {
+        const text = web.braveSearch(arena, settings.io, settings.gpa, query, key, max_results) catch |e|
+            return errorOutput(arena, "web_search (brave): {s}", .{@errorName(e)});
+        return .{ .text = text };
+    }
+
+    const text = web.duckduckgoSearch(arena, settings.io, settings.gpa, env_map, query, max_results) catch |e|
+        return errorOutput(arena, "web_search (ddg): {s}", .{@errorName(e)});
+    return .{ .text = text };
+}
+
+// ───────── web_fetch ─────────
+
+const web_fetch_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "url":{"type":"string","description":"Absolute http(s) URL to fetch."}
+    \\ },
+    \\ "required":["url"]}
+;
+
+pub fn buildWebFetch(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, web_fetch_schema_json, .{});
+    return .{
+        .name = "web_fetch",
+        .description = "Fetch an http(s) URL and return its body. HTML responses are converted to markdown; everything else is returned verbatim. Honors robots.txt; results are cached for 15 minutes.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = webFetchExecute,
+    };
+}
+
+fn webFetchExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const url = (try getString(input, "url")) orelse return errorOutput(arena, "web_fetch: missing 'url'", .{});
+    if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
+        return errorOutput(arena, "web_fetch: only http(s) URLs are supported (got: {s})", .{url});
+    }
+    const env_map = settings.env_map orelse return errorOutput(arena, "web_fetch: env not configured", .{});
+
+    const result = web.fetch(arena, settings.io, settings.gpa, env_map, url) catch |e| switch (e) {
+        web.Error.DisallowedByRobots => return errorOutput(arena, "web_fetch: blocked by robots.txt for {s}", .{url}),
+        else => return errorOutput(arena, "web_fetch: {s}: {s}", .{ url, @errorName(e) }),
+    };
+
+    if (result.status >= 400) {
+        return errorOutput(arena, "web_fetch: HTTP {d} for {s}\n{s}", .{ result.status, url, result.body });
+    }
+
+    const cache_marker: []const u8 = if (result.from_cache) " (cached)" else "";
+    const text = try std.fmt.allocPrint(
+        arena,
+        "GET {s} → {d}{s}\n\n{s}",
+        .{ url, result.status, cache_marker, result.body },
+    );
+    return .{ .text = text };
+}
 
 const bash_schema_json: []const u8 =
     \\{"type":"object",
