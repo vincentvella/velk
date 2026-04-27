@@ -11,14 +11,24 @@ const std = @import("std");
 const Io = std.Io;
 const mvzr = @import("mvzr");
 const tool = @import("tool.zig");
+const diff = @import("diff.zig");
+const approval = @import("approval.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
 /// so any tool that touches the filesystem can consult `unsafe` and reuse
 /// the right `io` implementation.
 pub const Settings = struct {
     io: Io,
+    /// gpa for diff/path duplications that the approval gate hands off
+    /// to the TUI thread. Required when `approval` is non-null.
+    gpa: std.mem.Allocator,
     /// When false, paths must be relative and lexically inside CWD.
     unsafe: bool = false,
+    /// Optional cross-thread gate. When set, write-side tools surface
+    /// a unified diff to the TUI and block until the user approves /
+    /// skips / always-applies. When null, every change auto-applies
+    /// (`--no-tui`, one-shot CLI, smoke tests).
+    approval: ?*approval.ApprovalGate = null,
 };
 
 pub const Error = error{
@@ -184,6 +194,18 @@ fn writeFileExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.
     const path = validatePath(settings, raw_path) catch |e| return errorOutput(arena, "write_file: {s}", .{@errorName(e)});
 
     const cwd = Io.Dir.cwd();
+    // Read the existing file (if any) for the "old" diff side. A
+    // missing file is a 0-byte old; the diff renders as all `+` lines.
+    const original = cwd.readFileAlloc(settings.io, path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return errorOutput(arena, "write_file: read {s}: {s}", .{ path, @errorName(e) }),
+    };
+
+    switch (try maybeRequestApproval(settings, arena, path, original, content)) {
+        .apply, .always_apply => {},
+        .skip => return .{ .text = try std.fmt.allocPrint(arena, "write_file: user skipped {s}", .{path}) },
+    }
+
     cwd.writeFile(settings.io, .{ .sub_path = path, .data = content }) catch |e|
         return errorOutput(arena, "write_file: {s}: {s}", .{ path, @errorName(e) });
 
@@ -237,10 +259,37 @@ fn editExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
     @memcpy(out[first .. first + new_str.len], new_str);
     @memcpy(out[first + new_str.len ..], original[first + old_str.len ..]);
 
+    switch (try maybeRequestApproval(settings, arena, path, original, out)) {
+        .apply, .always_apply => {},
+        .skip => return .{ .text = try std.fmt.allocPrint(arena, "edit: user skipped {s}", .{path}) },
+    }
+
     cwd.writeFile(settings.io, .{ .sub_path = path, .data = out }) catch |e|
         return errorOutput(arena, "edit: write {s}: {s}", .{ path, @errorName(e) });
 
     return .{ .text = try std.fmt.allocPrint(arena, "replaced 1 occurrence in {s}", .{path}) };
+}
+
+/// Compute the unified diff between `old` and `new`, surface it to
+/// the TUI via the approval gate (if any), and block on the user's
+/// decision. Auto-applies when no gate is configured (one-shot CLI,
+/// `--no-tui`, smoke tests).
+fn maybeRequestApproval(
+    settings: *const Settings,
+    arena: std.mem.Allocator,
+    path: []const u8,
+    old: []const u8,
+    new: []const u8,
+) !approval.Decision {
+    const gate = settings.approval orelse return .apply;
+    if (std.mem.eql(u8, old, new)) return .apply; // no-op write — don't bother prompting
+    // The gate takes ownership of these gpa-allocated copies.
+    const path_dup = try settings.gpa.dupe(u8, path);
+    errdefer settings.gpa.free(path_dup);
+    const diff_text = try diff.unifiedStringLabeled(arena, old, new, path, path, .{});
+    const diff_dup = try settings.gpa.dupe(u8, diff_text);
+    errdefer settings.gpa.free(diff_dup);
+    return gate.requestApproval(path_dup, diff_dup);
 }
 
 // ───────── ls ─────────

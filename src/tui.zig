@@ -15,6 +15,7 @@ const cost = @import("cost.zig");
 const slash = @import("slash.zig");
 const notify = @import("notify.zig");
 const markdown = @import("markdown.zig");
+const approval = @import("approval.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -29,6 +30,10 @@ const Event = union(enum) {
     a_tool_result: AgentToolResult,
     a_usage: provider_mod.Usage,
     a_done: WorkerResult,
+    /// Posted by ApprovalGate.requestApproval — main thread renders
+    /// the diff + prompt, captures the user's decision, calls
+    /// gate.deliver(...). Strings are gpa-owned; main thread frees.
+    a_approval: approval.Request,
 };
 
 const AgentToolCall = struct {
@@ -64,6 +69,14 @@ const Block = struct {
         tool_result,
         tool_result_error,
         notice,
+        /// Unified diff awaiting approval. Rendered in green/red,
+        /// followed by an approval-prompt notice. The block stays
+        /// after approval as a record of what was changed.
+        diff,
+        /// "[a]pply / [s]kip / [A]lways apply" prompt — only visible
+        /// while `awaiting_approval` is true. Removed after the user
+        /// responds.
+        approval_prompt,
     };
 
     /// Tool-block kinds the user can collapse. Other kinds ignore the
@@ -263,6 +276,15 @@ const Tui = struct {
     mcp_count: u8 = 0,
     /// Process env map. Used for notify thresholds + webhook URL.
     env_map: *std.process.Environ.Map,
+    /// Cross-thread approval gate. The TUI plugs its event-posting
+    /// closure into this; the worker calls `requestApproval` from
+    /// inside edit/write_file and blocks until we deliver a decision.
+    approval_gate: *approval.ApprovalGate,
+    /// Block id of the "[a]pply / [s]kip / [A]lways apply" prompt
+    /// that's currently awaiting input. 0 means no prompt active.
+    /// Set when an `a_approval` event arrives; cleared after we
+    /// deliver a decision.
+    awaiting_prompt_id: u32 = 0,
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -393,6 +415,26 @@ const Tui = struct {
         self.has_open_assistant = false;
     }
 
+    /// Replace the pending approval-prompt block with a one-line
+    /// notice recording the user's choice, and clear the awaiting
+    /// flag so subsequent keys go to the input box again.
+    fn consumeApprovalPrompt(self: *Tui, decision: approval.Decision) !void {
+        const prompt_id = self.awaiting_prompt_id;
+        if (prompt_id == 0) return;
+        self.awaiting_prompt_id = 0;
+        const verdict: []const u8 = switch (decision) {
+            .apply => "applied",
+            .skip => "skipped",
+            .always_apply => "applied (and approving the rest of this session)",
+        };
+        for (self.blocks.items) |*b| {
+            if (b.id != prompt_id) continue;
+            b.kind = .notice;
+            b.text = try std.fmt.allocPrint(self.arena, "→ {s}", .{verdict});
+            return;
+        }
+    }
+
     /// Toggle the `collapsed` flag of the block under the nav cursor.
     /// No-op when nothing collapsible is selected. Returns true if a
     /// toggle happened, so the caller can re-render.
@@ -448,7 +490,10 @@ const Tui = struct {
         for (visible, 0..) |line, idx| {
             const row: u16 = @intCast(idx);
             const logical: usize = start + idx;
-            const base_style = styleFor(line.kind);
+            const base_style = if (line.kind == .diff)
+                styleForDiffLine(line.text)
+            else
+                styleFor(line.kind);
             if (self.selection.active and selectionOverlapsLine(self.selection, logical)) {
                 renderRowWithSelection(win, row, line.text, base_style, self.selection, logical);
             } else if (line.kind == .assistant_text) {
@@ -562,7 +607,8 @@ const Tui = struct {
     /// Cancel the in-flight turn (if any). Blocks briefly while the
     /// worker unwinds — Future.cancel sends a cancel signal that the
     /// next Cancelable IO call in the worker raises as
-    /// `error.Canceled`.
+    /// `error.Canceled`. Also wakes any approval-gate waiter so
+    /// `cond.wait` returns Canceled immediately.
     fn cancelTurn(self: *Tui) !void {
         if (self.turn) |*t| {
             _ = t.future.cancel(self.io);
@@ -570,6 +616,7 @@ const Tui = struct {
             self.gpa.destroy(t.shim);
             self.turn = null;
         }
+        self.awaiting_prompt_id = 0;
         self.busy = false;
         try self.flushOpenAssistant();
         // Drain any agent events the worker had already queued before
@@ -722,8 +769,21 @@ fn freeAgentEvent(gpa: std.mem.Allocator, event: Event) void {
             gpa.free(tc.input);
         },
         .a_tool_result => |tr| gpa.free(tr.text),
+        .a_approval => |a| {
+            gpa.free(a.path);
+            gpa.free(a.diff_text);
+        },
         else => {},
     }
+}
+
+/// Approval-gate post hook. Called from the WORKER THREAD when a
+/// write tool needs sign-off. We post an `a_approval` event onto
+/// vaxis's loop and return immediately; the worker then blocks on
+/// the gate's condition variable.
+fn postApprovalEvent(ctx: ?*anyopaque, request: approval.Request) anyerror!void {
+    const tui: *Tui = @ptrCast(@alignCast(ctx.?));
+    try tui.loop.postEvent(.{ .a_approval = request });
 }
 
 fn styleFor(kind: Block.Kind) vaxis.Cell.Style {
@@ -734,6 +794,23 @@ fn styleFor(kind: Block.Kind) vaxis.Cell.Style {
         .tool_result => .{ .fg = .{ .index = 8 } },
         .tool_result_error => .{ .fg = .{ .index = 1 } },
         .notice => .{ .fg = .{ .index = 8 }, .italic = true },
+        // Diff body — per-line colour is applied by `styleForDiffLine`,
+        // not by the block-level base. The fallback dim grey here is
+        // used only for the `--- a/...` / `+++ b/...` headers.
+        .diff => .{ .fg = .{ .index = 8 } },
+        .approval_prompt => .{ .fg = .{ .index = 4 }, .bold = true },
+    };
+}
+
+/// Per-row colour for diff text. Looks at the leading char to colour
+/// adds green, removes red, hunk headers magenta, file headers grey.
+fn styleForDiffLine(text: []const u8) vaxis.Cell.Style {
+    if (text.len == 0) return .{};
+    return switch (text[0]) {
+        '+' => .{ .fg = .{ .index = 2 } }, // green
+        '-' => .{ .fg = .{ .index = 1 } }, // red
+        '@' => .{ .fg = .{ .index = 5 }, .bold = true }, // magenta hunk header
+        else => .{ .fg = .{ .index = 8 } }, // grey context / file headers
     };
 }
 
@@ -1133,6 +1210,7 @@ pub fn run(
     sess: *session_mod.Session,
     model: []const u8,
     mcp_count: u8,
+    approval_gate: *approval.ApprovalGate,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -1174,7 +1252,12 @@ pub fn run(
         .mcp_count = mcp_count,
         .env_map = env_map,
         .lines_arena = &lines_arena,
+        .approval_gate = approval_gate,
     };
+    // Wire the gate's event-poster so worker-side approval requests
+    // surface as `a_approval` events on the main thread.
+    approval_gate.post_fn = postApprovalEvent;
+    approval_gate.post_ctx = &tui;
     defer tui.cancelTurn() catch {}; // ensure worker is awaited if user exits mid-turn
 
     // Hydrate input history from disk so up-arrow recall works across
@@ -1307,6 +1390,36 @@ pub fn run(
                 }
             },
             .key_press => |key| {
+                // Approval prompt has highest precedence — while a
+                // diff is awaiting decision, swallow keystrokes and
+                // route to the gate. Ctrl-C is handled below as a
+                // turn-abort, which also unblocks the worker via
+                // cancelTurn (Future.cancel raises Canceled out of
+                // gate.cond.wait).
+                if (tui.awaiting_prompt_id != 0) {
+                    if (key.matches('c', .{ .ctrl = true })) {
+                        // Falls through to the Ctrl-C handler below
+                        // which cancels the turn.
+                    } else if (key.matches('a', .{}) or key.matches(vaxis.Key.enter, .{})) {
+                        approval_gate.deliver(.apply);
+                        try tui.consumeApprovalPrompt(.apply);
+                        try tui.render();
+                        continue;
+                    } else if (key.matches('s', .{}) or key.matches(vaxis.Key.escape, .{})) {
+                        approval_gate.deliver(.skip);
+                        try tui.consumeApprovalPrompt(.skip);
+                        try tui.render();
+                        continue;
+                    } else if (key.matches('A', .{ .shift = true })) {
+                        approval_gate.deliver(.always_apply);
+                        try tui.consumeApprovalPrompt(.always_apply);
+                        try tui.render();
+                        continue;
+                    } else {
+                        // Ignore other keys while waiting for approval.
+                        continue;
+                    }
+                }
                 // Ctrl-D exits — but only in insert mode. In normal /
                 // visual it's repurposed as a vim-style half-page jump.
                 if (key.matches('d', .{ .ctrl = true }) and tui.mode == .insert) return;
@@ -1655,6 +1768,29 @@ pub fn run(
             .a_usage => |usage| {
                 if (tui.turn == null) continue;
                 try tui.pushUsageNotice(usage);
+                try tui.render();
+            },
+            .a_approval => |req| {
+                // Worker is now blocked in gate.cond.wait; we own the
+                // gpa-allocated path/diff_text and must free them once
+                // we've copied the contents into our tui_arena. If
+                // the turn was canceled out from under us, deliver
+                // skip and free.
+                defer gpa.free(req.path);
+                defer gpa.free(req.diff_text);
+                if (tui.turn == null) {
+                    approval_gate.deliver(.skip);
+                    continue;
+                }
+                const diff_owned = try tui_arena.dupe(u8, req.diff_text);
+                try tui.pushBlock(.diff, diff_owned);
+                const prompt_text = try std.fmt.allocPrint(
+                    tui_arena,
+                    "Apply edit to {s}? [a]pply  [s]kip  [A]lways apply  Esc=skip",
+                    .{req.path},
+                );
+                try tui.pushBlock(.approval_prompt, prompt_text);
+                tui.awaiting_prompt_id = tui.blocks.items[tui.blocks.items.len - 1].id;
                 try tui.render();
             },
             .a_done => |result| {

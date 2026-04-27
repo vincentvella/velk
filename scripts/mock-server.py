@@ -48,7 +48,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ─── routing ────────────────────────────────────────────────
 
-    def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+    def _do_POST_impl(self):  # original handler, dispatched from do_POST
         length = int(self.headers.get("content-length", "0"))
         body = self.rfile.read(length)
         try:
@@ -89,20 +89,43 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404, f"GET not handled: {self.path}")
 
+    def do_POST(self):  # noqa: N802 — keep override above intact via dispatch
+        if self.path == "/_shutdown":
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"shutting down\n")
+            # server.shutdown() must be called from a thread other
+            # than the one currently serving — otherwise it deadlocks.
+            import threading
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        self._do_POST_impl()
+
     # ─── fixture selection ──────────────────────────────────────
 
     def _pick_fixture(self, scenario_dir: Path, payload: dict) -> Optional[Path]:
-        # 1. Explicit header override
+        # 1. Explicit header override. May be a flat file or the name
+        #    of a multi-step *directory* — see step picking below.
         scenario = self.headers.get("x-mock-scenario")
         if scenario:
+            multi = scenario_dir / scenario
+            if multi.is_dir():
+                return self._pick_step(multi, payload)
             candidate = scenario_dir / f"{scenario}.sse"
             if candidate.exists():
                 return candidate
-            self._log(f"  X-Mock-Scenario={scenario} — file missing, falling back")
+            self._log(f"  X-Mock-Scenario={scenario} — not found, falling back")
 
-        # 2. Substring-match against the last user message
+        # 2. Substring-match against the last user message. Match
+        #    directories first (multi-step scenarios), then files.
         prompt = self._last_user_text(payload).lower()
         if prompt:
+            for d in sorted(scenario_dir.iterdir()):
+                if not d.is_dir():
+                    continue
+                if d.name.lower() in prompt:
+                    return self._pick_step(d, payload)
             for f in sorted(scenario_dir.glob("*.sse")):
                 if f.stem == "default":
                     continue
@@ -112,6 +135,21 @@ class Handler(BaseHTTPRequestHandler):
         # 3. default.sse
         default = scenario_dir / "default.sse"
         return default if default.exists() else None
+
+    @staticmethod
+    def _pick_step(dir_: Path, payload: dict) -> Optional[Path]:
+        """Multi-step scenario: serve step N where N == len(messages).
+        Lets a single tool-use round trip through 3 .sse files
+        (user-only=1, after-tool-result=3, etc) without per-process
+        state."""
+        n = len(payload.get("messages") or []) or 1
+        candidate = dir_ / f"{n}.sse"
+        if candidate.exists():
+            return candidate
+        # Fall back to the highest-numbered file we have so the
+        # caller still gets *something* on overflow.
+        steps = sorted(dir_.glob("*.sse"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0)
+        return steps[-1] if steps else None
 
     @staticmethod
     def _last_user_text(payload: dict) -> str:

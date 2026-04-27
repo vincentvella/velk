@@ -7,6 +7,7 @@ const anthropic = @import("anthropic.zig");
 const openai = @import("openai.zig");
 const tool = @import("tool.zig");
 const tools = @import("tools.zig");
+const approval_mod = @import("approval.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -162,8 +163,21 @@ pub fn main(init: std.process.Init) !void {
             defer holder.deinit();
             const provider = holder.provider();
 
+            // Approval gate: shared between the agent worker thread and
+            // the TUI main thread. The TUI plugs `post_fn` into it; the
+            // worker calls `requestApproval` from inside the edit /
+            // write_file tools and blocks until the user decides.
+            // Headless when post_fn is null (one-shot CLI / --no-tui).
+            const approval_gate = try arena.create(approval_mod.ApprovalGate);
+            approval_gate.* = approval_mod.ApprovalGate.init(init.gpa, init.io);
+
             const settings = try arena.create(tools.Settings);
-            settings.* = .{ .io = init.io, .unsafe = opts.unsafe };
+            settings.* = .{
+                .io = init.io,
+                .gpa = init.gpa,
+                .unsafe = opts.unsafe,
+                .approval = approval_gate,
+            };
             const builtin_tools = try tools.buildAll(arena, settings);
 
             // Spawn any MCP servers the user passed via --mcp <cmd>;
@@ -242,7 +256,7 @@ pub fn main(init: std.process.Init) !void {
             }
 
             const mcp_count: u8 = if (mcp_servers) |s| @intCast(@min(255, s.clients.items.len)) else 0;
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count) catch |err| {
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);
