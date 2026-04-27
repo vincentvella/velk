@@ -102,6 +102,8 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildBash(arena, settings));
     try list.append(arena, try buildWebFetch(arena, settings));
     try list.append(arena, try buildWebSearch(arena, settings));
+    try list.append(arena, try buildWorktree(arena, settings));
+    try list.append(arena, try buildWritePlan(arena, settings));
     if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
     if (settings.ask != null) try list.append(arena, try buildAskUserQuestion(arena, settings));
     if (settings.sub_agent != null) try list.append(arena, try buildTask(arena, settings));
@@ -729,6 +731,150 @@ fn killGroup(pid: ?std.posix.pid_t) void {
     if (id <= 0) return;
     // Negative PID means "this process group" in POSIX kill().
     _ = std.c.kill(-id, std.posix.SIG.KILL);
+}
+
+// ───────── worktree ─────────
+
+const worktree_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "action":{"type":"string","enum":["add","list","remove"],"description":"Operation to perform."},
+    \\   "path":{"type":"string","description":"Worktree path (required for add/remove)."},
+    \\   "branch":{"type":"string","description":"Optional branch to check out (add only)."},
+    \\   "force":{"type":"boolean","description":"Pass --force to remove."}
+    \\ },
+    \\ "required":["action"]}
+;
+
+pub fn buildWorktree(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, worktree_schema_json, .{});
+    return .{
+        .name = "worktree",
+        .description = "Manage git worktrees. `action: add` creates one (optionally on a branch); `list` enumerates them; `remove` deletes one. Useful for isolating sub-agent work so parallel changes don't clobber each other.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = worktreeExecute,
+    };
+}
+
+fn worktreeExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    if (settings.mode.refusesWrites()) {
+        return errorOutput(arena, "worktree: refused — velk is in plan mode (read-only)", .{});
+    }
+    const action = (try getString(input, "action")) orelse return errorOutput(arena, "worktree: missing 'action'", .{});
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ "git", "worktree" });
+
+    if (std.mem.eql(u8, action, "list")) {
+        try argv.append(arena, "list");
+    } else if (std.mem.eql(u8, action, "add")) {
+        const path = (try getString(input, "path")) orelse return errorOutput(arena, "worktree: 'path' required for add", .{});
+        try argv.append(arena, "add");
+        try argv.append(arena, path);
+        if (try getString(input, "branch")) |b| {
+            try argv.append(arena, "-b");
+            try argv.append(arena, b);
+        }
+    } else if (std.mem.eql(u8, action, "remove")) {
+        const path = (try getString(input, "path")) orelse return errorOutput(arena, "worktree: 'path' required for remove", .{});
+        try argv.append(arena, "remove");
+        if (input == .object) {
+            if (input.object.get("force")) |v| switch (v) {
+                .bool => |b| if (b) try argv.append(arena, "--force"),
+                else => {},
+            };
+        }
+        try argv.append(arena, path);
+    } else {
+        return errorOutput(arena, "worktree: unknown action: {s}", .{action});
+    }
+
+    const result = std.process.run(settings.gpa, settings.io, .{ .argv = argv.items }) catch |e| {
+        return errorOutput(arena, "worktree: spawn failed: {s}", .{@errorName(e)});
+    };
+    defer settings.gpa.free(result.stdout);
+    defer settings.gpa.free(result.stderr);
+
+    const exit_code: i32 = switch (result.term) {
+        .exited => |c| @intCast(c),
+        else => -1,
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "git worktree {s} (exit {d})\n", .{ action, exit_code });
+    if (result.stdout.len > 0) try out.print(arena, "{s}", .{result.stdout});
+    if (result.stderr.len > 0) {
+        if (result.stdout.len > 0 and !std.mem.endsWith(u8, result.stdout, "\n")) try out.append(arena, '\n');
+        try out.print(arena, "[stderr] {s}", .{result.stderr});
+    }
+    return .{ .text = try arena.dupe(u8, out.items), .is_error = exit_code != 0 };
+}
+
+// ───────── write_plan (plan-mode exemption) ─────────
+
+const write_plan_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "steps":{"type":"array","description":"Ordered list of steps. Each item is one short sentence.",
+    \\     "items":{"type":"string"}},
+    \\   "summary":{"type":"string","description":"Optional one-line summary that goes at the top of PLAN.md."}
+    \\ },
+    \\ "required":["steps"]}
+;
+
+pub fn buildWritePlan(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, write_plan_schema_json, .{});
+    return .{
+        .name = "write_plan",
+        .description = "Write a checklist to PLAN.md. Use this in plan mode to commit to a sequence of steps before any other writes happen — `write_plan` is the *only* write tool exempt from plan-mode refusal. After PLAN.md is written, ask the user to switch to exec mode (the `/exec` slash command).",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = writePlanExecute,
+    };
+}
+
+fn writePlanExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    // No plan-mode refusal here — write_plan is the exemption.
+
+    const arr_v = switch (input) {
+        .object => |o| o.get("steps") orelse return errorOutput(arena, "write_plan: missing 'steps'", .{}),
+        else => return errorOutput(arena, "write_plan: input must be an object", .{}),
+    };
+    const arr = switch (arr_v) {
+        .array => |a| a,
+        else => return errorOutput(arena, "write_plan: 'steps' must be an array", .{}),
+    };
+    if (arr.items.len == 0) return errorOutput(arena, "write_plan: 'steps' must be non-empty", .{});
+
+    const summary: ?[]const u8 = try getString(input, "summary");
+
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(arena, "# Plan\n\n");
+    if (summary) |s| {
+        try buf.print(arena, "{s}\n\n", .{s});
+    }
+    for (arr.items, 0..) |item, idx| {
+        const text = switch (item) {
+            .string => |s| s,
+            else => return errorOutput(arena, "write_plan: steps[{d}] must be a string", .{idx}),
+        };
+        try buf.print(arena, "- [ ] {s}\n", .{text});
+    }
+
+    const path = "PLAN.md";
+    Io.Dir.cwd().writeFile(settings.io, .{ .sub_path = path, .data = buf.items }) catch |e| {
+        return errorOutput(arena, "write_plan: write failed: {s}", .{@errorName(e)});
+    };
+
+    const text = try std.fmt.allocPrint(
+        arena,
+        "wrote {s} ({d} step(s)). The user can review the plan; when ready they will run /exec to switch out of plan mode.",
+        .{ path, arr.items.len },
+    );
+    return .{ .text = text };
 }
 
 // ───────── todo_write ─────────
@@ -1575,4 +1721,127 @@ fn hookTestIo() Io {
         Static.initialised = true;
     }
     return Static.t.io();
+}
+
+// ───────── worktree validation ─────────
+
+test "worktree: missing 'action' is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildWorktree(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "missing 'action'") != null);
+}
+
+test "worktree: unknown action is rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildWorktree(a, &settings);
+    const input = try jsonObj(a, .{ .action = @as([]const u8, "frobnicate") });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "unknown action") != null);
+}
+
+test "worktree: add without 'path' is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildWorktree(a, &settings);
+    const input = try jsonObj(a, .{ .action = @as([]const u8, "add") });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "'path' required") != null);
+}
+
+test "worktree: refused in plan mode" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var settings = testSettings();
+    settings.mode = .plan;
+    const t = try buildWorktree(a, &settings);
+    const input = try jsonObj(a, .{ .action = @as([]const u8, "list") });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "plan mode") != null);
+}
+
+// ───────── write_plan validation ─────────
+
+test "write_plan: missing 'steps' is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildWritePlan(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "missing 'steps'") != null);
+}
+
+test "write_plan: empty steps is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildWritePlan(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"steps\":[]}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "non-empty") != null);
+}
+
+test "write_plan: steps must be strings" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildWritePlan(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"steps\":[\"a\",42]}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "must be a string") != null);
+}
+
+test "write_plan: writes PLAN.md and is exempt from plan mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    // Run under a CWD swap so PLAN.md ends up in the tmp dir.
+    var save_cwd: std.fs.Dir = try std.fs.cwd().openDir(".", .{});
+    defer save_cwd.close();
+    try std.posix.chdir(tmp_abs);
+    defer std.posix.fchdir(save_cwd.fd) catch {};
+
+    var settings = testSettings();
+    settings.mode = .plan; // <- key check: write_plan must run anyway
+    const t = try buildWritePlan(a, &settings);
+
+    const json =
+        \\{"summary":"unit test plan","steps":["draft","review","ship"]}
+    ;
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "wrote PLAN.md") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "3 step") != null);
+
+    const written = try Io.Dir.cwd().readFileAlloc(testing.io, "PLAN.md", a, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, written, "# Plan") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "unit test plan") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "- [ ] draft") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "- [ ] ship") != null);
 }

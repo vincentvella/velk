@@ -22,6 +22,8 @@ const git_commit = @import("git_commit.zig");
 const hooks = @import("hooks.zig");
 const todos = @import("todos.zig");
 const ask = @import("ask.zig");
+const tools_mod = @import("tools.zig");
+const permissions = @import("permissions.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -331,6 +333,10 @@ const Tui = struct {
     /// Number of options for the active question prompt. Used to
     /// validate the digit keystroke.
     ask_options_n: usize = 0,
+    /// Mutable handle to the tools.Settings struct so slash commands
+    /// can mutate the permissions mode at runtime (`/exec` toggle).
+    /// Null in headless smoke harnesses.
+    tools_settings: ?*tools_mod.Settings = null,
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -1710,6 +1716,25 @@ fn slashMultiline(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     return .handled;
 }
 
+/// Switch from `plan` mode to `default` so write tools that were
+/// being refused start running again. Idempotent — outside plan
+/// mode it just reports the current mode.
+fn slashExec(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    const settings = c.tui.tools_settings orelse {
+        try c.tui.pushBlock(.tool_result_error, "/exec: no settings handle (headless build?)");
+        return .handled;
+    };
+    if (settings.mode != .plan) {
+        const m = try std.fmt.allocPrint(c.tui.arena, "/exec: already in {s} mode (only useful from plan mode).", .{@tagName(settings.mode)});
+        try c.tui.pushBlock(.notice, m);
+        return .handled;
+    }
+    settings.mode = .default;
+    try c.tui.pushBlock(.notice, "/exec: switched out of plan mode. Write tools are now permitted.");
+    return .handled;
+}
+
 const slash_commands = [_]slash.Command{
     .{ .name = "help", .description = "list available commands", .handler = slashHelp },
     .{ .name = "clear", .description = "clear scrollback and conversation history", .handler = slashClear },
@@ -1726,6 +1751,7 @@ const slash_commands = [_]slash.Command{
     .{ .name = "compact", .description = "summarize the conversation so far and replace history with the summary", .handler = slashCompact },
     .{ .name = "init", .description = "generate a VELK.md tailored to this repo (uses tools + write_file)", .handler = slashInit },
     .{ .name = "multiline", .description = "toggle multi-line input (Enter inserts newline, Ctrl-D submits)", .handler = slashMultiline },
+    .{ .name = "exec", .description = "switch out of plan mode so write tools run again", .handler = slashExec },
 };
 
 const slash_registry: slash.Registry = .{ .commands = &slash_commands };
@@ -1754,6 +1780,7 @@ pub fn run(
     hook_engine: ?*const hooks.Engine,
     todos_store: ?*todos.Store,
     ask_gate: ?*ask.AskGate,
+    tools_settings: ?*tools_mod.Settings,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -1800,6 +1827,7 @@ pub fn run(
         .hook_engine = hook_engine,
         .todos = todos_store,
         .ask_gate = ask_gate,
+        .tools_settings = tools_settings,
     };
     defer if (todos_store) |s| s.deinit(io);
     if (ask_gate) |g| {

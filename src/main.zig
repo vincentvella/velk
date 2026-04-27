@@ -411,7 +411,7 @@ pub fn main(init: std.process.Init) !void {
 
             const mcp_count: u8 = if (mcp_servers) |s| @intCast(@min(255, s.clients.items.len)) else 0;
             const hook_engine_ptr: ?*const hooks_mod.Engine = if (file_settings.hook_engine.isEmpty()) null else &file_settings.hook_engine;
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate) catch |err| {
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate, settings) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);

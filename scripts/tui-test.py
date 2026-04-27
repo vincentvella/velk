@@ -609,6 +609,21 @@ def run_plan_mode_cases(bin_path: Path, fixtures_dir: Path) -> None:
                 "plan: file was not written",
                 not output_path.exists(),
             )
+
+            # /exec flips us out of plan mode at runtime. After the
+            # toggle, a second diffwrite should reach the approval
+            # gate (we see the diff hunk) instead of being refused.
+            tui.send_line("/exec")
+            case(
+                "plan: /exec confirms mode flip",
+                tui.wait_for("switched out of plan mode", screen=True, timeout=2.0),
+            )
+            tui.send_line("please diffwrite")
+            case(
+                "plan: after /exec the diff is offered for approval",
+                tui.wait_for("@@", screen=True, timeout=5.0),
+            )
+            tui.send("s")  # skip — we don't actually want to write
         finally:
             if tui.alive():
                 tui.close(signum=signal.SIGKILL)
