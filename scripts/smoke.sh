@@ -170,6 +170,16 @@ JSON
             "XDG_CONFIG_HOME=$SETTINGS_TMP" \
             "$VELK" --no-tui --debug --model cli-override "anything"
     rm -rf "$SETTINGS_TMP"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
+    # --mode parsing: bogus values are rejected with a warning but
+    # we still succeed (fall back to default). Hard-refuse cases
+    # belong in the harness — verify CLI surfaces here.
+    SMOKE_EXPECT_STDERR="unknown --mode" run_case \
+        "--mode bogus warns and falls back" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui --mode totally-bogus "anything"
 
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT

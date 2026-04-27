@@ -545,6 +545,41 @@ def run_slash_cases(bin_path: Path) -> None:
         # it never reaps, launchd inherits + reaps eventually.
 
 
+def run_plan_mode_cases(bin_path: Path, fixtures_dir: Path) -> None:
+    """`--mode plan` should refuse writes. Drive the diffwrite
+    scenario; instead of seeing a diff prompt we should get a
+    "refused — velk is in plan mode" tool result back."""
+    print()
+    print(f"tui-test: plan-mode refusal cases (fixtures={fixtures_dir})")
+    with Mock(fixtures_dir) as mock:
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": "sk-fake",
+            "ANTHROPIC_BASE_URL": mock.anthropic_url,
+            "VELK_NOTIFY": "0",
+        }
+        # Make sure no stale output file from a previous run masks
+        # the assertion that plan mode prevented the write.
+        output_path = Path("tests/fixtures/diffwrite-out.txt")
+        if output_path.exists():
+            output_path.unlink()
+        tui = TUI([str(bin_path), "--mode", "plan"], env=env)
+        try:
+            case("plan: repl banner", tui.wait_for("velk REPL"))
+            tui.send_line("please diffwrite")
+            case(
+                "plan: write_file is refused with a clear message",
+                tui.wait_for("refused — velk is in plan mode", screen=True, timeout=5.0),
+            )
+            case(
+                "plan: file was not written",
+                not output_path.exists(),
+            )
+        finally:
+            if tui.alive():
+                tui.close(signum=signal.SIGKILL)
+
+
 def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
     """Drive a real streamed turn against the mock model server. Each
     case spawns its own velk so state doesn't leak between tests."""
@@ -697,6 +732,7 @@ def main() -> int:
 
     run_slash_cases(args.bin)
     run_turn_cases(args.bin, args.fixtures)
+    run_plan_mode_cases(args.bin, args.fixtures)
 
     print()
     print(f"tui-test: {PASS} passed, {FAIL} failed")

@@ -9,6 +9,7 @@ const tool = @import("tool.zig");
 const tools = @import("tools.zig");
 const approval_mod = @import("approval.zig");
 const settings_mod = @import("settings.zig");
+const permissions_mod = @import("permissions.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -182,12 +183,24 @@ pub fn main(init: std.process.Init) !void {
             const approval_gate = try arena.create(approval_mod.ApprovalGate);
             approval_gate.* = approval_mod.ApprovalGate.init(init.gpa, init.io);
 
+            // Resolve permissions mode: CLI flag wins, then
+            // settings.json `permissions.mode`, else default.
+            const mode_str: ?[]const u8 = opts.mode orelse file_settings.mode;
+            const mode: permissions_mod.Mode = if (mode_str) |s| (permissions_mod.Mode.fromString(s) orelse blk: {
+                try errw.print("velk: unknown --mode '{s}', falling back to default\n", .{s});
+                try errw.flush();
+                break :blk .default;
+            }) else .default;
+            // Trust modes auto-apply via the gate's bypass.
+            if (mode.bypassesPrompts()) approval_gate.bypass = true;
+
             const settings = try arena.create(tools.Settings);
             settings.* = .{
                 .io = init.io,
                 .gpa = init.gpa,
                 .unsafe = opts.unsafe,
                 .approval = approval_gate,
+                .mode = mode,
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 

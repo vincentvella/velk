@@ -30,9 +30,11 @@ pub const Settings = struct {
     /// Each entry is a shell command (matches `--mcp`). Loaded
     /// alongside any `--mcp` flags the user passed.
     mcp_servers: []const []const u8 = &.{},
-    /// Reserved for the upcoming permissions engine. Stored as an
-    /// opaque JSON value today so a forward-compatible config still
-    /// parses on this version.
+    /// Permissions mode loaded from `permissions.mode`. `null`
+    /// means "not set; main.zig will fall back to default".
+    mode: ?[]const u8 = null,
+    /// Reserved for future permissions engine fields (allow/deny
+    /// rule lists, bash AST patterns). Stored as opaque JSON.
     permissions: ?std.json.Value = null,
     hooks: ?std.json.Value = null,
     skills: ?std.json.Value = null,
@@ -57,6 +59,7 @@ pub const Settings = struct {
             @memcpy(merged[self.mcp_servers.len..], b.mcp_servers);
             self.mcp_servers = merged;
         }
+        if (b.mode) |m| self.mode = m;
         if (b.permissions) |v| self.permissions = v;
         if (b.hooks) |v| self.hooks = v;
         if (b.skills) |v| self.skills = v;
@@ -124,9 +127,17 @@ const Wire = struct {
     /// JSON file stays human-friendly (`"provider": "anthropic"`).
     defaults: ?WireDefaults = null,
     mcp_servers: ?[][]const u8 = null,
-    permissions: ?std.json.Value = null,
+    permissions: ?WirePermissions = null,
     hooks: ?std.json.Value = null,
     skills: ?std.json.Value = null,
+};
+
+const WirePermissions = struct {
+    mode: ?[]const u8 = null,
+    /// Anything else (rule lists, bash patterns) lives here as an
+    /// opaque blob so a forward-compatible file parses now and we
+    /// can wire the fields up in v2.
+    rest: ?std.json.Value = null,
 };
 
 const WireDefaults = struct {
@@ -153,7 +164,10 @@ fn parse(arena: std.mem.Allocator, data: []const u8) !Settings {
         out.defaults.max_tokens = d.max_tokens;
     }
     if (wire.mcp_servers) |m| out.mcp_servers = m;
-    out.permissions = wire.permissions;
+    if (wire.permissions) |p| {
+        out.mode = p.mode;
+        out.permissions = p.rest;
+    }
     out.hooks = wire.hooks;
     out.skills = wire.skills;
     return out;

@@ -13,6 +13,7 @@ const mvzr = @import("mvzr");
 const tool = @import("tool.zig");
 const diff = @import("diff.zig");
 const approval = @import("approval.zig");
+const permissions = @import("permissions.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
 /// so any tool that touches the filesystem can consult `unsafe` and reuse
@@ -29,6 +30,10 @@ pub const Settings = struct {
     /// skips / always-applies. When null, every change auto-applies
     /// (`--no-tui`, one-shot CLI, smoke tests).
     approval: ?*approval.ApprovalGate = null,
+    /// Permissions mode. `plan` refuses every write tool; the others
+    /// affect whether the gate prompts (handled at startup by setting
+    /// `gate.bypass` for `accept_*` modes).
+    mode: permissions.Mode = .default,
 };
 
 pub const Error = error{
@@ -189,6 +194,9 @@ pub fn buildWriteFile(arena: std.mem.Allocator, settings: *const Settings) !tool
 
 fn writeFileExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
     const settings = settingsFromCtx(ctx);
+    if (settings.mode.refusesWrites()) {
+        return errorOutput(arena, "write_file: refused — velk is in plan mode (read-only)", .{});
+    }
     const raw_path = (try getString(input, "path")) orelse return errorOutput(arena, "write_file: missing 'path'", .{});
     const content = (try getString(input, "content")) orelse return errorOutput(arena, "write_file: missing 'content'", .{});
     const path = validatePath(settings, raw_path) catch |e| return errorOutput(arena, "write_file: {s}", .{@errorName(e)});
@@ -237,6 +245,9 @@ pub fn buildEdit(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool
 
 fn editExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
     const settings = settingsFromCtx(ctx);
+    if (settings.mode.refusesWrites()) {
+        return errorOutput(arena, "edit: refused — velk is in plan mode (read-only)", .{});
+    }
     const raw_path = (try getString(input, "path")) orelse return errorOutput(arena, "edit: missing 'path'", .{});
     const old_str = (try getString(input, "old_string")) orelse return errorOutput(arena, "edit: missing 'old_string'", .{});
     const new_str = (try getString(input, "new_string")) orelse return errorOutput(arena, "edit: missing 'new_string'", .{});
@@ -274,6 +285,10 @@ fn editExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
 /// the TUI via the approval gate (if any), and block on the user's
 /// decision. Auto-applies when no gate is configured (one-shot CLI,
 /// `--no-tui`, smoke tests).
+///
+/// Dangerous-path override: writes to `~/.ssh`, `~/.aws`, or `.env*`
+/// always force a prompt regardless of mode / gate.bypass — those
+/// paths are never silently overwritten.
 fn maybeRequestApproval(
     settings: *const Settings,
     arena: std.mem.Allocator,
@@ -283,12 +298,30 @@ fn maybeRequestApproval(
 ) !approval.Decision {
     const gate = settings.approval orelse return .apply;
     if (std.mem.eql(u8, old, new)) return .apply; // no-op write — don't bother prompting
+
+    const dangerous = permissions.isDangerousPath(path);
+
     // The gate takes ownership of these gpa-allocated copies.
     const path_dup = try settings.gpa.dupe(u8, path);
     errdefer settings.gpa.free(path_dup);
     const diff_text = try diff.unifiedStringLabeled(arena, old, new, path, path, .{});
     const diff_dup = try settings.gpa.dupe(u8, diff_text);
     errdefer settings.gpa.free(diff_dup);
+
+    if (dangerous) {
+        // Bypass the bypass: temporarily clear it, force-prompt,
+        // then restore (so subsequent non-dangerous edits still
+        // honour acceptAll/acceptEdits).
+        const saved = gate.bypass;
+        gate.bypass = false;
+        const decision = try gate.requestApproval(path_dup, diff_dup);
+        gate.bypass = saved;
+        // `always_apply` from a dangerous-path prompt only counts
+        // for *this* path — don't promote the gate-wide bypass.
+        if (decision == .always_apply) return .apply;
+        return decision;
+    }
+
     return gate.requestApproval(path_dup, diff_dup);
 }
 
@@ -458,6 +491,9 @@ pub fn buildBash(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool
 
 fn bashExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
     const settings = settingsFromCtx(ctx);
+    if (settings.mode.refusesWrites()) {
+        return errorOutput(arena, "bash: refused — velk is in plan mode (read-only)", .{});
+    }
     const command = (try getString(input, "command")) orelse return errorOutput(arena, "bash: missing 'command'", .{});
     const timeout_ms: i64 = (try getInt(input, "timeout_ms")) orelse default_bash_timeout_ms;
 

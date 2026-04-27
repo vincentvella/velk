@@ -29,6 +29,9 @@ pub const Options = struct {
     /// Dump request envelopes (model, sys/tool counts, body length) to
     /// stderr per turn. Useful for cache-window and prompt debugging.
     debug: bool = false,
+    /// Permissions mode. `null` here means "use settings.json /
+    /// default"; main.zig resolves the final value.
+    mode: ?[]const u8 = null,
 };
 
 pub const ParseError = struct {
@@ -89,6 +92,11 @@ pub fn parse(args: []const []const u8) Action {
             opts.debug = true;
             continue;
         }
+        if (eql(arg, "--mode")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.mode = v;
+            continue;
+        }
         if (eql(arg, "--no-tui")) {
             opts.no_tui = true;
             continue;
@@ -144,6 +152,8 @@ pub fn printHelp(w: anytype) !void {
         \\      --unsafe          allow tools to access paths outside CWD
         \\      --no-tui          force plain output (no TUI)
         \\      --debug           dump request envelope per turn to stderr
+        \\      --mode <name>     permissions mode: default | acceptEdits |
+        \\                        acceptAll | bypass | plan
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\      --mcp <command>   spawn an MCP server (repeatable);
