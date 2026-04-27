@@ -1346,6 +1346,39 @@ fn slashLoad(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
     return .handled;
 }
 
+fn slashDoctor(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(c.tui.arena, "velk diagnostics\n");
+
+    // Env-key presence (we never print the value).
+    const keys = [_][]const u8{ "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY" };
+    for (keys) |k| {
+        const set = c.env_map.get(k) != null;
+        const marker: []const u8 = if (set) "✓" else "·";
+        try buf.print(c.tui.arena, "  {s} {s}\n", .{ marker, k });
+    }
+
+    // Active model + MCP count.
+    try buf.print(c.tui.arena, "  · model: {s}\n", .{c.tui.model});
+    try buf.print(c.tui.arena, "  · mcp servers attached: {d}\n", .{c.tui.mcp_count});
+
+    // Saved-session count.
+    const sessions = persist.listSessions(c.tui.arena, c.tui.io, c.env_map) catch &[_]persist.SessionMeta{};
+    try buf.print(c.tui.arena, "  · saved sessions: {d}\n", .{sessions.len});
+
+    // Cost-log size.
+    if (cost_log.logPath(c.tui.arena, c.env_map)) |p| {
+        const entries = cost_log.readAll(c.tui.arena, c.tui.io, p) catch &[_]cost_log.Entry{};
+        try buf.print(c.tui.arena, "  · cost-log entries: {d}", .{entries.len});
+    } else |_| {
+        try buf.appendSlice(c.tui.arena, "  · cost-log: HOME unset");
+    }
+
+    try c.tui.pushBlock(.notice, buf.items);
+    return .handled;
+}
+
 fn slashResume(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
     const c = slashCtx(ctx);
     if (args.len == 0) {
@@ -1399,6 +1432,7 @@ const slash_commands = [_]slash.Command{
     .{ .name = "save", .description = "persist the current session to disk", .handler = slashSave },
     .{ .name = "load", .description = "replace the current session with a saved one", .handler = slashLoad },
     .{ .name = "resume", .description = "list saved sessions or resume one by name", .handler = slashResume },
+    .{ .name = "doctor", .description = "show env / session / cost-log diagnostics", .handler = slashDoctor },
     .{ .name = "multiline", .description = "toggle multi-line input (Enter inserts newline, Ctrl-D submits)", .handler = slashMultiline },
 };
 

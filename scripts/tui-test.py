@@ -506,6 +506,21 @@ def run_slash_cases(bin_path: Path) -> None:
             tui.wait_for("Saved sessions") or tui.saw("No saved sessions"),
         )
 
+        tui.send_line("/doctor")
+        case(
+            "/doctor lists env keys",
+            tui.wait_for("ANTHROPIC_API_KEY", timeout=2.0)
+            and tui.saw("OPENAI_API_KEY"),
+        )
+        case(
+            "/doctor reports model + mcp count",
+            tui.saw("model: claude-opus-4-7") and tui.saw("mcp servers attached:"),
+        )
+        case(
+            "/doctor reports cost-log entry count",
+            tui.saw("cost-log entries:"),
+        )
+
         # /multiline test runs LAST in this block — once ON, plain
         # Enter no longer submits, so any subsequent slash command
         # would get stuck in the buffer. We just verify the toggle
