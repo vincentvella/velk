@@ -495,6 +495,25 @@ def run_slash_cases(bin_path: Path) -> None:
         tui.send_line("/clear")
         case("/clear drops scrollback", tui.wait_for("Cleared scrollback"))
 
+        # /multiline test runs LAST in this block — once ON, plain
+        # Enter no longer submits, so any subsequent slash command
+        # would get stuck in the buffer. We just verify the toggle
+        # message + multi-row rendering, then leave the buffer
+        # populated (the TUI is torn down right after).
+        tui.send_line("/multiline")
+        case(
+            "/multiline toggles ON",
+            tui.wait_for("Multi-line mode ON"),
+        )
+        tui.send("first-multiline-line")
+        tui.send("\r")
+        tui.send("second-multiline-line")
+        case(
+            "/multiline: Enter inserts newline (both lines visible)",
+            tui.wait_for("first-multiline-line", screen=True, timeout=2.0)
+            and "second-multiline-line" in tui.screen(),
+        )
+
         # /exit returns from tui.run(), but vaxis's loop reader thread
         # blocks on read(slave_fd) and loop.stop() can't join it without
         # the fd being closed. In real terminal use this is invisible

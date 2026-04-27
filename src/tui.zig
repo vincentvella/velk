@@ -290,6 +290,10 @@ const Tui = struct {
     /// Set when an `a_approval` event arrives; cleared after we
     /// deliver a decision.
     awaiting_prompt_id: u32 = 0,
+    /// Multi-line input mode. While true, Enter appends `\n` to
+    /// the input buffer and Ctrl-D submits (instead of exiting).
+    /// Toggled by the `/multiline` slash command.
+    multiline: bool = false,
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -487,7 +491,17 @@ const Tui = struct {
         // Need at least: 1 row scrollback, status, separator, input.
         if (h < 4) return;
 
-        const scroll_h: u16 = h - 3;
+        // Input rows expand when the buffer holds newlines (multi-line
+        // mode). Cap at h/3 so the scrollback never disappears.
+        var input_rows: u16 = 1;
+        for (self.input.items) |c| {
+            if (c == '\n') input_rows += 1;
+        }
+        const input_cap: u16 = @max(1, @divTrunc(h, 3));
+        if (input_rows > input_cap) input_rows = input_cap;
+
+        const reserved: u16 = 2 + input_rows; // status + separator + input rows
+        const scroll_h: u16 = if (h > reserved) h - reserved else 0;
 
         // Reset (not deinit) so previous render's lines memory is
         // reclaimed AND `all_lines` is repointed to a fresh slab that
@@ -567,7 +581,7 @@ const Tui = struct {
             .wrap = .none,
         });
 
-        const input_row: u16 = h - 1;
+        const input_top: u16 = h - input_rows;
         const prompt: []const u8 = if (self.busy)
             "… "
         else switch (self.mode) {
@@ -582,14 +596,29 @@ const Tui = struct {
             .visual => 5, // magenta
             .visual_line => 5,
         };
-        _ = win.print(&.{
-            .{ .text = prompt, .style = .{ .fg = .{ .index = prompt_color }, .bold = true } },
-            .{ .text = self.input.items },
-        }, .{ .row_offset = input_row, .wrap = .none });
+        const cont_prompt: []const u8 = "  "; // continuation rows: blank gutter
+        const prompt_style: vaxis.Cell.Style = .{ .fg = .{ .index = prompt_color }, .bold = true };
+
+        // Walk newlines in the buffer; render up to `input_rows` of them.
+        var line_iter = std.mem.splitScalar(u8, self.input.items, '\n');
+        var rendered_rows: u16 = 0;
+        var last_line_text: []const u8 = "";
+        while (line_iter.next()) |line_text| {
+            if (rendered_rows >= input_rows) break;
+            const row = input_top + rendered_rows;
+            const head: []const u8 = if (rendered_rows == 0) prompt else cont_prompt;
+            _ = win.print(&.{
+                .{ .text = head, .style = prompt_style },
+                .{ .text = line_text },
+            }, .{ .row_offset = row, .wrap = .none });
+            last_line_text = line_text;
+            rendered_rows += 1;
+        }
 
         if (!self.busy) {
-            const cursor_col: u16 = @intCast(@min(w - 1, prompt.len + self.input.items.len));
-            win.showCursor(cursor_col, input_row);
+            const cursor_row = input_top + (rendered_rows -| 1);
+            const cursor_col: u16 = @intCast(@min(w - 1, prompt.len + last_line_text.len));
+            win.showCursor(cursor_col, cursor_row);
         } else {
             win.hideCursor();
         }
@@ -810,6 +839,73 @@ fn freeAgentEvent(gpa: std.mem.Allocator, event: Event) void {
 fn postApprovalEvent(ctx: ?*anyopaque, request: approval.Request) anyerror!void {
     const tui: *Tui = @ptrCast(@alignCast(ctx.?));
     try tui.loop.postEvent(.{ .a_approval = request });
+}
+
+/// Hand the contents of `tui.input` to the slash dispatcher, or to
+/// the agent worker if it's not a slash command. Shared by the
+/// Enter (single-line) path and the Ctrl-D (multi-line submit)
+/// path. Returns `.exit` when the slash handler asked to leave the
+/// REPL — the caller `return`s in that case.
+fn submitInputBuffer(
+    tui: *Tui,
+    tui_arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    env_map: *std.process.Environ.Map,
+    tty: *vaxis.Tty,
+    history_path: ?[]const u8,
+) !slash.Action {
+    if (tui.input.items.len == 0) return .handled;
+
+    if (slash.parse(tui.input.items)) |parsed| {
+        // Dupe name + args into the tui arena before clearing the
+        // input buffer — `parsed` borrows slices of `tui.input.items`
+        // and the next keystroke would overwrite them otherwise.
+        const name_owned = try tui_arena.dupe(u8, parsed.name);
+        const args_owned = try tui_arena.dupe(u8, parsed.args);
+        tui.input.clearRetainingCapacity();
+
+        var slash_ctx: SlashCtx = .{
+            .tui = tui,
+            .env_map = env_map,
+            .tty_writer = tty.writer(),
+        };
+        if (slash_registry.find(name_owned)) |cmd| {
+            const action = cmd.handler(@ptrCast(&slash_ctx), args_owned) catch |err| blk: {
+                const msg = try std.fmt.allocPrint(tui_arena, "/{s} failed: {s}", .{ name_owned, @errorName(err) });
+                try tui.pushBlock(.tool_result_error, msg);
+                break :blk slash.Action.handled;
+            };
+            try tui.render();
+            return action;
+        }
+        const msg = try std.fmt.allocPrint(tui_arena, "unknown command: /{s} (try /help)", .{name_owned});
+        try tui.pushBlock(.tool_result_error, msg);
+        try tui.render();
+        return .handled;
+    }
+
+    // Two copies of the prompt: one for tui's history (in tui_arena,
+    // lives for the session) and one for the worker (in gpa, lives
+    // until turn cleanup).
+    const prompt_for_history = try tui_arena.dupe(u8, tui.input.items);
+    const prompt_for_worker = try gpa.dupe(u8, tui.input.items);
+    try tui.input_history.append(tui_arena, prompt_for_history);
+    tui.history_idx = null;
+    if (history_path) |path| persist.appendHistory(tui_arena, io, path, prompt_for_history) catch {};
+    try tui.pushBlock(.user_prompt, prompt_for_history);
+    tui.input.clearRetainingCapacity();
+    tui.busy = true;
+    try tui.render();
+
+    tui.startTurn(prompt_for_worker) catch |err| {
+        gpa.free(prompt_for_worker);
+        const msg = try std.fmt.allocPrint(tui_arena, "error spawning agent: {s}", .{@errorName(err)});
+        try tui.pushBlock(.tool_result_error, msg);
+        tui.busy = false;
+        try tui.render();
+    };
+    return .handled;
 }
 
 fn styleFor(kind: Block.Kind) vaxis.Cell.Style {
@@ -1212,6 +1308,17 @@ fn slashLoad(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
     return .handled;
 }
 
+fn slashMultiline(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    c.tui.multiline = !c.tui.multiline;
+    const msg: []const u8 = if (c.tui.multiline)
+        "Multi-line mode ON — Enter inserts a newline, Ctrl-D submits."
+    else
+        "Multi-line mode OFF — Enter submits.";
+    try c.tui.pushBlock(.notice, msg);
+    return .handled;
+}
+
 const slash_commands = [_]slash.Command{
     .{ .name = "help", .description = "list available commands", .handler = slashHelp },
     .{ .name = "clear", .description = "clear scrollback and conversation history", .handler = slashClear },
@@ -1223,6 +1330,7 @@ const slash_commands = [_]slash.Command{
     .{ .name = "system", .description = "show or set the system prompt (use 'clear' to drop it)", .handler = slashSystem },
     .{ .name = "save", .description = "persist the current session to disk", .handler = slashSave },
     .{ .name = "load", .description = "replace the current session with a saved one", .handler = slashLoad },
+    .{ .name = "multiline", .description = "toggle multi-line input (Enter inserts newline, Ctrl-D submits)", .handler = slashMultiline },
 };
 
 const slash_registry: slash.Registry = .{ .commands = &slash_commands };
@@ -1456,9 +1564,24 @@ pub fn run(
                         continue;
                     }
                 }
-                // Ctrl-D exits — but only in insert mode. In normal /
-                // visual it's repurposed as a vim-style half-page jump.
-                if (key.matches('d', .{ .ctrl = true }) and tui.mode == .insert) return;
+                // Ctrl-D in insert mode: submits the buffered input
+                // when in multi-line mode; otherwise exits the REPL.
+                // In normal/visual it's repurposed as a vim-style
+                // half-page jump (handled further down).
+                if (key.matches('d', .{ .ctrl = true }) and tui.mode == .insert) {
+                    if (!tui.multiline) return;
+                    if (tui.input.items.len == 0) continue;
+                    if ((try submitInputBuffer(
+                        &tui,
+                        tui_arena,
+                        gpa,
+                        io,
+                        env_map,
+                        &tty,
+                        history_path,
+                    )) == .exit) return;
+                    continue;
+                }
                 if (key.matches('c', .{ .ctrl = true })) {
                     // Order of precedence: abort in-flight turn → clear
                     // selection → clear input → exit on empty.
@@ -1700,65 +1823,22 @@ pub fn run(
                     continue;
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
-                    if (tui.input.items.len == 0) continue;
-
-                    // Slash commands intercept BEFORE we hand the line
-                    // to the model. Suppress agent dispatch + history
-                    // append on success so /help, /clear etc. don't
-                    // pollute the prompt-recall buffer with non-prompts.
-                    if (slash.parse(tui.input.items)) |parsed| {
-                        // Dupe name + args into the tui arena before
-                        // clearing the input buffer — `parsed` borrows
-                        // slices of `tui.input.items`, so clearing first
-                        // would let the next keystroke overwrite them
-                        // and the handler would see garbage. (Caught by
-                        // scripts/tui-test.py — corruption appeared as
-                        // `Model set to ����`.)
-                        const name_owned = try tui_arena.dupe(u8, parsed.name);
-                        const args_owned = try tui_arena.dupe(u8, parsed.args);
-                        tui.input.clearRetainingCapacity();
-
-                        var slash_ctx: SlashCtx = .{
-                            .tui = &tui,
-                            .env_map = env_map,
-                            .tty_writer = tty.writer(),
-                        };
-                        if (slash_registry.find(name_owned)) |cmd| {
-                            const action = cmd.handler(@ptrCast(&slash_ctx), args_owned) catch |err| blk: {
-                                const msg = try std.fmt.allocPrint(tui_arena, "/{s} failed: {s}", .{ name_owned, @errorName(err) });
-                                try tui.pushBlock(.tool_result_error, msg);
-                                break :blk slash.Action.handled;
-                            };
-                            try tui.render();
-                            if (action == .exit) return;
-                        } else {
-                            const msg = try std.fmt.allocPrint(tui_arena, "unknown command: /{s} (try /help)", .{name_owned});
-                            try tui.pushBlock(.tool_result_error, msg);
-                            try tui.render();
-                        }
+                    // Multi-line mode: Enter inserts a literal \n
+                    // and stays put; submit happens on Ctrl-D.
+                    if (tui.multiline and tui.mode == .insert) {
+                        try tui.input.append(tui_arena, '\n');
+                        try tui.render();
                         continue;
                     }
-
-                    // Two copies of the prompt: one for tui's history (in
-                    // tui_arena, lives for the session) and one for the
-                    // worker (in gpa, lives until turn cleanup).
-                    const prompt_for_history = try tui_arena.dupe(u8, tui.input.items);
-                    const prompt_for_worker = try gpa.dupe(u8, tui.input.items);
-                    try tui.input_history.append(tui_arena, prompt_for_history);
-                    tui.history_idx = null;
-                    if (history_path) |path| persist.appendHistory(tui_arena, io, path, prompt_for_history) catch {};
-                    try tui.pushBlock(.user_prompt, prompt_for_history);
-                    tui.input.clearRetainingCapacity();
-                    tui.busy = true;
-                    try tui.render();
-
-                    tui.startTurn(prompt_for_worker) catch |err| {
-                        gpa.free(prompt_for_worker);
-                        const msg = try std.fmt.allocPrint(tui_arena, "error spawning agent: {s}", .{@errorName(err)});
-                        try tui.pushBlock(.tool_result_error, msg);
-                        tui.busy = false;
-                        try tui.render();
-                    };
+                    if ((try submitInputBuffer(
+                        &tui,
+                        tui_arena,
+                        gpa,
+                        io,
+                        env_map,
+                        &tty,
+                        history_path,
+                    )) == .exit) return;
                     continue;
                 }
                 if (key.matches(vaxis.Key.backspace, .{})) {
