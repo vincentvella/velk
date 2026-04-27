@@ -206,6 +206,15 @@ JSON
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --repo-map "anything"
 
+    # @symbol: when no literal file matches, fall through to a
+    # repo-grep for top-level decls. `maybeRequestApproval` lives
+    # in src/tools.zig — the body should land in the request.
+    SMOKE_EXPECT_STDERR="body=" run_case \
+        "@symbol falls through to a repo-grep when not a path" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui --debug "explain @maybeRequestApproval"
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else

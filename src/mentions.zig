@@ -1,10 +1,17 @@
-//! `@file` mention expansion. Scans a user prompt for tokens of
-//! the form `@path` or `@path:start-end` and prepends an
-//! `<attachments>` block containing each named file's contents.
+//! `@file` and `@symbol` mention expansion. Scans a user prompt
+//! for tokens of the form:
+//!
+//!   @path                 — attach whole file
+//!   @path:N               — attach line N
+//!   @path:N-M             — attach lines N..M
+//!   @symbol               — attach files whose top-level decl
+//!                           matches `(pub )?(fn|const|var|extern fn) <symbol>`
 //!
 //! The original mention text stays in the prompt — the LLM sees
 //! both the file content (in the attachments block) and the user's
-//! reference to it.
+//! reference to it. Path-or-symbol routing: a token that contains
+//! `/` or fails to read as a literal file but matches an identifier
+//! pattern falls through to symbol search.
 //!
 //! Path safety: lexical validation against CWD. We reject paths
 //! that escape via `..` so a malicious `@../../etc/passwd` doesn't
@@ -12,6 +19,8 @@
 
 const std = @import("std");
 const Io = std.Io;
+const ignore = @import("ignore.zig");
+const mvzr = @import("mvzr");
 
 pub const max_mention_bytes: usize = 64 * 1024;
 
@@ -141,6 +150,66 @@ pub fn readMention(
     return data[slice_start..@min(slice_end, data.len)];
 }
 
+/// True when `s` looks like an identifier (no path separators, all
+/// alphanumeric / underscore, leading char is alpha or `_`).
+/// Symbol-mention candidates have to pass this gate so we don't
+/// kick off a full-repo grep for `@2024` or `@some.thing`.
+pub fn looksLikeSymbol(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, s, '/') != null) return false;
+    if (!(std.ascii.isAlphabetic(s[0]) or s[0] == '_')) return false;
+    for (s) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    }
+    return true;
+}
+
+/// Maximum files attached for a single `@symbol` mention.
+pub const max_symbol_hits: usize = 3;
+
+/// Walk the repo from CWD, looking for files containing a top-level
+/// declaration of `name`. Returns up to `max_symbol_hits` paths,
+/// honoring the common-ignore set. Pure path scan — caller calls
+/// `readMention` with each result.
+pub fn searchSymbol(
+    arena: std.mem.Allocator,
+    io: Io,
+    name: []const u8,
+) ![]const []const u8 {
+    var hits: std.ArrayList([]const u8) = .empty;
+
+    const pattern_str = try std.fmt.allocPrint(
+        arena,
+        "(pub )?(fn|const|var|extern fn) {s}",
+        .{name},
+    );
+    var regex = mvzr.compile(pattern_str) orelse return &.{};
+
+    var dir = Io.Dir.cwd().openDir(io, ".", .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (hits.items.len >= max_symbol_hits) break;
+        if (entry.kind != .file) continue;
+        if (ignore.isIgnored(entry.path)) continue;
+        const data = Io.Dir.cwd().readFileAlloc(io, entry.path, arena, .limited(max_mention_bytes)) catch continue;
+        // Scan line-by-line so we anchor the regex correctly (mvzr
+        // doesn't gate `^` and we want top-level decls only).
+        var line_iter = std.mem.splitScalar(u8, data, '\n');
+        while (line_iter.next()) |line| {
+            // Top-level: the line must NOT start with whitespace.
+            if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) continue;
+            if (regex.isMatch(line)) {
+                try hits.append(arena, try arena.dupe(u8, entry.path));
+                break;
+            }
+        }
+    }
+    return hits.items;
+}
+
 /// Expand all mentions found in `prompt` into a single string with
 /// an `<attachments>` block prepended. Returns the original prompt
 /// unchanged when no mentions are present (so this is cheap to
@@ -169,9 +238,24 @@ pub fn expand(
             try attach.appendSlice(arena, body);
             if (body.len > 0 and body[body.len - 1] != '\n') try attach.append(arena, '\n');
             try attach.appendSlice(arena, "</file>\n");
-        } else {
-            try attach.print(arena, "<file path=\"{s}\" error=\"unreadable\"/>\n", .{m.path});
+            continue;
         }
+        // Not a literal file — fall through to symbol search if the
+        // token looks like an identifier.
+        if (looksLikeSymbol(m.path)) {
+            const hits = searchSymbol(arena, io, m.path) catch &[_][]const u8{};
+            if (hits.len > 0) {
+                for (hits) |hit_path| {
+                    const data = Io.Dir.cwd().readFileAlloc(io, hit_path, arena, .limited(max_mention_bytes)) catch continue;
+                    try attach.print(arena, "<file path=\"{s}\" matched-symbol=\"{s}\">\n", .{ hit_path, m.path });
+                    try attach.appendSlice(arena, data);
+                    if (data.len > 0 and data[data.len - 1] != '\n') try attach.append(arena, '\n');
+                    try attach.appendSlice(arena, "</file>\n");
+                }
+                continue;
+            }
+        }
+        try attach.print(arena, "<file path=\"{s}\" error=\"unreadable\"/>\n", .{m.path});
     }
     try attach.appendSlice(arena, "</attachments>\n\n");
     try attach.appendSlice(arena, prompt);
@@ -263,4 +347,21 @@ test "expand: no mentions returns prompt unchanged" {
     defer arena.deinit();
     const out = try expand(arena.allocator(), undefined, "just a regular prompt", false);
     try testing.expectEqualStrings("just a regular prompt", out);
+}
+
+test "looksLikeSymbol: identifier-shaped tokens pass" {
+    try testing.expect(looksLikeSymbol("maybeRequestApproval"));
+    try testing.expect(looksLikeSymbol("Settings"));
+    try testing.expect(looksLikeSymbol("_underscore"));
+    try testing.expect(looksLikeSymbol("snake_case_name"));
+    try testing.expect(looksLikeSymbol("name42"));
+}
+
+test "looksLikeSymbol: non-identifier tokens reject" {
+    try testing.expect(!looksLikeSymbol(""));
+    try testing.expect(!looksLikeSymbol("src/main.zig")); // path
+    try testing.expect(!looksLikeSymbol("foo.bar")); // dotted (file ext)
+    try testing.expect(!looksLikeSymbol("42name")); // leading digit
+    try testing.expect(!looksLikeSymbol("name-with-dashes"));
+    try testing.expect(!looksLikeSymbol("hello world"));
 }
