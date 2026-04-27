@@ -107,6 +107,7 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
     if (settings.ask != null) try list.append(arena, try buildAskUserQuestion(arena, settings));
     if (settings.sub_agent != null) try list.append(arena, try buildTask(arena, settings));
+    if (settings.sub_agent != null) try list.append(arena, try buildTeam(arena, settings));
     return list.items;
 }
 
@@ -1093,6 +1094,205 @@ const ChildCapture = struct {
     }
 };
 
+// ───────── team (parallel coordinator) ─────────
+
+const team_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "tasks":{"type":"array","description":"Independent sub-tasks to run in parallel. Each item has a `prompt` and optional `tools` allowlist.",
+    \\     "items":{"type":"object",
+    \\       "properties":{
+    \\         "prompt":{"type":"string"},
+    \\         "label":{"type":"string","description":"Optional human label to identify the task in the result. Defaults to 'task-N'."},
+    \\         "tools":{"type":"array","items":{"type":"string"}}
+    \\       },
+    \\       "required":["prompt"]}}
+    \\ },
+    \\ "required":["tasks"]}
+;
+
+pub fn buildTeam(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, team_schema_json, .{});
+    return .{
+        .name = "team",
+        .description = "Fan out work to multiple sub-agents in parallel. Pass `tasks` as an array of `{prompt, label?, tools?}`; each runs as an isolated child agent (same provider/model) and the results are aggregated under their labels. Children share the parent registry minus `task` and `team` (no nesting in v1). Use this when N sub-tasks are independent and you want them to overlap rather than running serially via repeated `task` calls.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = teamExecute,
+    };
+}
+
+const TeamChild = struct {
+    label: []const u8,
+    prompt: []const u8,
+    /// Per-child arena. Allocated on the parent gpa (NOT the parent
+    /// turn arena) so concurrent allocations from different threads
+    /// don't race the shared parent allocator. Owned by `teamExecute`
+    /// — deinited at the end of the call.
+    arena: *std.heap.ArenaAllocator,
+    capture: ChildCapture,
+    err: ?anyerror = null,
+};
+
+fn teamExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const sub = settings.sub_agent orelse return errorOutput(arena, "team: no sub-agent runtime configured", .{});
+
+    const arr_v = switch (input) {
+        .object => |o| o.get("tasks") orelse return errorOutput(arena, "team: missing 'tasks'", .{}),
+        else => return errorOutput(arena, "team: input must be an object", .{}),
+    };
+    const arr = switch (arr_v) {
+        .array => |a| a,
+        else => return errorOutput(arena, "team: 'tasks' must be an array", .{}),
+    };
+    if (arr.items.len == 0) return errorOutput(arena, "team: 'tasks' must be non-empty", .{});
+    if (arr.items.len > 8) return errorOutput(arena, "team: at most 8 parallel tasks supported", .{});
+
+    // Build per-task state up front so we have stable pointers for
+    // the futures to write into. Each child owns a private arena
+    // (gpa-backed) so concurrent allocations don't race a shared
+    // parent allocator.
+    var children = try arena.alloc(TeamChild, arr.items.len);
+    var per_task_tools = try arena.alloc([]const tool.Tool, arr.items.len);
+    defer for (children) |c| {
+        c.arena.deinit();
+        settings.gpa.destroy(c.arena);
+    };
+    for (arr.items, 0..) |item, idx| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => return errorOutput(arena, "team: tasks[{d}] must be an object", .{idx}),
+        };
+        const prompt_v = obj.get("prompt") orelse return errorOutput(arena, "team: tasks[{d}].prompt missing", .{idx});
+        const prompt = switch (prompt_v) {
+            .string => |s| s,
+            else => return errorOutput(arena, "team: tasks[{d}].prompt must be a string", .{idx}),
+        };
+        const label: []const u8 = blk: {
+            const v = obj.get("label") orelse break :blk try std.fmt.allocPrint(arena, "task-{d}", .{idx + 1});
+            break :blk switch (v) {
+                .string => |s| s,
+                else => return errorOutput(arena, "team: tasks[{d}].label must be a string", .{idx}),
+            };
+        };
+
+        // Per-task tools allowlist filter — same rules as `task`,
+        // plus we exclude `team` itself to prevent recursion.
+        var allow: ?[]const []const u8 = null;
+        if (obj.get("tools")) |tv| switch (tv) {
+            .array => |a| {
+                var names = try arena.alloc([]const u8, a.items.len);
+                for (a.items, 0..) |item2, j| {
+                    names[j] = switch (item2) {
+                        .string => |s| s,
+                        else => return errorOutput(arena, "team: tasks[{d}].tools[{d}] must be a string", .{ idx, j }),
+                    };
+                }
+                allow = names;
+            },
+            else => return errorOutput(arena, "team: tasks[{d}].tools must be an array", .{idx}),
+        };
+
+        var tlist: std.ArrayList(tool.Tool) = .empty;
+        for (sub.tools) |t| {
+            if (std.mem.eql(u8, t.name, "task")) continue;
+            if (std.mem.eql(u8, t.name, "team")) continue;
+            if (allow) |names| {
+                var matched = false;
+                for (names) |n| if (std.mem.eql(u8, t.name, n)) {
+                    matched = true;
+                    break;
+                };
+                if (!matched) continue;
+            }
+            try tlist.append(arena, t);
+        }
+        per_task_tools[idx] = tlist.items;
+
+        const child_arena = try settings.gpa.create(std.heap.ArenaAllocator);
+        child_arena.* = .init(settings.gpa);
+        children[idx] = .{
+            .label = label,
+            .prompt = prompt,
+            .arena = child_arena,
+            .capture = .{ .arena = child_arena.allocator() },
+        };
+    }
+
+    // Spawn each child concurrently and collect futures. We unwind
+    // properly even on partial-spawn failure.
+    var futures: std.ArrayList(Io.Future(anyerror!void)) = .empty;
+    defer for (futures.items) |*f| {
+        _ = f.await(settings.io) catch {};
+    };
+    for (children, per_task_tools) |*child, child_tools| {
+        const f = try Io.concurrent(settings.io, runTeamChild, .{ sub, child, child_tools, settings.gpa });
+        try futures.append(arena, f);
+    }
+    // Now drain — the defer above also awaits, but we want to
+    // capture per-child errors on the happy path here.
+    for (futures.items, 0..) |*f, i| {
+        const r = f.await(settings.io);
+        if (r) |_| {} else |e| {
+            children[i].err = e;
+        }
+    }
+    futures.clearRetainingCapacity();
+
+    // Aggregate results into a labelled markdown report.
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "team complete ({d} task(s)):\n\n", .{children.len});
+    for (children) |c| {
+        try out.print(arena, "## {s}\n", .{c.label});
+        if (c.err) |e| {
+            try out.print(arena, "_failed: {s}_\n\n", .{@errorName(e)});
+            continue;
+        }
+        try out.print(
+            arena,
+            "_({d} tool call(s) across {d} iteration(s))_\n\n",
+            .{ c.capture.tool_calls, c.capture.iterations },
+        );
+        if (c.capture.final_text.items.len > 0) {
+            try out.appendSlice(arena, c.capture.final_text.items);
+        } else {
+            try out.appendSlice(arena, "_(no final text produced)_");
+        }
+        try out.appendSlice(arena, "\n\n");
+    }
+    return .{ .text = out.items };
+}
+
+fn runTeamChild(
+    sub: *const SubAgent,
+    child: *TeamChild,
+    child_tools: []const tool.Tool,
+    gpa: std.mem.Allocator,
+) anyerror!void {
+    const sink: agent_mod.Sink = .{
+        .ctx = &child.capture,
+        .onText = ChildCapture.onText,
+        .onToolCall = ChildCapture.onToolCall,
+        .onToolResult = ChildCapture.onToolResult,
+        .onTurnEnd = ChildCapture.onTurnEnd,
+    };
+    // Use the child's private arena so agent.run's per-turn
+    // allocations (messages, tool defs, deltas) don't race other
+    // children allocating off a shared parent allocator.
+    _ = try agent_mod.run(child.arena.allocator(), sub.provider, sink, .{
+        .model = sub.model,
+        .max_tokens = sub.max_tokens,
+        .system = sub.system,
+        .prompt = child.prompt,
+        .tools = child_tools,
+        .max_iterations = sub.max_iterations,
+        .hook_engine = sub.hook_engine,
+        .hook_gpa = gpa,
+        .hook_io = sub.hook_io,
+    });
+}
+
 // ───────── ask_user_question ─────────
 
 const ask_user_question_schema_json: []const u8 =
@@ -1646,6 +1846,146 @@ test "task: 'tools' must be an array" {
     const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
     try testing.expect(out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.text, "must be an array") != null);
+}
+
+test "team: refuses without runtime" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildTeam(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"tasks\":[{\"prompt\":\"x\"}]}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "no sub-agent runtime") != null);
+}
+
+test "team: missing 'tasks' is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = stubStream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTeam(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "missing 'tasks'") != null);
+}
+
+test "team: empty tasks array is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = stubStream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTeam(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"tasks\":[]}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "non-empty") != null);
+}
+
+test "team: more than 8 tasks rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = stubStream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTeam(a, &settings);
+    var json: std.ArrayList(u8) = .empty;
+    try json.appendSlice(a, "{\"tasks\":[");
+    for (0..9) |i| {
+        if (i > 0) try json.append(a, ',');
+        try json.print(a, "{{\"prompt\":\"p{d}\"}}", .{i});
+    }
+    try json.appendSlice(a, "]}");
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json.items, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "at most 8") != null);
+}
+
+test "team: aggregates each child's final text under its label" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Per-prompt scripted-text provider. `onText` emits a tagged
+    // string echoing the prompt; the aggregator should land both
+    // children's text under their labels.
+    const Echo = struct {
+        fn stream(_: ?*anyopaque, req: provider_mod.Request, s: provider_mod.Stream) anyerror!void {
+            // Find the user message text and echo it back.
+            for (req.messages) |m| {
+                for (m.content) |c| switch (c) {
+                    .text => |t| {
+                        const out = std.fmt.allocPrint(std.heap.page_allocator, "echo:{s}", .{t}) catch return;
+                        defer std.heap.page_allocator.free(out);
+                        try s.onText(s.ctx, out);
+                    },
+                    else => {},
+                };
+            }
+            try s.onStop(s.ctx, "end_turn");
+        }
+    };
+
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = Echo.stream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTeam(a, &settings);
+    const json =
+        \\{"tasks":[
+        \\  {"label":"alpha","prompt":"first-prompt"},
+        \\  {"label":"beta","prompt":"second-prompt"}
+        \\]}
+    ;
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "## alpha") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "echo:first-prompt") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "## beta") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "echo:second-prompt") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "team complete (2 task(s))") != null);
+}
+
+test "team: each task missing prompt is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = stubStream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTeam(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"tasks\":[{\"label\":\"x\"}]}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "prompt missing") != null);
 }
 
 test "task: child registry filters out `task` and respects allowlist" {

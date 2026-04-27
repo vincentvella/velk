@@ -756,6 +756,34 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
             if output_path.exists():
                 output_path.unlink()
 
+            # ── team (parallel coordinator) ─────────────────────
+            # `coordinate/` fixture: parent emits a `team` tool_use
+            # with two children — `writer` (haiku.sse) and
+            # `summarizer` (summarize.sse). Each child runs to
+            # end_turn; the team tool aggregates the results into
+            # one labelled markdown report. Parent step 2 wraps up.
+            tui.send_line("please coordinate")
+            case(
+                "team: parent fans out to children",
+                tui.wait_for("fanning-out", screen=True, timeout=5.0),
+            )
+            # Aggregated result block lands as a collapsed tool
+            # result. The "[N lines, Tab to expand]" summary is
+            # itself proof that the children produced output —
+            # an empty / failed fan-out would render `(no final
+            # text produced)` and the line count would be much
+            # smaller. Inner content verification is covered by
+            # the unit tests; we don't navigate vim mode to
+            # expand a collapsed block from a pty script.
+            case(
+                "team: aggregated tool result lands",
+                tui.wait_for("team complete (2 task(s))", screen=True, timeout=8.0),
+            )
+            case(
+                "team: parent wraps up after fan-out",
+                tui.wait_for("team-aggregated", screen=True, timeout=8.0),
+            )
+
             # ── task (sub-agent) ────────────────────────────────
             # `spawnchild/` fixture: step 1 emits a tool_use for
             # `task` whose prompt routes the child to the haiku
