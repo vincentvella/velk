@@ -14,6 +14,7 @@ const tool = @import("tool.zig");
 const diff = @import("diff.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
+const ignore = @import("ignore.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
 /// so any tool that touches the filesystem can consult `unsafe` and reuse
@@ -34,6 +35,9 @@ pub const Settings = struct {
     /// affect whether the gate prompts (handled at startup by setting
     /// `gate.bypass` for `accept_*` modes).
     mode: permissions.Mode = .default,
+    /// When true, `ls` and `grep` descend into / list paths that
+    /// match the common-ignore set (node_modules, .git, etc).
+    include_ignored: bool = false,
 };
 
 pub const Error = error{
@@ -358,7 +362,12 @@ fn lsExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) 
     var out: std.ArrayList(u8) = .empty;
     var iter = dir.iterate();
     var count: usize = 0;
+    var skipped: usize = 0;
     while (try iter.next(settings.io)) |entry| {
+        if (!settings.include_ignored and ignore.isIgnored(entry.name)) {
+            skipped += 1;
+            continue;
+        }
         if (count >= 200) {
             try out.appendSlice(arena, "… (truncated at 200 entries)\n");
             break;
@@ -376,6 +385,9 @@ fn lsExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) 
             else => try out.print(arena, "{s} ({s})\n", .{ entry.name, @tagName(entry.kind) }),
         }
         count += 1;
+    }
+    if (skipped > 0) {
+        try out.print(arena, "(skipped {d} ignored entries — pass --include-ignored to see them)\n", .{skipped});
     }
     return .{ .text = out.items };
 }
@@ -430,6 +442,7 @@ fn grepExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
             defer walker.deinit();
             while (try walker.next(settings.io)) |entry| {
                 if (entry.kind != .file) continue;
+                if (!settings.include_ignored and ignore.isIgnored(entry.path)) continue;
                 const full = try std.fs.path.join(arena, &.{ path, entry.path });
                 grepOneFile(settings, arena, &out, full, &regex, max_results, &hits) catch continue;
                 if (hits >= max_results) break;

@@ -32,6 +32,10 @@ pub const Options = struct {
     /// Permissions mode. `null` here means "use settings.json /
     /// default"; main.zig resolves the final value.
     mode: ?[]const u8 = null,
+    /// Skip the common-ignore list (node_modules, .git, .zig-cache,
+    /// etc.) when listing / grepping. Off by default — explicitly
+    /// asking the model to scan a build output is the rare case.
+    include_ignored: bool = false,
 };
 
 pub const ParseError = struct {
@@ -97,6 +101,10 @@ pub fn parse(args: []const []const u8) Action {
             opts.mode = v;
             continue;
         }
+        if (eql(arg, "--include-ignored")) {
+            opts.include_ignored = true;
+            continue;
+        }
         if (eql(arg, "--no-tui")) {
             opts.no_tui = true;
             continue;
@@ -154,6 +162,8 @@ pub fn printHelp(w: anytype) !void {
         \\      --debug           dump request envelope per turn to stderr
         \\      --mode <name>     permissions mode: default | acceptEdits |
         \\                        acceptAll | bypass | plan
+        \\      --include-ignored ls/grep also descend into ignored dirs
+        \\                        (node_modules, .git, .zig-cache, ...)
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\      --mcp <command>   spawn an MCP server (repeatable);

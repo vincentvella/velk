@@ -202,6 +202,7 @@ pub fn main(init: std.process.Init) !void {
                 .unsafe = opts.unsafe,
                 .approval = approval_gate,
                 .mode = mode,
+                .include_ignored = opts.include_ignored,
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 
