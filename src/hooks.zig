@@ -288,31 +288,53 @@ fn runCommand(
         child.stdin = null;
     }
 
+    // Drain stdout + stderr concurrently with a wall-clock timeout
+    // honoring `h.timeout_ms`. Without this, a hook that hangs (e.g.
+    // `read` from a closed pipe, or an infinite loop) blocks the
+    // agent forever. Using MultiReader.fill mirrors what runBash
+    // does for the same hang-the-tool footgun.
+    const timeout: Io.Timeout = if (h.timeout_ms == 0) .none else .{
+        .duration = .{
+            .raw = Io.Duration.fromMilliseconds(h.timeout_ms),
+            .clock = .awake,
+        },
+    };
+
+    var multi_buf: Io.File.MultiReader.Buffer(2) = undefined;
+    var multi: Io.File.MultiReader = undefined;
+    multi.init(gpa, io, multi_buf.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi.deinit();
+    const so_reader = multi.reader(0);
+    const se_reader = multi.reader(1);
+
+    var timed_out = false;
+    while (multi.fill(64, timeout)) |_| {
+        if (so_reader.buffered().len > 256 * 1024) break; // cap pathological output
+        if (se_reader.buffered().len > 256 * 1024) break;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        error.Timeout => timed_out = true,
+        else => return err,
+    }
+
+    if (timed_out) {
+        child.kill(io);
+        _ = child.wait(io) catch {};
+        const note = try std.fmt.allocPrint(gpa, "hook timed out after {d}ms", .{h.timeout_ms});
+        return .{
+            .exit_code = -1,
+            .stdout = try gpa.dupe(u8, ""),
+            .stderr = note,
+        };
+    }
+
+    multi.checkAnyError() catch {}; // best-effort drain
     var stdout_buf: std.ArrayList(u8) = .empty;
     var stderr_buf: std.ArrayList(u8) = .empty;
     errdefer stdout_buf.deinit(gpa);
     errdefer stderr_buf.deinit(gpa);
-
-    if (child.stdout) |*so| {
-        var buf: [4096]u8 = undefined;
-        var reader = so.reader(io, &buf);
-        while (true) {
-            const data = reader.interface.peekGreedy(1) catch break;
-            if (data.len == 0) break;
-            try stdout_buf.appendSlice(gpa, data);
-            reader.interface.toss(data.len);
-        }
-    }
-    if (child.stderr) |*se| {
-        var buf: [4096]u8 = undefined;
-        var reader = se.reader(io, &buf);
-        while (true) {
-            const data = reader.interface.peekGreedy(1) catch break;
-            if (data.len == 0) break;
-            try stderr_buf.appendSlice(gpa, data);
-            reader.interface.toss(data.len);
-        }
-    }
+    try stdout_buf.appendSlice(gpa, so_reader.buffered());
+    try stderr_buf.appendSlice(gpa, se_reader.buffered());
 
     const term = try child.wait(io);
     const code: i32 = switch (term) {
@@ -538,6 +560,26 @@ test "dispatch: matcher rejects mismatched tool_name and skips the hook" {
     defer if (out.notice) |s| arena.free(s);
     defer if (out.blocked) |s| arena.free(s);
     try testing.expect(out.blocked == null);
+}
+
+test "dispatch: command hung beyond timeout_ms is killed and notice surfaces" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .post_tool_use,
+        .kind = .command,
+        .body = "sleep 10",
+        .timeout_ms = 200, // tight cap so the test finishes quickly
+    }} };
+    const start = std.time.milliTimestamp();
+    const out = try e.dispatch(arena, testIo(), .post_tool_use, .{ .tool_name = "bash" });
+    const elapsed_ms = std.time.milliTimestamp() - start;
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    defer if (out.notice) |s| arena.free(s);
+    // Sanity: we shouldn't have actually waited 10 seconds.
+    try testing.expect(elapsed_ms < 2000);
+    try testing.expect(out.notice != null);
+    try testing.expect(std.mem.indexOf(u8, out.notice.?, "timed out") != null);
 }
 
 test "dispatch: matcher hits and the hook fires" {

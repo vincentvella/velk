@@ -42,8 +42,13 @@ pub const Settings = struct {
     /// `gate.bypass` for `accept_*` modes).
     mode: permissions.Mode = .default,
     /// When true, `ls` and `grep` descend into / list paths that
-    /// match the common-ignore set (node_modules, .git, etc).
+    /// match the common-ignore set (node_modules, .git, etc) AND
+    /// any `.gitignore` parsed at startup.
     include_ignored: bool = false,
+    /// Optional parsed `.gitignore` matcher. When non-empty, ls /
+    /// grep also skip paths matching its rules. The hardcoded
+    /// common-ignore set is always engaged regardless.
+    gitignore_matcher: ignore.Matcher = .empty(),
     /// Process env (for XDG_CACHE_HOME etc). Nullable for tests.
     env_map: ?*std.process.Environ.Map = null,
     /// Optional todo store. When set, the `todo_write` tool is
@@ -413,9 +418,17 @@ fn lsExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) 
     var count: usize = 0;
     var skipped: usize = 0;
     while (try iter.next(settings.io)) |entry| {
-        if (!settings.include_ignored and ignore.isIgnored(entry.name)) {
-            skipped += 1;
-            continue;
+        if (!settings.include_ignored) {
+            if (ignore.isIgnored(entry.name)) {
+                skipped += 1;
+                continue;
+            }
+            if (settings.gitignore_matcher.patterns.len > 0 and
+                settings.gitignore_matcher.isIgnored(entry.name))
+            {
+                skipped += 1;
+                continue;
+            }
         }
         if (count >= 200) {
             try out.appendSlice(arena, "… (truncated at 200 entries)\n");
@@ -491,7 +504,14 @@ fn grepExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
             defer walker.deinit();
             while (try walker.next(settings.io)) |entry| {
                 if (entry.kind != .file) continue;
-                if (!settings.include_ignored and ignore.isIgnored(entry.path)) continue;
+                if (!settings.include_ignored) {
+                    if (ignore.isIgnored(entry.path)) continue;
+                    if (settings.gitignore_matcher.patterns.len > 0 and
+                        settings.gitignore_matcher.isIgnored(entry.path))
+                    {
+                        continue;
+                    }
+                }
                 const full = try std.fs.path.join(arena, &.{ path, entry.path });
                 grepOneFile(settings, arena, &out, full, &regex, max_results, &hits) catch continue;
                 if (hits >= max_results) break;

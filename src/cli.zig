@@ -42,6 +42,10 @@ pub const Options = struct {
     /// Prepend a filtered repo layout to the system prompt at
     /// launch. Cached by `git status --porcelain` hash.
     repo_map: bool = false,
+    /// Per-turn wall-clock cap (ms). 0 = unlimited.
+    max_turn_ms: u64 = 0,
+    /// Per-turn cumulative-token cap (input + output). 0 = unlimited.
+    max_turn_tokens: u64 = 0,
 };
 
 pub const ParseError = struct {
@@ -119,6 +123,18 @@ pub fn parse(args: []const []const u8) Action {
             opts.repo_map = true;
             continue;
         }
+        if (eql(arg, "--max-turn-ms")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.max_turn_ms = std.fmt.parseInt(u64, v, 10) catch
+                return errAction("invalid integer for --max-turn-ms", v);
+            continue;
+        }
+        if (eql(arg, "--max-turn-tokens")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.max_turn_tokens = std.fmt.parseInt(u64, v, 10) catch
+                return errAction("invalid integer for --max-turn-tokens", v);
+            continue;
+        }
         if (eql(arg, "--no-tui")) {
             opts.no_tui = true;
             continue;
@@ -182,6 +198,11 @@ pub fn printHelp(w: anytype) !void {
         \\                        turn end (best-effort, requires git repo)
         \\      --repo-map        prepend a filtered repo layout to the
         \\                        system prompt (cached by `git status`)
+        \\      --max-turn-ms <n> abort a turn if it runs longer than n ms
+        \\                        (0 = unlimited; checked between iterations)
+        \\      --max-turn-tokens <n>
+        \\                        abort a turn if cumulative input+output
+        \\                        tokens exceed n (0 = unlimited)
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\      --mcp <command>   spawn an MCP server (repeatable);

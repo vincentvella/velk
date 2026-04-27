@@ -39,12 +39,25 @@ pub const Config = struct {
     /// long-lived buffers separate from the per-turn arena.
     hook_gpa: ?std.mem.Allocator = null,
     /// Io for spawning hook commands. Required when `hook_engine`
-    /// is non-null.
+    /// is non-null. Also used for the wall-clock budget check when
+    /// `max_wall_ms` is set.
     hook_io: ?Io = null,
+    /// Optional wall-clock cap (ms) for a single turn. Checked at
+    /// the end of each iteration; on breach we abort with
+    /// `Error.TurnBudgetExceeded` after `onTurnEnd` fires. 0 = unlimited.
+    max_wall_ms: u64 = 0,
+    /// Optional cumulative-token cap for a single turn (input +
+    /// output across all iterations). Checked after each iteration's
+    /// usage is collected. 0 = unlimited.
+    max_total_tokens: u64 = 0,
 };
 
 pub const Error = error{
     IterationBudgetExceeded,
+    /// `Config.max_wall_ms` or `max_total_tokens` was breached
+    /// mid-turn. The accumulated history is committed; the turn
+    /// returns this error to the caller.
+    TurnBudgetExceeded,
     StreamingApiError,
     InvalidToolInput,
 } || std.mem.Allocator.Error;
@@ -62,6 +75,10 @@ pub fn run(
     const tool_defs = try buildToolDefs(arena, config.tools);
 
     var cumulative: provider_mod.Usage = .{};
+    const turn_started_at: ?Io.Timestamp = if (config.max_wall_ms > 0 and config.hook_io != null)
+        Io.Clock.now(.awake, config.hook_io.?)
+    else
+        null;
 
     var iteration: u32 = 0;
     while (iteration < config.max_iterations) : (iteration += 1) {
@@ -98,6 +115,25 @@ pub fn run(
         if (!std.mem.eql(u8, stop, "tool_use")) {
             try sink.onTurnEnd(sink.ctx, cumulative);
             return messages.items;
+        }
+
+        // Budget checks fire AFTER the iteration's usage is folded
+        // into `cumulative`. We only abort between iterations — a
+        // tool use already in flight gets to finish.
+        if (config.max_total_tokens > 0) {
+            const total: u64 = @as(u64, cumulative.input_tokens) + @as(u64, cumulative.output_tokens);
+            if (total > config.max_total_tokens) {
+                try sink.onTurnEnd(sink.ctx, cumulative);
+                return Error.TurnBudgetExceeded;
+            }
+        }
+        if (turn_started_at) |t0| {
+            const elapsed = t0.untilNow(config.hook_io.?, .awake);
+            const elapsed_ms: u64 = @intCast(@max(@as(i96, 0), @divTrunc(elapsed.nanoseconds, std.time.ns_per_ms)));
+            if (elapsed_ms > config.max_wall_ms) {
+                try sink.onTurnEnd(sink.ctx, cumulative);
+                return Error.TurnBudgetExceeded;
+            }
         }
 
         // Build the assistant message that the model just produced

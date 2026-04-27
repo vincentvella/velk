@@ -17,6 +17,8 @@ const hooks_mod = @import("hooks.zig");
 const todos_mod = @import("todos.zig");
 const ask_mod = @import("ask.zig");
 const skills_mod = @import("skills.zig");
+const ignore_mod = @import("ignore.zig");
+const lockfile = @import("lockfile.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -230,6 +232,11 @@ pub fn main(init: std.process.Init) !void {
                 .hook_io = init.io,
             };
 
+            // Optional .gitignore — read once at startup. Failures
+            // (no file, parse error) silently fall back to the
+            // hardcoded common-ignore set.
+            const gitignore_matcher = ignore_mod.Matcher.fromGitignore(arena, init.io, ".") catch ignore_mod.Matcher.empty();
+
             const settings = try arena.create(tools.Settings);
             settings.* = .{
                 .io = init.io,
@@ -242,6 +249,7 @@ pub fn main(init: std.process.Init) !void {
                 .todos = todos_store,
                 .ask = ask_gate,
                 .sub_agent = sub_agent,
+                .gitignore_matcher = gitignore_matcher,
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 
@@ -337,6 +345,8 @@ pub fn main(init: std.process.Init) !void {
                 .hook_engine = if (file_settings.hook_engine.isEmpty()) null else &file_settings.hook_engine,
                 .hook_gpa = init.gpa,
                 .hook_io = init.io,
+                .max_wall_ms = opts.max_turn_ms,
+                .max_total_tokens = opts.max_turn_tokens,
             });
 
             if (opts.session) |name| {
@@ -411,7 +421,14 @@ pub fn main(init: std.process.Init) !void {
 
             const mcp_count: u8 = if (mcp_servers) |s| @intCast(@min(255, s.clients.items.len)) else 0;
             const hook_engine_ptr: ?*const hooks_mod.Engine = if (file_settings.hook_engine.isEmpty()) null else &file_settings.hook_engine;
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate, settings) catch |err| {
+
+            // Lockfile-based unclean-shutdown detection. If the
+            // previous run didn't clean up, surface a notice so the
+            // user can /resume. Always release on clean exit.
+            const had_stale_lock = lockfile.touchAndCheckStale(arena, init.io, init.environ_map) catch false;
+            defer lockfile.release(init.io, arena, init.environ_map);
+
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate, settings, had_stale_lock) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);
@@ -574,6 +591,10 @@ fn renderProviderError(errw: *Io.Writer, err: anyerror, provider: provider_mod.P
     switch (err) {
         agent.Error.IterationBudgetExceeded => {
             try errw.print("velk: hit iteration budget without end_turn\n", .{});
+            return;
+        },
+        agent.Error.TurnBudgetExceeded => {
+            try errw.print("velk: TurnBudgetExceeded — wall-clock or token cap hit\n", .{});
             return;
         },
         else => {},

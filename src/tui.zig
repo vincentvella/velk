@@ -1666,11 +1666,63 @@ fn slashDoctor(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     // Cost-log size.
     if (cost_log.logPath(c.tui.arena, c.env_map)) |p| {
         const entries = cost_log.readAll(c.tui.arena, c.tui.io, p) catch &[_]cost_log.Entry{};
-        try buf.print(c.tui.arena, "  · cost-log entries: {d}", .{entries.len});
+        try buf.print(c.tui.arena, "  · cost-log entries: {d}\n", .{entries.len});
     } else |_| {
-        try buf.appendSlice(c.tui.arena, "  · cost-log: HOME unset");
+        try buf.appendSlice(c.tui.arena, "  · cost-log: HOME unset\n");
     }
 
+    // Git repo state — branch + dirty count via porcelain. Best-
+    // effort: anything that fails (no git, no repo) drops a "·"
+    // line rather than failing the command.
+    {
+        const branch_run = std.process.run(c.tui.gpa, c.tui.io, .{
+            .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
+        }) catch null;
+        if (branch_run) |r| {
+            defer c.tui.gpa.free(r.stdout);
+            defer c.tui.gpa.free(r.stderr);
+            const ok = switch (r.term) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+            if (ok) {
+                const branch = std.mem.trim(u8, r.stdout, " \t\r\n");
+                try buf.print(c.tui.arena, "  · git branch: {s}\n", .{branch});
+                const status_run = std.process.run(c.tui.gpa, c.tui.io, .{
+                    .argv = &.{ "git", "status", "--porcelain" },
+                }) catch null;
+                if (status_run) |sr| {
+                    defer c.tui.gpa.free(sr.stdout);
+                    defer c.tui.gpa.free(sr.stderr);
+                    var dirty: usize = 0;
+                    var lines = std.mem.splitScalar(u8, sr.stdout, '\n');
+                    while (lines.next()) |line| if (line.len > 0) {
+                        dirty += 1;
+                    };
+                    try buf.print(c.tui.arena, "  · git dirty: {d} change(s)\n", .{dirty});
+                } else {
+                    try buf.appendSlice(c.tui.arena, "  · git dirty: (status unavailable)\n");
+                }
+            } else {
+                try buf.appendSlice(c.tui.arena, "  · git: not a repository\n");
+            }
+        } else {
+            try buf.appendSlice(c.tui.arena, "  · git: not on PATH\n");
+        }
+    }
+
+    // MCP reachability: each attached server's stdin pipe is open
+    // iff the child process is alive. We don't ping the server
+    // itself (would burn a JSON-RPC roundtrip). Just report the
+    // count alongside the existing attach count for symmetry —
+    // mcp_count is already shown above.
+    if (c.tui.mcp_count > 0) {
+        try buf.print(c.tui.arena, "  · mcp: {d} attached at startup (live ping deferred)\n", .{c.tui.mcp_count});
+    }
+
+    if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n') {
+        _ = buf.pop();
+    }
     try c.tui.pushBlock(.notice, buf.items);
     return .handled;
 }
@@ -1781,6 +1833,7 @@ pub fn run(
     todos_store: ?*todos.Store,
     ask_gate: ?*ask.AskGate,
     tools_settings: ?*tools_mod.Settings,
+    had_stale_lock: bool,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -1854,6 +1907,15 @@ pub fn run(
         .notice,
         "velk REPL — Ctrl-D exit · Ctrl-C abort/cancel · Esc → normal (hjkl, w/b words, 0/$/I/A line, g/G top/bot, Ctrl-u/d page, v/V visual, y yank, i/a insert, q quit) · Enter send",
     );
+    // Crash-recovery v2: stale lockfile from a previous run means
+    // the prior session likely didn't clean up. Surface a stronger
+    // hint than the generic "saved sessions exist" nudge.
+    if (had_stale_lock) {
+        try tui.pushBlock(
+            .notice,
+            "[crash-recovery] previous velk session didn't shut down cleanly — try /resume to pick up where it left off.",
+        );
+    }
     // Crash-recovery v1: when launched without --session and at
     // least one saved session exists, point the user at /resume so
     // a forgotten previous session is one keystroke away.

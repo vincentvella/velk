@@ -23,6 +23,9 @@ pub const Config = struct {
     /// `hook_engine` is non-null.
     hook_gpa: ?std.mem.Allocator = null,
     hook_io: ?Io = null,
+    /// Forwarded to agent.Config — optional per-turn budget caps.
+    max_wall_ms: u64 = 0,
+    max_total_tokens: u64 = 0,
 };
 
 pub const Session = struct {
@@ -52,6 +55,8 @@ pub const Session = struct {
             .hook_engine = self.config.hook_engine,
             .hook_gpa = self.config.hook_gpa,
             .hook_io = self.config.hook_io,
+            .max_wall_ms = self.config.max_wall_ms,
+            .max_total_tokens = self.config.max_total_tokens,
         });
         self.messages.clearRetainingCapacity();
         try self.messages.appendSlice(self.arena, final);

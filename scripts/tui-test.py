@@ -528,6 +528,14 @@ def run_slash_cases(bin_path: Path) -> None:
             "/doctor reports cost-log entry count",
             tui.saw("cost-log entries:"),
         )
+        case(
+            "/doctor reports git branch (v2)",
+            tui.saw("git branch:") or tui.saw("git: not"),
+        )
+        case(
+            "/doctor reports git dirty count (v2)",
+            tui.saw("git dirty:") or tui.saw("git: not"),
+        )
 
         # /multiline test runs LAST in this block — once ON, plain
         # Enter no longer submits, so any subsequent slash command

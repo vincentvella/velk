@@ -1,11 +1,26 @@
-//! Lightweight ignore filter for `ls` / `grep`. V1 hard-codes the
-//! common dependency / build / cache directories that bloat a
-//! listing without telling the model anything useful. A real
-//! `.gitignore` parser (with negations, globs, anchored patterns)
-//! is a v2 lift — these names cover ~95% of the noise in a typical
-//! repo.
+//! Ignore filter for `ls` / `grep`. Two layers:
+//!
+//!   1. `isIgnored(path)` matches the **hardcoded common-ignore set**
+//!      — `.git`, `node_modules`, `.zig-cache`, etc. — by path
+//!      segment. Cheap, no allocation, no IO. Always on.
+//!
+//!   2. `Matcher.fromGitignore(arena, io, path)` parses a real
+//!      `.gitignore` file and returns a `Matcher` that combines
+//!      anchored, negated, and glob patterns. Used when a project
+//!      has its own ignore rules (e.g. generated artifacts that
+//!      aren't in the hardcoded set).
+//!
+//! Both layers compose: `Matcher.isIgnored(path)` returns true if
+//! either the hardcoded set or any non-negated `.gitignore` pattern
+//! matches AND no later negated pattern overrides it.
+//!
+//! **Out of scope for v1**: `?` single-char glob, `[abc]` brackets,
+//! escape sequences, and walking up multiple directory levels for
+//! nested `.gitignore` files. We read at most one file at the path
+//! the caller passes in.
 
 const std = @import("std");
+const Io = std.Io;
 
 /// Directory + file basenames whose presence we always want to
 /// silently skip. Matched on each path segment, not the full path,
@@ -95,4 +110,274 @@ test "isIgnored: lets normal paths through" {
 test "isIgnored: leading-slash paths handled" {
     try testing.expect(isIgnored("/Users/v/proj/.git/objects/abc"));
     try testing.expect(!isIgnored("/Users/v/proj/src/main.zig"));
+}
+
+// ───────── .gitignore parsing ─────────
+
+const Pattern = struct {
+    negate: bool,
+    /// True when the pattern starts with `/` — match relative to
+    /// the gitignore's directory, NOT anywhere in the path.
+    anchored: bool,
+    /// True when the pattern ends with `/` — only match directories.
+    /// We can't always know if a path is a directory just from the
+    /// string, so we match this as "any path whose first matching
+    /// segment is or could be a directory" — practically: if the
+    /// pattern matches a prefix of the path, the path is ignored.
+    dir_only: bool,
+    /// The cleaned glob (leading `/` stripped, trailing `/` stripped).
+    glob: []const u8,
+};
+
+pub const Matcher = struct {
+    patterns: []const Pattern = &.{},
+
+    pub fn empty() Matcher {
+        return .{};
+    }
+
+    /// Parse `.gitignore` content. Comments, blank lines, and lines
+    /// containing whitespace-only are skipped. Negated patterns
+    /// (`!foo`) override earlier matches; the *last matching*
+    /// pattern wins, per gitignore semantics.
+    pub fn parse(arena: std.mem.Allocator, body: []const u8) !Matcher {
+        var list: std.ArrayList(Pattern) = .empty;
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r");
+            if (trimmed.len == 0) continue;
+            if (trimmed[0] == '#') continue;
+
+            var s = trimmed;
+            var negate = false;
+            if (s[0] == '!') {
+                negate = true;
+                s = s[1..];
+                if (s.len == 0) continue;
+            }
+            var anchored = false;
+            if (s[0] == '/') {
+                anchored = true;
+                s = s[1..];
+                if (s.len == 0) continue;
+            } else if (std.mem.indexOfScalar(u8, s, '/')) |_| {
+                // A `/` in the middle implies anchoring per gitignore
+                // spec ("foo/bar" matches `foo/bar`, not `x/foo/bar`).
+                anchored = true;
+            }
+            var dir_only = false;
+            if (s.len > 0 and s[s.len - 1] == '/') {
+                dir_only = true;
+                s = s[0 .. s.len - 1];
+                if (s.len == 0) continue;
+            }
+            try list.append(arena, .{
+                .negate = negate,
+                .anchored = anchored,
+                .dir_only = dir_only,
+                .glob = try arena.dupe(u8, s),
+            });
+        }
+        return .{ .patterns = list.items };
+    }
+
+    /// Read `<dir>/.gitignore` if it exists; return `Matcher.empty()`
+    /// when the file is missing or unreadable. `dir` is relative to
+    /// CWD.
+    pub fn fromGitignore(
+        arena: std.mem.Allocator,
+        io: Io,
+        dir: []const u8,
+    ) !Matcher {
+        const path = try std.fmt.allocPrint(arena, "{s}/.gitignore", .{dir});
+        const body = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch |e| switch (e) {
+            error.FileNotFound => return Matcher.empty(),
+            else => return Matcher.empty(),
+        };
+        return try parse(arena, body);
+    }
+
+    /// Combines the hardcoded common-ignore set with the parsed
+    /// patterns. Returns true if the path should be skipped.
+    pub fn isIgnored(self: Matcher, path: []const u8) bool {
+        if (path.len == 0) return false;
+        if (isIgnored_hardcoded(path)) return true;
+
+        var matched = false;
+        for (self.patterns) |p| {
+            if (patternMatches(p, path)) {
+                matched = !p.negate; // last match wins
+            }
+        }
+        return matched;
+    }
+};
+
+/// Alias the hardcoded layer so `Matcher.isIgnored` can call it
+/// without recursion.
+fn isIgnored_hardcoded(path: []const u8) bool {
+    return isIgnored(path);
+}
+
+fn patternMatches(p: Pattern, path: []const u8) bool {
+    // Anchored: glob must match `path` (or a prefix slash-bounded)
+    // from position 0.
+    if (p.anchored) {
+        if (globMatch(p.glob, path)) return true;
+        // dir_only: the pattern matched the directory itself; any
+        // descendant path is also ignored. We approximate this by
+        // checking if the pattern matches a prefix terminated by `/`.
+        if (p.dir_only or hasInternalSlashFreeGlob(p.glob)) {
+            // Try matching as a prefix: split `path` at each `/` and
+            // see if `glob` matches the head.
+            var i: usize = 0;
+            while (i < path.len) : (i += 1) {
+                if (path[i] == '/') {
+                    if (globMatch(p.glob, path[0..i])) return true;
+                }
+            }
+        }
+        return false;
+    }
+    // Non-anchored: match by basename anywhere along the path.
+    var seg_start: usize = 0;
+    var i: usize = 0;
+    while (i <= path.len) : (i += 1) {
+        const at_end = (i == path.len);
+        if (at_end or path[i] == '/') {
+            const seg = path[seg_start..i];
+            if (seg.len > 0 and globMatch(p.glob, seg)) return true;
+            seg_start = i + 1;
+        }
+    }
+    return false;
+}
+
+fn hasInternalSlashFreeGlob(glob: []const u8) bool {
+    return std.mem.indexOfScalar(u8, glob, '/') == null;
+}
+
+/// Minimal glob matcher: `*` matches any run of non-`/` characters,
+/// `**` matches any run of characters including `/`. Everything else
+/// is literal. No `?`, no `[abc]`, no escapes — those are out of
+/// scope for v1.
+pub fn globMatch(pattern: []const u8, text: []const u8) bool {
+    return globMatchRecursive(pattern, 0, text, 0);
+}
+
+fn globMatchRecursive(pat: []const u8, pi: usize, txt: []const u8, ti: usize) bool {
+    var p = pi;
+    var t = ti;
+    while (p < pat.len) {
+        if (pat[p] == '*') {
+            // Detect `**`
+            const is_double = (p + 1 < pat.len and pat[p + 1] == '*');
+            const skip = if (is_double) @as(usize, 2) else 1;
+            // Skip a possible `/` after `**` so `**/` and `**` are equivalent.
+            const next_p = if (is_double and p + 2 < pat.len and pat[p + 2] == '/') p + 3 else p + skip;
+
+            // Try matching zero or more characters
+            if (next_p >= pat.len) {
+                // `**` at end matches everything; `*` at end matches a
+                // segment with no `/`.
+                if (is_double) return true;
+                // `*` at end: rest of text must be slash-free.
+                return std.mem.indexOfScalar(u8, txt[t..], '/') == null;
+            }
+            // Greedy with backtracking.
+            var k: usize = t;
+            while (k <= txt.len) : (k += 1) {
+                if (globMatchRecursive(pat, next_p, txt, k)) return true;
+                if (!is_double and k < txt.len and txt[k] == '/') break;
+            }
+            return false;
+        }
+        if (t >= txt.len) return false;
+        if (pat[p] != txt[t]) return false;
+        p += 1;
+        t += 1;
+    }
+    return t == txt.len;
+}
+
+test "globMatch: literals" {
+    try testing.expect(globMatch("foo", "foo"));
+    try testing.expect(!globMatch("foo", "fooo"));
+    try testing.expect(!globMatch("foo", "fo"));
+}
+
+test "globMatch: single star is segment-bounded" {
+    try testing.expect(globMatch("*.log", "x.log"));
+    try testing.expect(globMatch("*.log", "anything.log"));
+    try testing.expect(!globMatch("*.log", "a/b.log"));
+    try testing.expect(globMatch("foo*", "foobar"));
+    try testing.expect(!globMatch("foo*", "foo/bar"));
+}
+
+test "globMatch: double star crosses /" {
+    try testing.expect(globMatch("**/*.log", "a/b/c.log"));
+    try testing.expect(globMatch("**/build", "x/y/build"));
+    try testing.expect(globMatch("a/**", "a/b/c/d"));
+}
+
+test "Matcher.parse: comments + blanks skipped, patterns retained" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const m = try Matcher.parse(arena_state.allocator(),
+        \\# this is a comment
+        \\
+        \\*.log
+        \\!important.log
+        \\/anchored
+        \\dir/
+    );
+    try testing.expectEqual(@as(usize, 4), m.patterns.len);
+    try testing.expectEqualStrings("*.log", m.patterns[0].glob);
+    try testing.expect(!m.patterns[0].anchored);
+    try testing.expect(m.patterns[1].negate);
+    try testing.expect(m.patterns[2].anchored);
+    try testing.expect(m.patterns[3].dir_only);
+}
+
+test "Matcher.isIgnored: glob + negate" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const m = try Matcher.parse(arena_state.allocator(),
+        \\*.log
+        \\!keep.log
+    );
+    try testing.expect(m.isIgnored("foo.log"));
+    try testing.expect(m.isIgnored("a/b/foo.log"));
+    try testing.expect(!m.isIgnored("keep.log")); // negation overrides
+    try testing.expect(!m.isIgnored("foo.txt"));
+}
+
+test "Matcher.isIgnored: anchored pattern only matches at root" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const m = try Matcher.parse(arena_state.allocator(),
+        \\/build
+    );
+    try testing.expect(m.isIgnored("build")); // anchored root match
+    try testing.expect(m.isIgnored("build/x")); // dir prefix
+    // `nested/build` should NOT be matched by an anchored `/build` —
+    // the hardcoded set does match `build` though, so this would
+    // still be ignored in practice. Check a name not in the
+    // hardcoded set.
+    const m2 = try Matcher.parse(arena_state.allocator(), "/dist-anchored\n");
+    try testing.expect(m2.isIgnored("dist-anchored"));
+    try testing.expect(!m2.isIgnored("nested/dist-anchored"));
+}
+
+test "Matcher.isIgnored: hardcoded layer always engaged" {
+    const m: Matcher = .empty();
+    try testing.expect(m.isIgnored("node_modules"));
+    try testing.expect(m.isIgnored("a/b/.git/HEAD"));
+}
+
+test "Matcher.fromGitignore: missing file yields empty matcher" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const m = try Matcher.fromGitignore(arena_state.allocator(), testing.io, "/nonexistent/dir");
+    try testing.expectEqual(@as(usize, 0), m.patterns.len);
 }

@@ -271,6 +271,21 @@ JSON
     rm -rf "$HOOK_SETTINGS_TMP"
     unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
 
+    # Budget caps: --max-turn-tokens 1 against the default mock
+    # (which streams ~12 in / 7 out tokens) trips immediately. The
+    # turn aborts after the first iteration completes; the agent
+    # surfaces TurnBudgetExceeded as the error name. The mock fixture
+    # ends with end_turn so the cap actually fires before the model
+    # would have stopped on its own — we use bash to force a tool
+    # turn... actually default.sse already hits the cap because input
+    # tokens alone exceed 1. The model errors with "TurnBudgetExceeded".
+    SMOKE_EXPECT_STDERR="TurnBudgetExceeded" run_case \
+        "--max-turn-tokens trips when cap exceeded mid-turn" 1 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui --max-turn-tokens 1 "please diffwrite"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
     # Skills v1: a project-level .velk/skills/<name>/SKILL.md with
     # name + description in frontmatter is discovered and the
     # banner reports the load. Use a tmp project dir so we don't
