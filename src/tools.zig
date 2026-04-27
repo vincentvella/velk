@@ -18,6 +18,9 @@ const ignore = @import("ignore.zig");
 const web = @import("web.zig");
 const todos_mod = @import("todos.zig");
 const ask_mod = @import("ask.zig");
+const provider_mod = @import("provider.zig");
+const agent_mod = @import("agent.zig");
+const hooks_mod = @import("hooks.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
 /// so any tool that touches the filesystem can consult `unsafe` and reuse
@@ -50,6 +53,32 @@ pub const Settings = struct {
     /// registered; calls block on the gate until the TUI delivers a
     /// selection (or Esc cancels).
     ask: ?*ask_mod.AskGate = null,
+    /// Sub-agent dispatcher. Populated by `main.zig` *after*
+    /// `buildAll` runs (the `task` tool needs a back-pointer to the
+    /// rest of the registry). When non-null, the `task` tool is
+    /// registered.
+    sub_agent: ?*const SubAgent = null,
+};
+
+/// Wires the `task` tool's child agent into the parent's runtime.
+/// Owned by main.zig; back-pointed from `Settings.sub_agent` once
+/// the tool registry has been built.
+pub const SubAgent = struct {
+    provider: provider_mod.Provider,
+    model: []const u8,
+    max_tokens: u32 = 4096,
+    /// The full parent registry. The child filters by name when the
+    /// caller passes a `tools` allowlist; otherwise it inherits all.
+    tools: []const tool.Tool = &.{},
+    max_iterations: u32 = 5,
+    /// Optional system prompt for the child. If null we let the
+    /// child run with no system prompt at all (matches what the
+    /// caller asked for, no parent leakage).
+    system: ?[]const u8 = null,
+    /// Hooks fire inside child tool calls just like the parent —
+    /// safety boundaries should still apply. Null disables.
+    hook_engine: ?*const hooks_mod.Engine = null,
+    hook_io: ?Io = null,
 };
 
 pub const Error = error{
@@ -75,6 +104,7 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildWebSearch(arena, settings));
     if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
     if (settings.ask != null) try list.append(arena, try buildAskUserQuestion(arena, settings));
+    if (settings.sub_agent != null) try list.append(arena, try buildTask(arena, settings));
     return list.items;
 }
 
@@ -780,6 +810,142 @@ fn todoWriteExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.
     }
     return .{ .text = out.items };
 }
+
+// ───────── task (sub-agent) ─────────
+
+const task_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "prompt":{"type":"string","description":"The instructions for the sub-agent. The sub-agent has its own message history and runs to completion before returning."},
+    \\   "tools":{"type":"array","description":"Optional. Names of parent tools the child is allowed to call. When omitted, the child inherits the full registry minus `task` itself.",
+    \\     "items":{"type":"string"}}
+    \\ },
+    \\ "required":["prompt"]}
+;
+
+pub fn buildTask(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, task_schema_json, .{});
+    return .{
+        .name = "task",
+        .description = "Spawn a sub-agent with isolated context. Pass a `prompt` (and optionally a `tools` allowlist by name); the sub-agent runs the agent loop with its own fresh message history and returns the final assistant text. Use for self-contained sub-tasks where you don't want to pollute the main conversation. Sub-agents do not nest — `task` is excluded from the child's tool set.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = taskExecute,
+    };
+}
+
+fn taskExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const sub = settings.sub_agent orelse return errorOutput(arena, "task: no sub-agent runtime configured", .{});
+
+    const prompt = (try getString(input, "prompt")) orelse return errorOutput(arena, "task: missing 'prompt'", .{});
+
+    // Build the child's tool set: parent's registry minus `task`,
+    // optionally filtered by the caller's allowlist.
+    var allow: ?[]const []const u8 = null;
+    if (input == .object) {
+        if (input.object.get("tools")) |v| switch (v) {
+            .array => |a| {
+                var names = try arena.alloc([]const u8, a.items.len);
+                for (a.items, 0..) |item, i| {
+                    names[i] = switch (item) {
+                        .string => |s| s,
+                        else => return errorOutput(arena, "task: tools[{d}] must be a string", .{i}),
+                    };
+                }
+                allow = names;
+            },
+            else => return errorOutput(arena, "task: 'tools' must be an array", .{}),
+        };
+    }
+
+    var child_tools: std.ArrayList(tool.Tool) = .empty;
+    for (sub.tools) |t| {
+        if (std.mem.eql(u8, t.name, "task")) continue;
+        if (allow) |names| {
+            var matched = false;
+            for (names) |n| if (std.mem.eql(u8, t.name, n)) {
+                matched = true;
+                break;
+            };
+            if (!matched) continue;
+        }
+        try child_tools.append(arena, t);
+    }
+
+    // The child runs synchronously on this same worker thread.
+    // We capture its final assistant text via a SilentSink so the
+    // parent's UI doesn't receive interleaved deltas — only the
+    // final result (returned as the tool's Output) lands.
+    var capture: ChildCapture = .{};
+    const sink: agent_mod.Sink = .{
+        .ctx = &capture,
+        .onText = ChildCapture.onText,
+        .onToolCall = ChildCapture.onToolCall,
+        .onToolResult = ChildCapture.onToolResult,
+        .onTurnEnd = ChildCapture.onTurnEnd,
+    };
+
+    const child_arena = arena; // child shares this turn's arena
+    capture.arena = child_arena;
+
+    _ = agent_mod.run(child_arena, sub.provider, sink, .{
+        .model = sub.model,
+        .max_tokens = sub.max_tokens,
+        .system = sub.system,
+        .prompt = prompt,
+        .tools = child_tools.items,
+        .max_iterations = sub.max_iterations,
+        .hook_engine = sub.hook_engine,
+        .hook_gpa = settings.gpa,
+        .hook_io = sub.hook_io,
+    }) catch |e| {
+        return errorOutput(arena, "task: child agent failed: {s}", .{@errorName(e)});
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "task complete ({d} tool call(s) across {d} iteration(s))\n\n", .{
+        capture.tool_calls,
+        capture.iterations,
+    });
+    if (capture.final_text.items.len > 0) {
+        try out.appendSlice(arena, capture.final_text.items);
+    } else {
+        try out.appendSlice(arena, "(no final text produced)");
+    }
+    return .{ .text = out.items };
+}
+
+const ChildCapture = struct {
+    arena: std.mem.Allocator = undefined,
+    final_text: std.ArrayList(u8) = .empty,
+    tool_calls: u32 = 0,
+    iterations: u32 = 0,
+
+    fn cast(ctx: ?*anyopaque) *ChildCapture {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn onText(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        const self = cast(ctx);
+        try self.final_text.appendSlice(self.arena, text);
+    }
+    fn onToolCall(ctx: ?*anyopaque, _: []const u8, _: []const u8) anyerror!void {
+        const self = cast(ctx);
+        self.tool_calls +|= 1;
+        // A new tool call means the previous "final text" was just
+        // intermediate prose — clear it so we end with the truly
+        // final assistant text.
+        self.final_text.clearRetainingCapacity();
+    }
+    fn onToolResult(_: ?*anyopaque, _: []const u8, _: bool) anyerror!void {
+        return;
+    }
+    fn onTurnEnd(ctx: ?*anyopaque, _: provider_mod.Usage) anyerror!void {
+        const self = cast(ctx);
+        self.iterations +|= 1;
+    }
+};
 
 // ───────── ask_user_question ─────────
 

@@ -218,6 +218,18 @@ pub fn main(init: std.process.Init) !void {
                 break :blk g;
             };
 
+            // Sub-agent runtime. Allocated up-front so the `task`
+            // tool can carry a stable back-pointer to it; `tools`,
+            // `system`, and `hook_engine` are filled in below once
+            // the parent registry and system prompt are settled.
+            const sub_agent = try arena.create(tools.SubAgent);
+            sub_agent.* = .{
+                .provider = provider,
+                .model = opts.model orelse defaultModelFor(opts.provider),
+                .max_tokens = opts.max_tokens,
+                .hook_io = init.io,
+            };
+
             const settings = try arena.create(tools.Settings);
             settings.* = .{
                 .io = init.io,
@@ -229,6 +241,7 @@ pub fn main(init: std.process.Init) !void {
                 .env_map = init.environ_map,
                 .todos = todos_store,
                 .ask = ask_gate,
+                .sub_agent = sub_agent,
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 
@@ -308,6 +321,13 @@ pub fn main(init: std.process.Init) !void {
                     try errw.flush();
                 }
             }
+
+            // Now that tool_set + final_system are settled, finish
+            // wiring the sub-agent runtime so the `task` tool has
+            // the parent registry to filter against.
+            sub_agent.tools = tool_set;
+            sub_agent.system = final_system;
+            sub_agent.hook_engine = if (file_settings.hook_engine.isEmpty()) null else &file_settings.hook_engine;
 
             var sess: session.Session = .init(arena, provider, .{
                 .model = model,

@@ -215,10 +215,13 @@ JSON
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "explain @maybeRequestApproval"
 
-    # Tools registry includes web_fetch + web_search → tools=9 in
-    # the debug envelope (was tools=7 before this batch).
-    SMOKE_EXPECT_STDERR="tools=9" run_case \
-        "web_fetch + web_search are registered tools" 0 \
+    # Tools registry: --no-tui ships 10 tools — 9 builtins (echo,
+    # read_file, write_file, edit, ls, grep, bash, web_fetch,
+    # web_search) plus `task` (the sub-agent dispatcher; works
+    # headlessly). `todo_write` and `ask_user_question` need a
+    # TUI panel and so are NOT registered here.
+    SMOKE_EXPECT_STDERR="tools=10" run_case \
+        "task tool is registered alongside the 9 builtins" 0 \
         env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "anything"

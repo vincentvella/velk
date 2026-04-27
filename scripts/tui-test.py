@@ -741,6 +741,26 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
             if output_path.exists():
                 output_path.unlink()
 
+            # ── task (sub-agent) ────────────────────────────────
+            # `spawnchild/` fixture: step 1 emits a tool_use for
+            # `task` whose prompt routes the child to the haiku
+            # fixture. The child runs to completion silently; the
+            # parent then sees the task tool's result containing
+            # the child's final text. Step 2 wraps up.
+            tui.send_line("please spawnchild")
+            case(
+                "task: parent emitted tool_use",
+                tui.wait_for("delegating-to-child", screen=True, timeout=5.0),
+            )
+            case(
+                "task: child's haiku final text bubbles into parent's tool result",
+                tui.wait_for("Allocator", screen=True, timeout=5.0),
+            )
+            case(
+                "task: parent wraps up after sub-agent",
+                tui.wait_for("child-done-now-wrap-up", screen=True, timeout=5.0),
+            )
+
             # ── ask_user_question ───────────────────────────────
             # `askwhich/` fixture: step 1 emits a tool_use for
             # ask_user_question; the TUI shows a numbered picker;
