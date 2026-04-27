@@ -12,6 +12,7 @@ const settings_mod = @import("settings.zig");
 const permissions_mod = @import("permissions.zig");
 const workspace_mod = @import("workspace.zig");
 const mentions_mod = @import("mentions.zig");
+const repo_map_mod = @import("repo_map.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -247,11 +248,27 @@ pub fn main(init: std.process.Init) !void {
             // non-fatal — we just run with the user's --system as-is.
             const repo_root = workspace_mod.findRepoRoot(arena, init.io) catch null;
             const ctx_loaded = workspace_mod.findContextFile(arena, init.io, repo_root) catch null;
-            const final_system: ?[]const u8 = if (ctx_loaded) |loaded| blk: {
+            var final_system: ?[]const u8 = if (ctx_loaded) |loaded| blk: {
                 try errw.print("velk: auto-loaded {s} ({d} bytes)\n", .{ loaded.path, loaded.contents.len });
                 try errw.flush();
                 break :blk try workspace_mod.buildSystemPrompt(arena, opts.system, loaded.contents, loaded.path);
             } else opts.system;
+
+            // Repo map (opt-in): prepend a cached filtered tree
+            // listing so the model has the project shape without
+            // having to ls everything itself. Cache invalidates on
+            // `git status --porcelain` hash change.
+            if (opts.repo_map) {
+                const cwd_key = try std.fmt.allocPrint(arena, "{x:0>16}", .{
+                    std.hash.Wyhash.hash(0, repo_root orelse "."),
+                });
+                const map = repo_map_mod.cachedOrGenerate(arena, init.io, init.gpa, init.environ_map, cwd_key) catch "";
+                if (map.len > 0) {
+                    final_system = try workspace_mod.buildSystemPrompt(arena, final_system, map, "repo-map");
+                    try errw.print("velk: repo-map prepended ({d} bytes)\n", .{map.len});
+                    try errw.flush();
+                }
+            }
 
             var sess: session.Session = .init(arena, provider, .{
                 .model = model,

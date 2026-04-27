@@ -39,6 +39,9 @@ pub const Options = struct {
     /// After every turn, if the tree is dirty + we're in a git
     /// repo, run `git add -A && git commit -m …`. Off by default.
     auto_commit: bool = false,
+    /// Prepend a filtered repo layout to the system prompt at
+    /// launch. Cached by `git status --porcelain` hash.
+    repo_map: bool = false,
 };
 
 pub const ParseError = struct {
@@ -112,6 +115,10 @@ pub fn parse(args: []const []const u8) Action {
             opts.auto_commit = true;
             continue;
         }
+        if (eql(arg, "--repo-map")) {
+            opts.repo_map = true;
+            continue;
+        }
         if (eql(arg, "--no-tui")) {
             opts.no_tui = true;
             continue;
@@ -173,6 +180,8 @@ pub fn printHelp(w: anytype) !void {
         \\                        (node_modules, .git, .zig-cache, ...)
         \\      --auto-commit     git add -A + git commit at every dirty
         \\                        turn end (best-effort, requires git repo)
+        \\      --repo-map        prepend a filtered repo layout to the
+        \\                        system prompt (cached by `git status`)
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\      --mcp <command>   spawn an MCP server (repeatable);

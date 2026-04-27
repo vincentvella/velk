@@ -200,6 +200,12 @@ JSON
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "summarize @LICENSE"
 
+    SMOKE_EXPECT_STDERR="repo-map prepended" run_case \
+        "--repo-map prepends layout to system prompt" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui --repo-map "anything"
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else
