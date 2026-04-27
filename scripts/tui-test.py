@@ -788,6 +788,25 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
                 tui.wait_for("ask-confirmed", screen=True, timeout=5.0),
             )
 
+            # ── ask_user_question (Esc cancels) ─────────────────
+            # `askcancel/` fixture: same shape, but we press Esc.
+            # Tool returns is_error to the model; the model wraps
+            # up with "cancel-acknowledged".
+            tui.send_line("please askcancel")
+            case(
+                "ask cancel: question rendered",
+                tui.wait_for("Which-cancel-target?", screen=True, timeout=5.0),
+            )
+            tui.send("\x1b")  # Esc
+            case(
+                "ask cancel: verdict notice records cancellation",
+                tui.wait_for("→ canceled", screen=True, timeout=5.0),
+            )
+            case(
+                "ask cancel: model continues after cancel",
+                tui.wait_for("cancel-acknowledged", screen=True, timeout=5.0),
+            )
+
             # ── todo_write ──────────────────────────────────────
             # `todowrite/` fixture: step 1 emits a tool_use with two
             # items; the tool runs and the store is mutated; step 2

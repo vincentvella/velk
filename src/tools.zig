@@ -1250,3 +1250,329 @@ test "bash: nonzero exit marked is_error" {
     try testing.expect(out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.text, "exit: 7") != null);
 }
+
+// ───────── todo_write validation ─────────
+
+test "todo_write: refuses without a store" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings(); // todos = null
+    const t = try buildTodoWrite(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "no store wired") != null);
+}
+
+test "todo_write: missing 'todos' field is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var store: todos_mod.Store = .init(testing.allocator);
+    defer store.deinit(testing.io);
+    var settings = testSettings();
+    settings.todos = &store;
+    const t = try buildTodoWrite(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "missing 'todos'") != null);
+}
+
+test "todo_write: rejects bad status enum" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var store: todos_mod.Store = .init(testing.allocator);
+    defer store.deinit(testing.io);
+    var settings = testSettings();
+    settings.todos = &store;
+    const t = try buildTodoWrite(a, &settings);
+    const json =
+        \\{"todos":[{"content":"x","status":"banana"}]}
+    ;
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "status invalid") != null);
+}
+
+test "todo_write: rejects non-array todos" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var store: todos_mod.Store = .init(testing.allocator);
+    defer store.deinit(testing.io);
+    var settings = testSettings();
+    settings.todos = &store;
+    const t = try buildTodoWrite(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"todos\":\"oops\"}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "must be an array") != null);
+}
+
+test "todo_write: empty list is valid and clears the store" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var store: todos_mod.Store = .init(testing.allocator);
+    defer store.deinit(testing.io);
+    try store.set(testing.io, &.{.{ .content = "stale", .status = .pending }});
+    var settings = testSettings();
+    settings.todos = &store;
+    const t = try buildTodoWrite(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"todos\":[]}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expectEqual(@as(usize, 0), store.len(testing.io));
+    try testing.expect(std.mem.indexOf(u8, out.text, "cleared") != null);
+}
+
+test "todo_write: full happy path mutates the store" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var store: todos_mod.Store = .init(testing.allocator);
+    defer store.deinit(testing.io);
+    var settings = testSettings();
+    settings.todos = &store;
+    const t = try buildTodoWrite(a, &settings);
+    const json =
+        \\{"todos":[
+        \\  {"content":"draft","status":"in_progress"},
+        \\  {"content":"ship","status":"pending"}
+        \\]}
+    ;
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expectEqual(@as(usize, 2), store.len(testing.io));
+    try testing.expect(std.mem.indexOf(u8, out.text, "[~] draft") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "[ ] ship") != null);
+}
+
+// ───────── ask_user_question validation ─────────
+
+test "ask_user_question: refuses without a gate" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings(); // ask = null
+    const t = try buildAskUserQuestion(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "no UI gate") != null);
+}
+
+test "ask_user_question: missing 'question' is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var gate: ask_mod.AskGate = .init(testing.allocator, hookTestIo());
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.ask = &gate;
+    const t = try buildAskUserQuestion(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "missing 'question'") != null);
+}
+
+test "ask_user_question: zero options is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var gate: ask_mod.AskGate = .init(testing.allocator, hookTestIo());
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.ask = &gate;
+    const t = try buildAskUserQuestion(a, &settings);
+    const json = "{\"question\":\"hi?\",\"options\":[]}";
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "non-empty") != null);
+}
+
+test "ask_user_question: more than 9 options rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var gate: ask_mod.AskGate = .init(testing.allocator, hookTestIo());
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.ask = &gate;
+    const t = try buildAskUserQuestion(a, &settings);
+    const json = "{\"question\":\"q\",\"options\":[\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\",\"10\"]}";
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "at most 9") != null);
+}
+
+test "ask_user_question: non-string option rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var gate: ask_mod.AskGate = .init(testing.allocator, hookTestIo());
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.ask = &gate;
+    const t = try buildAskUserQuestion(a, &settings);
+    const json = "{\"question\":\"q\",\"options\":[\"a\",42]}";
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "must be a string") != null);
+}
+
+test "ask_user_question: headless gate cancels the call" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var gate: ask_mod.AskGate = .init(testing.allocator, hookTestIo());
+    // No post_fn → headless. The tool should return an is_error
+    // result with "canceled by user" rather than block forever.
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.ask = &gate;
+    const t = try buildAskUserQuestion(a, &settings);
+    const json = "{\"question\":\"q\",\"options\":[\"a\",\"b\"]}";
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "canceled") != null);
+}
+
+// ───────── task (sub-agent) validation ─────────
+
+test "task: refuses when no sub-agent runtime is wired" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings(); // sub_agent = null
+    const t = try buildTask(a, &settings);
+    const input = try jsonObj(a, .{ .prompt = @as([]const u8, "x") });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "no sub-agent runtime") != null);
+}
+
+test "task: missing 'prompt' is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{
+            .ctx = null,
+            .streamFn = stubStream,
+            .lastErrorBodyFn = stubLastBody,
+        },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTask(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "missing 'prompt'") != null);
+}
+
+test "task: 'tools' must be an array" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = stubStream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTask(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"prompt\":\"x\",\"tools\":\"not-array\"}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "must be an array") != null);
+}
+
+test "task: child registry filters out `task` and respects allowlist" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Hand-crafted parent registry with three tools; the allowlist
+    // restricts the child to "echo".
+    var captured_filter: ChildFilterCapture = .{};
+    const parent_tools = [_]tool.Tool{
+        .{ .name = "echo", .description = "", .input_schema = .{ .null = {} }, .execute = stubExecute },
+        .{ .name = "edit", .description = "", .input_schema = .{ .null = {} }, .execute = stubExecute },
+        .{ .name = "task", .description = "", .input_schema = .{ .null = {} }, .execute = stubExecute },
+    };
+    const sub: SubAgent = .{
+        .provider = .{
+            .ctx = &captured_filter,
+            .streamFn = ChildFilterCapture.streamCapture,
+            .lastErrorBodyFn = stubLastBody,
+        },
+        .model = "m",
+        .tools = &parent_tools,
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTask(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"prompt\":\"x\",\"tools\":[\"echo\",\"task\"]}", .{});
+    _ = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+
+    // The provider was called once with the child's tool defs;
+    // we verify the registry was filtered to ONLY "echo": "task"
+    // is excluded by the runtime even though it's in the allowlist,
+    // and "edit" is excluded because the allowlist blocks it.
+    try testing.expectEqual(@as(usize, 1), captured_filter.tool_count);
+    try testing.expectEqualStrings("echo", captured_filter.first_tool_name);
+}
+
+const ChildFilterCapture = struct {
+    tool_count: usize = 0,
+    first_tool_name: []const u8 = "",
+
+    fn streamCapture(ctx: ?*anyopaque, req: provider_mod.Request, s: provider_mod.Stream) anyerror!void {
+        const self: *ChildFilterCapture = @ptrCast(@alignCast(ctx.?));
+        self.tool_count = req.tools.len;
+        if (req.tools.len > 0) self.first_tool_name = req.tools[0].name;
+        // Emit an immediate end_turn so the agent loop unwinds.
+        try s.onStop(s.ctx, "end_turn");
+    }
+};
+
+fn stubStream(_: ?*anyopaque, _: provider_mod.Request, s: provider_mod.Stream) anyerror!void {
+    try s.onStop(s.ctx, "end_turn");
+}
+
+fn stubLastBody(_: ?*anyopaque) ?[]const u8 {
+    return null;
+}
+
+fn stubExecute(_: ?*anyopaque, _: std.mem.Allocator, _: std.json.Value) anyerror!tool.Output {
+    return .{ .text = "" };
+}
+
+fn hookTestIo() Io {
+    const Threaded = std.Io.Threaded;
+    const Static = struct {
+        var t: Threaded = undefined;
+        var initialised: bool = false;
+    };
+    if (!Static.initialised) {
+        Static.t = Threaded.init(std.heap.page_allocator, .{});
+        Static.initialised = true;
+    }
+    return Static.t.io();
+}

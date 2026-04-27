@@ -248,3 +248,108 @@ test "formatCatalog: includes name, description, path" {
     try testing.expect(std.mem.indexOf(u8, out, ".velk/skills/a/SKILL.md") != null);
     try testing.expect(std.mem.indexOf(u8, out, "</skills>") != null);
 }
+
+fn writeSkill(io: Io, root_abs: []const u8, name: []const u8, body: []const u8, arena: std.mem.Allocator) !void {
+    const dir = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root_abs, name });
+    try Io.Dir.cwd().makePath(io, dir);
+    const path = try std.fmt.allocPrint(arena, "{s}/SKILL.md", .{dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+}
+
+test "loadFrom: discovers skills with valid frontmatter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const root_abs = try tmp.dir.realpathAlloc(a, ".");
+
+    try writeSkill(testing.io, root_abs, "alpha",
+        \\---
+        \\name: alpha
+        \\description: first
+        \\---
+        \\
+        \\body
+    , a);
+    try writeSkill(testing.io, root_abs, "beta",
+        \\---
+        \\name: beta
+        \\description: second
+        \\---
+    , a);
+
+    var by_name: std.StringHashMap(Skill) = .init(a);
+    defer by_name.deinit();
+    try loadFrom(a, testing.io, root_abs, &by_name);
+    try testing.expectEqual(@as(usize, 2), by_name.count());
+    try testing.expect(by_name.get("alpha") != null);
+    try testing.expect(by_name.get("beta") != null);
+}
+
+test "loadFrom: malformed SKILL.md (no frontmatter) is silently skipped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const root_abs = try tmp.dir.realpathAlloc(a, ".");
+
+    // good skill alongside a malformed one
+    try writeSkill(testing.io, root_abs, "good",
+        \\---
+        \\name: good
+        \\description: works
+        \\---
+    , a);
+    try writeSkill(testing.io, root_abs, "broken", "no frontmatter at all", a);
+
+    var by_name: std.StringHashMap(Skill) = .init(a);
+    defer by_name.deinit();
+    try loadFrom(a, testing.io, root_abs, &by_name);
+    try testing.expectEqual(@as(usize, 1), by_name.count());
+    try testing.expect(by_name.get("good") != null);
+    try testing.expect(by_name.get("broken") == null);
+}
+
+test "loadFrom: project skill with same name overrides earlier root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    const user_root = try std.fmt.allocPrint(a, "{s}/user", .{tmp_abs});
+    const project_root = try std.fmt.allocPrint(a, "{s}/project", .{tmp_abs});
+
+    try writeSkill(testing.io, user_root, "shared",
+        \\---
+        \\name: shared
+        \\description: from-user
+        \\---
+    , a);
+    try writeSkill(testing.io, project_root, "shared",
+        \\---
+        \\name: shared
+        \\description: from-project
+        \\---
+    , a);
+
+    var by_name: std.StringHashMap(Skill) = .init(a);
+    defer by_name.deinit();
+    // Same precedence as loadAll: user first, project later wins.
+    try loadFrom(a, testing.io, user_root, &by_name);
+    try loadFrom(a, testing.io, project_root, &by_name);
+    try testing.expectEqual(@as(usize, 1), by_name.count());
+    try testing.expectEqualStrings("from-project", by_name.get("shared").?.description);
+}
+
+test "loadFrom: missing root is a silent no-op" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var by_name: std.StringHashMap(Skill) = .init(a);
+    defer by_name.deinit();
+    try loadFrom(a, testing.io, "/nonexistent/path/that/does/not/exist", &by_name);
+    try testing.expectEqual(@as(usize, 0), by_name.count());
+}

@@ -448,3 +448,109 @@ test "buildPayload: includes tool_name and event" {
     try testing.expect(std.mem.indexOf(u8, payload, "\"tool_name\":\"bash\"") != null);
     try testing.expect(std.mem.indexOf(u8, payload, "\"cwd\":\"/tmp\"") != null);
 }
+
+// The dispatch tests below need a real `Io` because `runCommand`
+// spawns a child process. Reuse a single threaded Io across tests.
+fn testIo() Io {
+    const Threaded = std.Io.Threaded;
+    const Static = struct {
+        var t: Threaded = undefined;
+        var initialised: bool = false;
+    };
+    if (!Static.initialised) {
+        Static.t = Threaded.init(std.heap.page_allocator, .{});
+        Static.initialised = true;
+    }
+    return Static.t.io();
+}
+
+test "dispatch: command-type exit 0 lets the tool proceed" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .pre_tool_use,
+        .kind = .command,
+        .body = "exit 0",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .pre_tool_use, .{ .tool_name = "bash" });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.notice) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    try testing.expect(out.blocked == null);
+    try testing.expect(out.notice == null);
+}
+
+test "dispatch: command-type exit 2 blocks with stderr as reason" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .pre_tool_use,
+        .kind = .command,
+        .body = "echo nope >&2; exit 2",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .pre_tool_use, .{ .tool_name = "bash" });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.notice) |s| arena.free(s);
+    defer arena.free(out.blocked.?);
+    try testing.expectEqualStrings("nope", out.blocked.?);
+}
+
+test "dispatch: command-type non-zero non-2 surfaces as a notice" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .post_tool_use,
+        .kind = .command,
+        .body = "echo broke >&2; exit 7",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .post_tool_use, .{ .tool_name = "bash" });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    defer arena.free(out.notice.?);
+    try testing.expect(out.blocked == null);
+    try testing.expect(std.mem.indexOf(u8, out.notice.?, "exit 7") != null);
+    try testing.expect(std.mem.indexOf(u8, out.notice.?, "broke") != null);
+}
+
+test "dispatch: command stdout becomes inject on UserPromptSubmit" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .user_prompt_submit,
+        .kind = .command,
+        .body = "echo INJECTED",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .user_prompt_submit, .{ .prompt = "hi" });
+    defer if (out.notice) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    defer arena.free(out.inject.?);
+    try testing.expectEqualStrings("INJECTED", out.inject.?);
+}
+
+test "dispatch: matcher rejects mismatched tool_name and skips the hook" {
+    const arena = testing.allocator;
+    // The hook would block if it ran. Matcher excludes "bash"
+    // because it only accepts "edit", so we must NOT see blocked.
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .pre_tool_use,
+        .kind = .command,
+        .matcher = "^edit$",
+        .body = "exit 2",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .pre_tool_use, .{ .tool_name = "bash" });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.notice) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    try testing.expect(out.blocked == null);
+}
+
+test "dispatch: matcher hits and the hook fires" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .pre_tool_use,
+        .kind = .command,
+        .matcher = "^bash$",
+        .body = "echo blocked-it >&2; exit 2",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .pre_tool_use, .{ .tool_name = "bash" });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.notice) |s| arena.free(s);
+    defer arena.free(out.blocked.?);
+    try testing.expectEqualStrings("blocked-it", out.blocked.?);
+}
