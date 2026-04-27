@@ -462,7 +462,8 @@ def run_slash_cases(bin_path: Path) -> None:
         case("/help mentions /system", tui.saw("/system"))
 
         tui.send_line("/cost")
-        case("/cost on empty session", tui.wait_for("No turns recorded yet"))
+        case("/cost on empty session", tui.wait_for("Session totals"))
+        case("/cost shows rolling-window labels", tui.saw("Today") and tui.saw("Week") and tui.saw("All"))
 
         tui.send_line("/model")
         case("/model with no args shows current", tui.wait_for("Current model:"))

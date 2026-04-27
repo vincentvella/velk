@@ -12,6 +12,7 @@ const provider_mod = @import("provider.zig");
 const session_mod = @import("session.zig");
 const persist = @import("persist.zig");
 const cost = @import("cost.zig");
+const cost_log = @import("cost_log.zig");
 const slash = @import("slash.zig");
 const notify = @import("notify.zig");
 const markdown = @import("markdown.zig");
@@ -732,11 +733,26 @@ const Tui = struct {
         if (usage.cache_read_tokens > 0 or usage.cache_creation_tokens > 0) {
             try buf.print(self.arena, " · cache {d} read / {d} write", .{ usage.cache_read_tokens, usage.cache_creation_tokens });
         }
-        if (cost.turnCost(self.model, usage)) |c| {
+        const this_turn_cost: ?f64 = cost.turnCost(self.model, usage);
+        if (this_turn_cost) |c| {
             try buf.print(self.arena, " · ${d:.4}", .{c});
         }
         try buf.append(self.arena, ']');
         try self.pushBlock(.notice, buf.items);
+
+        // Append to the persistent cost log (best-effort: a write
+        // failure here mustn't break the turn, just like notify).
+        const log_path = cost_log.logPath(self.arena, self.env_map) catch return;
+        const entry: cost_log.Entry = .{
+            .ts = std.Io.Clock.now(.real, self.io).toSeconds(),
+            .model = self.model,
+            .in = usage.input_tokens,
+            .out = usage.output_tokens,
+            .cache_read = usage.cache_read_tokens,
+            .cache_write = usage.cache_creation_tokens,
+            .cost_usd = this_turn_cost orelse 0,
+        };
+        cost_log.append(self.arena, self.io, log_path, entry) catch {};
     }
 };
 
@@ -1159,21 +1175,43 @@ fn slashExit(_: *anyopaque, _: []const u8) anyerror!slash.Action {
 
 fn slashCost(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     const c = slashCtx(ctx);
+    var buf: std.ArrayList(u8) = .empty;
+
+    // In-session totals first.
     const u = c.tui.cumulative_usage;
     if (u.input_tokens == 0 and u.output_tokens == 0) {
-        try c.tui.pushBlock(.notice, "No turns recorded yet — cost is $0.0000.");
-        return .handled;
-    }
-    var buf: std.ArrayList(u8) = .empty;
-    try buf.print(c.tui.arena, "Session totals · {d} in / {d} out", .{ u.input_tokens, u.output_tokens });
-    if (u.cache_read_tokens > 0 or u.cache_creation_tokens > 0) {
-        try buf.print(c.tui.arena, " · cache {d} read / {d} write", .{ u.cache_read_tokens, u.cache_creation_tokens });
-    }
-    if (cost.turnCost(c.tui.model, u)) |total| {
-        try buf.print(c.tui.arena, " · ${d:.4}", .{total});
+        try buf.appendSlice(c.tui.arena, "Session totals · (no turns yet)\n");
     } else {
-        try buf.print(c.tui.arena, " · cost: model not in price table", .{});
+        try buf.print(c.tui.arena, "Session totals · {d} in / {d} out", .{ u.input_tokens, u.output_tokens });
+        if (u.cache_read_tokens > 0 or u.cache_creation_tokens > 0) {
+            try buf.print(c.tui.arena, " · cache {d} read / {d} write", .{ u.cache_read_tokens, u.cache_creation_tokens });
+        }
+        if (cost.turnCost(c.tui.model, u)) |total| {
+            try buf.print(c.tui.arena, " · ${d:.4}", .{total});
+        }
+        try buf.append(c.tui.arena, '\n');
     }
+
+    // Rolling totals from the persistent log.
+    const log_path = cost_log.logPath(c.tui.arena, c.env_map) catch null;
+    if (log_path) |p| {
+        const entries = cost_log.readAll(c.tui.arena, c.tui.io, p) catch &[_]cost_log.Entry{};
+        const now = std.Io.Clock.now(.real, c.tui.io).toSeconds();
+        const today = cost_log.aggregate(entries, .today, now);
+        const week = cost_log.aggregate(entries, .week, now);
+        const month = cost_log.aggregate(entries, .month, now);
+        const all = cost_log.aggregate(entries, .all, now);
+        try buf.print(c.tui.arena,
+            "Today  · {d} turn(s) · ${d:.4}\nWeek   · {d} turn(s) · ${d:.4}\nMonth  · {d} turn(s) · ${d:.4}\nAll    · {d} turn(s) · ${d:.4}",
+            .{
+                today.turns, today.cost_usd,
+                week.turns,  week.cost_usd,
+                month.turns, month.cost_usd,
+                all.turns,   all.cost_usd,
+            },
+        );
+    }
+
     try c.tui.pushBlock(.notice, buf.items);
     return .handled;
 }
