@@ -732,6 +732,20 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
             )
             if output_path.exists():
                 output_path.unlink()
+
+            # ── /compact ────────────────────────────────────────
+            # The /compact handler builds a request whose final user
+            # message contains "summarize", which the mock maps to
+            # `tests/fixtures/anthropic/summarize.sse`. The fixture
+            # streams a canned summary marker we then look for both
+            # in the notice block AND as proof the history was
+            # actually replaced.
+            tui.send_line("/compact")
+            case(
+                "/compact: replaces history with summary",
+                tui.wait_for("compact-summary-marker", screen=True, timeout=5.0)
+                and "replaced history" in tui.screen(),
+            )
         finally:
             if FAIL > 0 or os.environ.get("TUI_TEST_DUMP"):
                 with open("/tmp/tui-test-turn-buffer.txt", "w") as f:

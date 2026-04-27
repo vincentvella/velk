@@ -1346,6 +1346,100 @@ fn slashLoad(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
     return .handled;
 }
 
+/// Sink used by /compact to harvest the model's summary text.
+const CompactSink = struct {
+    text: std.ArrayList(u8) = .empty,
+    arena: std.mem.Allocator,
+
+    fn cb(ctx: ?*anyopaque, t: []const u8) anyerror!void {
+        const self: *CompactSink = @ptrCast(@alignCast(ctx.?));
+        try self.text.appendSlice(self.arena, t);
+    }
+    fn noop(_: ?*anyopaque, _: provider_mod.ToolUse) anyerror!void {}
+    fn noopUsage(_: ?*anyopaque, _: provider_mod.Usage) anyerror!void {}
+    fn noopStop(_: ?*anyopaque, _: []const u8) anyerror!void {}
+};
+
+const compact_prompt: []const u8 =
+    "Please summarize the conversation so far in 3-6 sentences. " ++
+    "Capture the user's goal, key decisions, files touched, " ++
+    "and any open questions. Be concrete, no preamble.";
+
+fn slashCompact(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    if (c.tui.sess.messages.items.len == 0) {
+        try c.tui.pushBlock(.notice, "/compact: no messages to summarize yet.");
+        return .handled;
+    }
+    if (c.tui.turn != null) {
+        try c.tui.pushBlock(.notice, "/compact: a turn is in flight — wait for it to finish.");
+        return .handled;
+    }
+
+    try c.tui.pushBlock(.notice, "/compact: summarizing… (UI is paused for the duration of the call)");
+    try c.tui.render();
+
+    // Synchronous call on the main thread for v1. Future work: move
+    // to a worker so the spinner keeps animating + Ctrl-C cancels.
+    var harvest: CompactSink = .{ .arena = c.tui.arena };
+
+    // Build a request that's the existing history + a synthetic user
+    // turn asking for the summary. We deliberately don't pass tools
+    // — the summary should be plain text.
+    var msgs: std.ArrayList(provider_mod.Message) = .empty;
+    try msgs.appendSlice(c.tui.arena, c.tui.sess.messages.items);
+    try msgs.append(c.tui.arena, try provider_mod.textMessage(c.tui.arena, .user, compact_prompt));
+
+    const req: provider_mod.Request = .{
+        .model = c.tui.model,
+        .max_tokens = c.tui.sess.config.max_tokens,
+        .system = c.tui.sess.config.system,
+        .messages = msgs.items,
+        .tools = &.{},
+    };
+
+    c.tui.sess.provider.stream(req, .{
+        .ctx = &harvest,
+        .onText = CompactSink.cb,
+        .onToolUse = CompactSink.noop,
+        .onUsage = CompactSink.noopUsage,
+        .onStop = CompactSink.noopStop,
+    }) catch |err| {
+        const msg = try std.fmt.allocPrint(c.tui.arena, "/compact failed: {s}", .{@errorName(err)});
+        try c.tui.pushBlock(.tool_result_error, msg);
+        return .handled;
+    };
+
+    if (harvest.text.items.len == 0) {
+        try c.tui.pushBlock(.tool_result_error, "/compact: model returned an empty summary.");
+        return .handled;
+    }
+
+    // Replace history with a single user message containing the
+    // summary, prefixed so future turns can tell it's compacted
+    // context (not a real user turn). The next /save / autosave
+    // captures the new shorter history.
+    const summary_owned = try c.tui.arena.dupe(u8, harvest.text.items);
+    const synthetic = try std.fmt.allocPrint(
+        c.tui.arena,
+        "(Previous conversation summary)\n{s}",
+        .{summary_owned},
+    );
+    c.tui.sess.messages.clearRetainingCapacity();
+    try c.tui.sess.messages.append(
+        c.tui.arena,
+        try provider_mod.textMessage(c.tui.arena, .user, synthetic),
+    );
+
+    const notice = try std.fmt.allocPrint(
+        c.tui.arena,
+        "/compact: replaced history with a {d}-char summary.\n\n{s}",
+        .{ summary_owned.len, summary_owned },
+    );
+    try c.tui.pushBlock(.notice, notice);
+    return .handled;
+}
+
 fn slashDoctor(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     const c = slashCtx(ctx);
     var buf: std.ArrayList(u8) = .empty;
@@ -1433,6 +1527,7 @@ const slash_commands = [_]slash.Command{
     .{ .name = "load", .description = "replace the current session with a saved one", .handler = slashLoad },
     .{ .name = "resume", .description = "list saved sessions or resume one by name", .handler = slashResume },
     .{ .name = "doctor", .description = "show env / session / cost-log diagnostics", .handler = slashDoctor },
+    .{ .name = "compact", .description = "summarize the conversation so far and replace history with the summary", .handler = slashCompact },
     .{ .name = "multiline", .description = "toggle multi-line input (Enter inserts newline, Ctrl-D submits)", .handler = slashMultiline },
 };
 
