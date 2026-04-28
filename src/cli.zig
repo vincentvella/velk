@@ -59,6 +59,20 @@ pub const Options = struct {
     /// profile layer between CLI flags (which still win) and the
     /// base `defaults` block (which loses to the profile).
     profile: ?[]const u8 = null,
+    /// Architect/coder split: when set, the `task` sub-agent
+    /// dispatcher defaults to this model instead of the parent's
+    /// `--model`. The model can call `task(prompt)` to delegate
+    /// reasoning-heavy work to the planner without paying for it
+    /// on every coder turn. Per-call override via `task(prompt,
+    /// model="…")` still wins over this default.
+    planner_model: ?[]const u8 = null,
+    /// Architect/coder split: when set, treated as `--model` for
+    /// the parent agent (the "coder" runs every main turn). If
+    /// `--model` is also set, that wins.
+    coder_model: ?[]const u8 = null,
+    /// Watch mode: re-run the prompt every time the working tree
+    /// changes. Implies `--no-tui`. Requires a positional prompt.
+    watch: bool = false,
 };
 
 pub const ParseError = struct {
@@ -175,6 +189,20 @@ pub fn parse(args: []const []const u8) Action {
             opts.profile = v;
             continue;
         }
+        if (eql(arg, "--planner-model")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.planner_model = v;
+            continue;
+        }
+        if (eql(arg, "--coder-model")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.coder_model = v;
+            continue;
+        }
+        if (eql(arg, "--watch")) {
+            opts.watch = true;
+            continue;
+        }
         if (eql(arg, "--session") or eql(arg, "-S")) {
             const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
             opts.session = v;
@@ -245,8 +273,20 @@ pub fn printHelp(w: anytype) !void {
         \\                        auto-run /compact when cumulative input
         \\                        tokens reach <pct>% of the model's
         \\                        context window (1..99; 0 = disabled)
+        \\      --watch           re-run the prompt every time the working
+        \\                        tree changes (polling, 500ms cadence;
+        \\                        implies --no-tui; requires a prompt)
         \\  -P, --profile <name>  apply a named profile from settings.json
         \\                        (e.g. `-P review` for read-only flow)
+        \\      --planner-model <id>
+        \\                        sub-agent (`task` tool) default model.
+        \\                        Use with --coder-model for cheap-codes /
+        \\                        expensive-plans split: e.g.
+        \\                        --coder-model claude-haiku-4-5
+        \\                        --planner-model claude-opus-4-7
+        \\      --coder-model <id>
+        \\                        parent agent model (alias for --model;
+        \\                        --model wins if both are set)
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\      --mcp <command>   spawn an MCP server (repeatable);
@@ -501,4 +541,34 @@ test "parse: --profile missing value errors" {
 test "parse: --profile defaults to null" {
     const o = try expectRun(parse(&.{ "velk", "hi" }));
     try testing.expect(o.profile == null);
+}
+
+test "parse: --planner-model + --coder-model captured" {
+    const o = try expectRun(parse(&.{
+        "velk", "--planner-model", "claude-opus-4-7", "--coder-model", "claude-haiku-4-5", "hi",
+    }));
+    try testing.expectEqualStrings("claude-opus-4-7", o.planner_model.?);
+    try testing.expectEqualStrings("claude-haiku-4-5", o.coder_model.?);
+}
+
+test "parse: --planner-model missing value errors" {
+    const e = try expectParseError(parse(&.{ "velk", "--planner-model" }));
+    try testing.expectEqualStrings("--planner-model", e.arg.?);
+}
+
+test "parse: planner/coder default to null" {
+    const o = try expectRun(parse(&.{ "velk", "hi" }));
+    try testing.expect(o.planner_model == null);
+    try testing.expect(o.coder_model == null);
+}
+
+test "parse: --watch sets the flag" {
+    const o = try expectRun(parse(&.{ "velk", "--watch", "review the diff" }));
+    try testing.expect(o.watch);
+    try testing.expectEqualStrings("review the diff", o.prompt.?);
+}
+
+test "parse: watch defaults to false" {
+    const o = try expectRun(parse(&.{ "velk", "hi" }));
+    try testing.expect(!o.watch);
 }

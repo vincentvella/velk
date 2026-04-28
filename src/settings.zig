@@ -42,6 +42,17 @@ pub const CustomTool = struct {
     description: []const u8,
 };
 
+/// Per-language LSP server config. `extension` is matched against a
+/// file's tail (`.zig`, `.rs`, etc.) — the leading dot is included
+/// in the key so `path.endsWith(ext)` works directly.
+pub const LspServer = struct {
+    extension: []const u8,
+    command: []const u8,
+    /// LSP `languageId` field sent in `textDocument/didOpen`. Server-
+    /// specific (zls wants "zig", rust-analyzer wants "rust", etc.).
+    language_id: []const u8,
+};
+
 pub const Settings = struct {
     defaults: Defaults = .{},
     /// Each entry is a shell command (matches `--mcp`). Loaded
@@ -63,6 +74,9 @@ pub const Settings = struct {
     /// User-declared shell tools. Merged from user + project files;
     /// later entries with the same name replace earlier ones.
     custom_tools: []const CustomTool = &.{},
+    /// Per-language LSP servers. Same merge semantics as `custom_tools`:
+    /// later entries replace same-extension earlier ones.
+    lsp_servers: []const LspServer = &.{},
     /// Compiled hook engine. Built lazily by `compileHooks` once
     /// settings have been merged so project-level hooks override the
     /// user-level set wholesale (no concatenation — last one wins).
@@ -110,6 +124,19 @@ pub const Settings = struct {
         if (b.custom_tools.len > 0) {
             self.custom_tools = try mergeCustomTools(arena, self.custom_tools, b.custom_tools);
         }
+        if (b.lsp_servers.len > 0) {
+            self.lsp_servers = try mergeLspServers(arena, self.lsp_servers, b.lsp_servers);
+        }
+    }
+
+    /// Lookup an LSP server config by file extension. Match is exact
+    /// (case-sensitive), so settings should use `.zig` / `.rs` /
+    /// etc. with the dot included.
+    pub fn findLspServer(self: Settings, extension: []const u8) ?LspServer {
+        for (self.lsp_servers) |s| {
+            if (std.mem.eql(u8, s.extension, extension)) return s;
+        }
+        return null;
     }
 
     /// Compile the merged `hooks` JSON into a typed engine. Safe to
@@ -196,12 +223,24 @@ const Wire = struct {
     /// Strict-shape array; keys other than name/command/description
     /// are tolerated and ignored.
     tools: ?[]WireCustomTool = null,
+    /// `{"extension":".zig","command":"zls","language_id":"zig"}, ...`
+    lsp: ?WireLsp = null,
 };
 
 const WireCustomTool = struct {
     name: ?[]const u8 = null,
     command: ?[]const u8 = null,
     description: ?[]const u8 = null,
+};
+
+const WireLsp = struct {
+    servers: ?[]WireLspServer = null,
+};
+
+const WireLspServer = struct {
+    extension: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    language_id: ?[]const u8 = null,
 };
 
 const WirePermissions = struct {
@@ -244,7 +283,42 @@ fn parse(arena: std.mem.Allocator, data: []const u8) !Settings {
     out.skills = wire.skills;
     if (wire.profiles) |v| out.profiles = try parseProfiles(arena, v);
     if (wire.tools) |t| out.custom_tools = try parseCustomTools(arena, t);
+    if (wire.lsp) |l| {
+        if (l.servers) |s| {
+            out.lsp_servers = try parseLspServers(arena, s);
+        }
+    }
     return out;
+}
+
+fn parseLspServers(arena: std.mem.Allocator, raw: []WireLspServer) ![]const LspServer {
+    var list: std.ArrayList(LspServer) = .empty;
+    for (raw) |w| {
+        const ext = w.extension orelse return Error.InvalidSettingsJson;
+        const cmd = w.command orelse return Error.InvalidSettingsJson;
+        const lid = w.language_id orelse return Error.InvalidSettingsJson;
+        try list.append(arena, .{
+            .extension = try arena.dupe(u8, ext),
+            .command = try arena.dupe(u8, cmd),
+            .language_id = try arena.dupe(u8, lid),
+        });
+    }
+    return list.items;
+}
+
+fn mergeLspServers(arena: std.mem.Allocator, a: []const LspServer, b: []const LspServer) ![]const LspServer {
+    var list: std.ArrayList(LspServer) = .empty;
+    try list.appendSlice(arena, a);
+    outer: for (b) |new| {
+        for (list.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing.extension, new.extension)) {
+                list.items[i] = new;
+                continue :outer;
+            }
+        }
+        try list.append(arena, new);
+    }
+    return list.items;
 }
 
 fn parseCustomTools(arena: std.mem.Allocator, raw: []WireCustomTool) ![]const CustomTool {
@@ -539,6 +613,49 @@ test "custom_tools: missing required field rejects file" {
     defer arena_state.deinit();
     const json = "{\"tools\":[{\"name\":\"x\",\"command\":\"echo\"}]}"; // no description
     try testing.expectError(Error.InvalidSettingsJson, parse(arena_state.allocator(), json));
+}
+
+test "lsp_servers: parsed from lsp.servers array" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{ "lsp": { "servers": [
+        \\   {"extension": ".zig", "command": "zls",            "language_id": "zig"},
+        \\   {"extension": ".rs",  "command": "rust-analyzer",  "language_id": "rust"}
+        \\]}}
+    ;
+    const s = try parse(arena_state.allocator(), json);
+    try testing.expectEqual(@as(usize, 2), s.lsp_servers.len);
+    const z = s.findLspServer(".zig").?;
+    try testing.expectEqualStrings("zls", z.command);
+    try testing.expectEqualStrings("zig", z.language_id);
+    const r = s.findLspServer(".rs").?;
+    try testing.expectEqualStrings("rust-analyzer", r.command);
+}
+
+test "lsp_servers: missing required field rejects file" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json = "{\"lsp\":{\"servers\":[{\"extension\":\".zig\",\"command\":\"zls\"}]}}"; // no language_id
+    try testing.expectError(Error.InvalidSettingsJson, parse(arena_state.allocator(), json));
+}
+
+test "lsp_servers: project entry replaces same-extension user entry" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var user = try parse(arena, "{\"lsp\":{\"servers\":[{\"extension\":\".zig\",\"command\":\"zls-old\",\"language_id\":\"zig\"}]}}");
+    const project = try parse(arena, "{\"lsp\":{\"servers\":[{\"extension\":\".zig\",\"command\":\"zls-new\",\"language_id\":\"zig\"}]}}");
+    try user.merge(arena, project);
+    try testing.expectEqual(@as(usize, 1), user.lsp_servers.len);
+    try testing.expectEqualStrings("zls-new", user.findLspServer(".zig").?.command);
+}
+
+test "lsp_servers: lookup miss returns null" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const s = try parse(arena_state.allocator(), "{\"lsp\":{\"servers\":[{\"extension\":\".zig\",\"command\":\"zls\",\"language_id\":\"zig\"}]}}");
+    try testing.expect(s.findLspServer(".rs") == null);
 }
 
 test "custom_tools: project entry replaces same-named user entry" {

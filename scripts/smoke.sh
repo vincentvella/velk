@@ -221,8 +221,8 @@ JSON
     # sub-agent dispatchers `task` + `team` (both work headlessly).
     # `todo_write` and `ask_user_question` need a TUI panel and are
     # NOT registered here.
-    SMOKE_EXPECT_STDERR="tools=15" run_case \
-        "worktree + write_plan + task + team + read_memory + write_memory registered alongside the 9 builtins" 0 \
+    SMOKE_EXPECT_STDERR="tools=16" run_case \
+        "worktree + write_plan + task + team + read/write_memory + lsp_diagnostics registered alongside the 9 builtins" 0 \
         env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "anything"
@@ -317,6 +317,46 @@ MD
     rm -rf "$SKILLS_TMP"
     unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
 
+    # --watch: requires a prompt. We can't reasonably exercise the
+    # full poll loop in smoke (it blocks indefinitely), but we CAN
+    # confirm the no-prompt error path. The poll-and-rerun loop is
+    # covered by the watch.zig unit tests for fingerprint stability
+    # / change detection.
+    SMOKE_EXPECT_STDERR="--watch requires a positional prompt" run_case \
+        "watch: --watch without a prompt errors" 2 \
+        env ANTHROPIC_API_KEY=sk-fake "$VELK" --watch
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
+    # Architect/coder split: --planner-model + --coder-model surfaces
+    # an "architect/coder split" banner at startup. The mock backend
+    # doesn't actually use a different model server-side — what we're
+    # checking here is plumbing.
+    SMOKE_EXPECT_STDERR="architect/coder split" run_case \
+        "split: banner reports coder + planner" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui \
+                --coder-model claude-haiku-4-5 \
+                --planner-model claude-opus-4-7 \
+                "anything"
+    SMOKE_EXPECT_STDERR="coder=claude-haiku-4-5" run_case \
+        "split: banner names the coder explicitly" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui \
+                --coder-model claude-haiku-4-5 \
+                --planner-model claude-opus-4-7 \
+                "anything"
+    SMOKE_EXPECT_STDERR="planner=claude-opus-4-7" run_case \
+        "split: banner names the planner explicitly" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "$VELK" --no-tui \
+                --coder-model claude-haiku-4-5 \
+                --planner-model claude-opus-4-7 \
+                "anything"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
     # Memory tools (memdir): a turn that triggers the `write_memory`
     # tool against a tmp XDG_DATA_HOME lands a markdown file at
     # `<tmp>/velk/memdir/smoke-test-topic.md`. Confirms end-to-end:
@@ -371,8 +411,8 @@ JSON
     # output when stderr is a regular file. The custom-tools
     # banner check above runs without --debug; here we only need
     # to confirm `tools=14` lands.
-    SMOKE_EXPECT_STDERR="tools=16" run_case \
-        "custom-tools: tool count bumps from 15 → 16" 0 \
+    SMOKE_EXPECT_STDERR="tools=17" run_case \
+        "custom-tools: tool count bumps from 16 → 17" 0 \
         env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
             ANTHROPIC_API_KEY=sk-fake \
             HOME="$CUSTOM_TMP" \

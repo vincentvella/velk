@@ -19,6 +19,7 @@ const ask_mod = @import("ask.zig");
 const skills_mod = @import("skills.zig");
 const ignore_mod = @import("ignore.zig");
 const lockfile = @import("lockfile.zig");
+const watch_mod = @import("watch.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -238,10 +239,18 @@ pub fn main(init: std.process.Init) !void {
             // tool can carry a stable back-pointer to it; `tools`,
             // `system`, and `hook_engine` are filled in below once
             // the parent registry and system prompt are settled.
+            // Architect/coder split: the sub-agent's default model
+            // is `--planner-model` if set, else the parent model.
+            // The parent's model is `--model` (winning), or
+            // `--coder-model`, or the provider default. Per-call
+            // override on the `task` tool still wins over both.
+            const parent_model = opts.model orelse opts.coder_model orelse defaultModelFor(opts.provider);
+            const sub_default_model = opts.planner_model orelse parent_model;
+
             const sub_agent = try arena.create(tools.SubAgent);
             sub_agent.* = .{
                 .provider = provider,
-                .model = opts.model orelse defaultModelFor(opts.provider),
+                .model = sub_default_model,
                 .max_tokens = opts.max_tokens,
                 .hook_io = init.io,
             };
@@ -250,6 +259,22 @@ pub fn main(init: std.process.Init) !void {
             // (no file, parse error) silently fall back to the
             // hardcoded common-ignore set.
             const gitignore_matcher = ignore_mod.Matcher.fromGitignore(arena, init.io, ".") catch ignore_mod.Matcher.empty();
+
+            // Translate file-settings LSP servers into the
+            // tools-runtime mirror (the duplication keeps tools.zig
+            // free of a cyclic settings.zig dependency).
+            const lsp_runtime: []tools.LspServerConfig = blk: {
+                if (file_settings.lsp_servers.len == 0) break :blk &[_]tools.LspServerConfig{};
+                const lr = try arena.alloc(tools.LspServerConfig, file_settings.lsp_servers.len);
+                for (file_settings.lsp_servers, 0..) |s, i| {
+                    lr[i] = .{
+                        .extension = s.extension,
+                        .command = s.command,
+                        .language_id = s.language_id,
+                    };
+                }
+                break :blk lr;
+            };
 
             const settings = try arena.create(tools.Settings);
             settings.* = .{
@@ -264,6 +289,7 @@ pub fn main(init: std.process.Init) !void {
                 .ask = ask_gate,
                 .sub_agent = sub_agent,
                 .gitignore_matcher = gitignore_matcher,
+                .lsp_servers = lsp_runtime,
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 
@@ -336,9 +362,20 @@ pub fn main(init: std.process.Init) !void {
                 try errw.flush();
             }
 
-            const model = opts.model orelse defaultModelFor(opts.provider);
+            const model = parent_model;
 
             try printProviderBanner(errw, init.environ_map, opts.provider, model);
+
+            // Surface the architect/coder split if the user asked
+            // for two models. Banner reports both so the user can
+            // sanity-check which side is which.
+            if (opts.planner_model != null or opts.coder_model != null) {
+                try errw.print(
+                    "velk: architect/coder split · coder={s} · planner={s} (used by `task` tool)\n",
+                    .{ parent_model, sub_default_model },
+                );
+                try errw.flush();
+            }
 
             // Project-context auto-load: walk up from CWD looking
             // for a git repo root, then look for AGENTS.md /
@@ -421,6 +458,13 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
+            // --watch requires a prompt — it's the thing we re-run.
+            if (opts.watch and opts.prompt == null) {
+                try errw.print("velk: --watch requires a positional prompt to re-run\n", .{});
+                try errw.flush();
+                std.process.exit(2);
+            }
+
             if (opts.prompt) |p| {
                 var plain: PlainSink = .{ .text_out = w, .progress_out = errw, .arena = arena, .model = model };
                 const expanded = mentions_mod.expand(arena, init.io, p, opts.unsafe) catch p;
@@ -463,6 +507,35 @@ pub fn main(init: std.process.Init) !void {
                     try errw.flush();
                     std.process.exit(1);
                 };
+
+                // --watch: poll the working tree and re-run the
+                // prompt every time the fingerprint changes. The
+                // session's message history persists across re-runs
+                // so the model can see what it produced last time
+                // and react to the diff. Ctrl-C exits via the
+                // installed SIGINT handler.
+                if (opts.watch) {
+                    const watch_root = ".";
+                    var prev = watch_mod.fingerprint(arena, init.io, watch_root) catch 0;
+                    try errw.print("velk: --watch · polling every {d}ms · Ctrl-C to exit\n", .{watch_mod.default_poll_ms});
+                    try errw.flush();
+                    while (true) {
+                        prev = watch_mod.waitForChange(arena, init.io, watch_root, prev, watch_mod.default_poll_ms) catch |e| {
+                            try errw.print("velk: --watch poll failed: {s}\n", .{@errorName(e)});
+                            try errw.flush();
+                            std.process.exit(1);
+                        };
+                        try errw.print("\nvelk: --watch · change detected, re-running prompt\n", .{});
+                        try errw.flush();
+                        sess.ask(prompt_with_hook, plain.sink()) catch |err| {
+                            try renderProviderError(errw, err, provider);
+                            try errw.flush();
+                            // Keep watching even on error — the
+                            // user might fix the issue; exiting
+                            // here forces a re-launch.
+                        };
+                    }
+                }
                 return;
             }
 

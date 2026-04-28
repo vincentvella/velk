@@ -63,6 +63,19 @@ pub const Settings = struct {
     /// rest of the registry). When non-null, the `task` tool is
     /// registered.
     sub_agent: ?*const SubAgent = null,
+    /// Per-language LSP server configs (extension → command +
+    /// languageId). Populated from settings.json. The
+    /// `lsp_diagnostics` tool looks up by extension.
+    lsp_servers: []const LspServerConfig = &.{},
+};
+
+/// Mirror of `settings.LspServer` — duplicated here so tools.zig
+/// doesn't have to import settings.zig (which would create a
+/// dependency cycle through the wire types).
+pub const LspServerConfig = struct {
+    extension: []const u8,
+    command: []const u8,
+    language_id: []const u8,
 };
 
 /// Wires the `task` tool's child agent into the parent's runtime.
@@ -111,6 +124,7 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildWritePlan(arena, settings));
     try list.append(arena, try buildReadMemory(arena, settings));
     try list.append(arena, try buildWriteMemory(arena, settings));
+    try list.append(arena, try buildLspDiagnostics(arena, settings));
     if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
     if (settings.ask != null) try list.append(arena, try buildAskUserQuestion(arena, settings));
     if (settings.sub_agent != null) try list.append(arena, try buildTask(arena, settings));
@@ -987,7 +1001,8 @@ const task_schema_json: []const u8 =
     \\ "properties":{
     \\   "prompt":{"type":"string","description":"The instructions for the sub-agent. The sub-agent has its own message history and runs to completion before returning."},
     \\   "tools":{"type":"array","description":"Optional. Names of parent tools the child is allowed to call. When omitted, the child inherits the full registry minus `task` itself.",
-    \\     "items":{"type":"string"}}
+    \\     "items":{"type":"string"}},
+    \\   "model":{"type":"string","description":"Optional. Run the child with this model id instead of the sub-agent default. Use to delegate reasoning-heavy work to a more capable (and expensive) model — e.g. `model='claude-opus-4-7'` from a Haiku parent."}
     \\ },
     \\ "required":["prompt"]}
 ;
@@ -1058,8 +1073,13 @@ fn taskExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
     const child_arena = arena; // child shares this turn's arena
     capture.arena = child_arena;
 
+    // Per-call model override. Falls back to the sub-agent default
+    // (which `--planner-model` sets at startup, otherwise inherits
+    // the parent's model).
+    const child_model: []const u8 = (try getString(input, "model")) orelse sub.model;
+
     _ = agent_mod.run(child_arena, sub.provider, sink, .{
-        .model = sub.model,
+        .model = child_model,
         .max_tokens = sub.max_tokens,
         .system = sub.system,
         .prompt = prompt,
@@ -1418,6 +1438,109 @@ fn getInt(value: std.json.Value, field: []const u8) !?i64 {
     };
 }
 
+// ───────── lsp_diagnostics ─────────
+
+const lsp_mod = @import("lsp.zig");
+
+const lsp_diagnostics_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "file":{"type":"string","description":"Path to a source file in the project. The LSP server is selected by file extension via settings.json `lsp.servers`."},
+    \\   "timeout_ms":{"type":"integer","description":"Optional. How long to wait for the server's first publishDiagnostics. Default 5000."}
+    \\ },
+    \\ "required":["file"]}
+;
+
+pub fn buildLspDiagnostics(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, lsp_diagnostics_schema_json, .{});
+    return .{
+        .name = "lsp_diagnostics",
+        .description = "Get LSP-reported diagnostics (errors, warnings, hints) for a source file. Spawns the project's configured LSP server (settings.json `lsp.servers[<ext>]`), opens the file, and waits for the first publishDiagnostics. Use to surface real compile/lint errors instead of guessing.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = lspDiagnosticsExecute,
+    };
+}
+
+fn lspDiagnosticsExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const file = (try getString(input, "file")) orelse return errorOutput(arena, "lsp_diagnostics: missing 'file'", .{});
+    const timeout_ms: u64 = @intCast(@as(i64, (try getInt(input, "timeout_ms")) orelse 5000));
+
+    // Path safety: same lexical check the other file tools use.
+    _ = validatePath(settings, file) catch {
+        return errorOutput(arena, "lsp_diagnostics: refused — path '{s}' is outside CWD (use --unsafe to override)", .{file});
+    };
+
+    // Find the configured server by extension.
+    const ext = std.fs.path.extension(file);
+    if (ext.len == 0) return errorOutput(arena, "lsp_diagnostics: file '{s}' has no extension", .{file});
+    const server: LspServerConfig = blk: {
+        for (settings.lsp_servers) |s| {
+            if (std.mem.eql(u8, s.extension, ext)) break :blk s;
+        }
+        return errorOutput(arena, "lsp_diagnostics: no LSP server configured for '{s}' — add `lsp.servers` entry to settings.json", .{ext});
+    };
+
+    // Read the file body so we can send it in didOpen (avoids the
+    // server doing its own disk read of a path it might not be able
+    // to find e.g. under sandboxed CI).
+    const cwd = std.Io.Dir.cwd();
+    const body = cwd.readFileAlloc(settings.io, file, arena, .limited(max_file_bytes)) catch |e|
+        return errorOutput(arena, "lsp_diagnostics: read failed: {s}", .{@errorName(e)});
+
+    // Resolve workspace root to an absolute path. Std 0.16 lacks an
+    // Io.Dir.realpathAlloc / process.getCwdAlloc; libc getcwd is the
+    // shortest path. LSP servers use this for project-wide config
+    // discovery.
+    const root_abs = blk: {
+        var buf: [4096]u8 = undefined;
+        const ptr = std.c.getcwd(&buf, buf.len) orelse
+            return errorOutput(arena, "lsp_diagnostics: getcwd failed", .{});
+        const len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
+        _ = ptr;
+        break :blk try arena.dupe(u8, buf[0..len]);
+    };
+
+    // The file URI must be absolute. If the user passed an absolute
+    // path, use it directly; otherwise join CWD + file.
+    const file_abs: []const u8 = if (std.fs.path.isAbsolute(file))
+        file
+    else
+        try std.fs.path.join(arena, &.{ root_abs, file });
+
+    // Tokenize the configured command on whitespace. The same
+    // limitation the bash + custom-tool wrappers have: no quoted
+    // args, no env-substitution. Surrounding shell still strips
+    // outer quotes.
+    var argv: std.ArrayList([]const u8) = .empty;
+    var iter = std.mem.tokenizeAny(u8, server.command, " \t");
+    while (iter.next()) |part| try argv.append(arena, part);
+    if (argv.items.len == 0) return errorOutput(arena, "lsp_diagnostics: empty command for '{s}'", .{ext});
+
+    const gpa = settings.gpa;
+    const client = lsp_mod.Client.start(gpa, settings.io, argv.items, root_abs) catch |e|
+        return errorOutput(arena, "lsp_diagnostics: spawn '{s}' failed: {s}", .{ server.command, @errorName(e) });
+    defer client.deinit();
+
+    const diags = client.diagnostics(arena, file_abs, server.language_id, body, timeout_ms) catch |e| switch (e) {
+        error.Timeout => return errorOutput(arena, "lsp_diagnostics: timed out after {d}ms waiting for diagnostics", .{timeout_ms}),
+        else => return errorOutput(arena, "lsp_diagnostics: query failed: {s}", .{@errorName(e)}),
+    };
+
+    if (diags.len == 0) {
+        return .{ .text = "(no diagnostics reported)", .is_error = false };
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "{d} diagnostic(s) for {s}:\n", .{ diags.len, file });
+    for (diags) |d| {
+        try out.print(arena, "  [{s}] {s}:{d}:{d}: {s}\n", .{ d.severity, file, d.line + 1, d.col + 1, d.message });
+    }
+    if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') _ = out.pop();
+    return .{ .text = out.items, .is_error = false };
+}
+
 // ───────── memory (memdir) ─────────
 
 const memory = @import("memory.zig");
@@ -1738,6 +1861,77 @@ test "custom: refused under plan mode" {
     try testing.expect(out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.text, "plan mode") != null);
     try testing.expect(std.mem.indexOf(u8, out.text, "writes-something") != null);
+}
+
+test "lsp_diagnostics: missing file is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildLspDiagnostics(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "missing 'file'") != null);
+}
+
+test "lsp_diagnostics: file without extension is rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildLspDiagnostics(a, &settings);
+    const input = try jsonObj(a, .{ .file = @as([]const u8, "Makefile") });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "no extension") != null);
+}
+
+test "lsp_diagnostics: end-to-end against a fake server" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Skip if python3 isn't available or the fake server file is
+    // missing — the test harness shouldn't fail in those envs.
+    const fake = "scripts/fake-lsp.py";
+    std.fs.cwd().access(fake, .{}) catch return;
+
+    // Touch a target source file inside CWD so the path safety
+    // check passes and the file actually exists for didOpen's
+    // contents harvest.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "lsp-target.zig", .data = "test diag here" });
+    const tmp_path = try tmp.dir.realpathAlloc(a, ".");
+
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.unsafe = true; // tmp is outside CWD; opt out of the safety check
+    const fake_cmd = try std.fmt.allocPrint(a, "python3 {s}/{s}", .{ try std.fs.cwd().realpathAlloc(a, "."), fake });
+    settings.lsp_servers = &.{
+        .{ .extension = ".zig", .command = fake_cmd, .language_id = "zig" },
+    };
+    const t = try buildLspDiagnostics(a, &settings);
+    const file_path = try std.fmt.allocPrint(a, "{s}/lsp-target.zig", .{tmp_path});
+    const input = try jsonObj(a, .{ .file = file_path, .timeout_ms = @as(i64, 3000) });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "fake-lsp-marker") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "[error]") != null);
+}
+
+test "lsp_diagnostics: unconfigured extension surfaces a clear message" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings(); // lsp_servers = empty
+    const t = try buildLspDiagnostics(a, &settings);
+    const input = try jsonObj(a, .{ .file = @as([]const u8, "src/main.zig") });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "no LSP server configured") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, ".zig") != null);
 }
 
 test "custom: nonzero exit marks is_error" {
@@ -2260,15 +2454,68 @@ test "task: child registry filters out `task` and respects allowlist" {
 const ChildFilterCapture = struct {
     tool_count: usize = 0,
     first_tool_name: []const u8 = "",
+    model: []const u8 = "",
 
     fn streamCapture(ctx: ?*anyopaque, req: provider_mod.Request, s: provider_mod.Stream) anyerror!void {
         const self: *ChildFilterCapture = @ptrCast(@alignCast(ctx.?));
         self.tool_count = req.tools.len;
         if (req.tools.len > 0) self.first_tool_name = req.tools[0].name;
+        self.model = req.model;
         // Emit an immediate end_turn so the agent loop unwinds.
         try s.onStop(s.ctx, "end_turn");
     }
 };
+
+test "task: per-call `model` override wins over sub-agent default" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var captured: ChildFilterCapture = .{};
+    const sub: SubAgent = .{
+        .provider = .{
+            .ctx = &captured,
+            .streamFn = ChildFilterCapture.streamCapture,
+            .lastErrorBodyFn = stubLastBody,
+        },
+        .model = "default-model-from-startup",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTask(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        a,
+        "{\"prompt\":\"plan this\",\"model\":\"claude-opus-4-7\"}",
+        .{},
+    );
+    _ = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expectEqualStrings("claude-opus-4-7", captured.model);
+}
+
+test "task: omitted `model` falls back to sub-agent default" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var captured: ChildFilterCapture = .{};
+    const sub: SubAgent = .{
+        .provider = .{
+            .ctx = &captured,
+            .streamFn = ChildFilterCapture.streamCapture,
+            .lastErrorBodyFn = stubLastBody,
+        },
+        .model = "planner-from-cli",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTask(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"prompt\":\"x\"}", .{});
+    _ = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expectEqualStrings("planner-from-cli", captured.model);
+}
 
 fn stubStream(_: ?*anyopaque, _: provider_mod.Request, s: provider_mod.Stream) anyerror!void {
     try s.onStop(s.ctx, "end_turn");
