@@ -87,24 +87,28 @@ class VelkAgent(AbstractInstalledAgent):
         max_turn_ms = os.environ.get("VELK_MAX_TURN_MS", "600000")
 
         # System prompt nudging the model into autonomous-task mode.
-        # Without this, models default to a "chat with the user"
-        # demeanor — observed in v0.0.3's first batch run on the
-        # `create-bucket` task: the model produced the right
-        # commands, then asked clarifying questions instead of
-        # executing them. Override via $VELK_BENCH_SYSTEM if you
-        # want different framing.
+        # Empirical findings shaping this phrasing:
+        # 1. With no system prompt, frontier models default to a
+        #    "chat with the user" demeanor — they list commands
+        #    and ask for confirmation instead of executing.
+        # 2. A soft "you are unattended" prompt isn't enough on
+        #    AWS-themed or other irreversible-feeling tasks — the
+        #    model still hedges. Stating that the environment is
+        #    isolated/sandboxed (which any disposable container is
+        #    — `docker run --rm` semantics) breaks the hedging
+        #    without revealing anything bench-specific.
+        # The phrasing avoids: task-specific guidance, tool-name
+        # hints (already in the API's `tools[]`), the words
+        # "Terminal-Bench" / "benchmark" / "test", or any framing
+        # that would let the model game tests it can see.
+        # Override via $VELK_BENCH_SYSTEM if you want different framing.
         system_prompt = os.environ.get(
             "VELK_BENCH_SYSTEM",
             (
-                "You are an autonomous agent running inside an ephemeral "
-                "Linux container with full root access. The user is not "
-                "available to answer questions — you must complete the "
-                "task on your own. Do not ask for confirmation; do not "
-                "ask clarifying questions. Use the bash, read_file, "
-                "write_file, and edit tools to inspect and modify the "
-                "filesystem as needed. When you believe the task is "
-                "complete, end your turn — the harness will run "
-                "automated tests to score your work."
+                "You are running unattended. No human is available to "
+                "answer questions or confirm actions. Make reasonable "
+                "choices and execute them through tool calls. End "
+                "your turn when the task is complete."
             ),
         )
 

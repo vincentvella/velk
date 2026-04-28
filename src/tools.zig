@@ -716,7 +716,22 @@ fn runBash(
     command: []const u8,
     timeout_ms: i64,
 ) !std.process.RunResult {
-    const argv = &[_][]const u8{ "/bin/sh", "-c", command };
+    // Run via bash with alias expansion + ~/.bashrc sourced when
+    // available. Non-interactive bash normally skips both, so an
+    // `alias git='hub'` in the user's bashrc wouldn't apply. We
+    // turn on `expand_aliases`, source .bashrc if present (silently
+    // skipped on Alpine / non-bashrc distros), then run the user's
+    // command. Falls back to `/bin/sh -c` when bash isn't on PATH
+    // (Alpine without bash, scratch images).
+    const wrapped = std.fmt.allocPrint(
+        arena,
+        "shopt -s expand_aliases 2>/dev/null; if [ -f ~/.bashrc ]; then . ~/.bashrc 2>/dev/null; fi; {s}",
+        .{command},
+    ) catch command;
+    const argv: []const []const u8 = if (bashAvailable())
+        &[_][]const u8{ "/bin/bash", "-c", wrapped }
+    else
+        &[_][]const u8{ "/bin/sh", "-c", command };
     const timeout: Io.Timeout = if (timeout_ms <= 0) .none else .{
         .duration = .{
             .raw = Io.Duration.fromMilliseconds(timeout_ms),
@@ -759,6 +774,23 @@ fn runBash(
         .stderr = try multi_reader.toOwnedSlice(1),
         .term = term,
     };
+}
+
+/// True when /bin/bash is executable. Cached after the first probe
+/// because the answer doesn't change for the lifetime of the process.
+fn bashAvailable() bool {
+    const Cache = struct {
+        var checked: bool = false;
+        var has_bash: bool = false;
+    };
+    if (Cache.checked) return Cache.has_bash;
+    Cache.checked = true;
+    // F_OK probe via libc — std.fs in Zig 0.16 is Io-based and we
+    // don't have an Io handle in this static context. libc access()
+    // returns 0 on existing+visible, -1 otherwise.
+    // POSIX F_OK = 0; just probe existence + executable.
+    Cache.has_bash = std.c.access("/bin/bash", 0) == 0;
+    return Cache.has_bash;
 }
 
 /// Send SIGKILL to a process group. Best-effort — silently ignores
