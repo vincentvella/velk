@@ -73,6 +73,11 @@ pub const Options = struct {
     /// Watch mode: re-run the prompt every time the working tree
     /// changes. Implies `--no-tui`. Requires a positional prompt.
     watch: bool = false,
+    /// Max tool-use iterations per turn before the agent loop
+    /// gives up with `IterationBudgetExceeded`. 0 = use the
+    /// session.Config default (10). Bench harnesses (terminal-
+    /// bench etc.) routinely want 20–50.
+    max_iterations: u32 = 0,
 };
 
 pub const ParseError = struct {
@@ -203,6 +208,14 @@ pub fn parse(args: []const []const u8) Action {
             opts.watch = true;
             continue;
         }
+        if (eql(arg, "--max-iterations")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            const n = std.fmt.parseInt(u32, v, 10) catch
+                return errAction("invalid integer for --max-iterations", v);
+            if (n == 0) return errAction("--max-iterations must be at least 1", v);
+            opts.max_iterations = n;
+            continue;
+        }
         if (eql(arg, "--session") or eql(arg, "-S")) {
             const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
             opts.session = v;
@@ -269,6 +282,10 @@ pub fn printHelp(w: anytype) !void {
         \\                        tokens exceed n (0 = unlimited)
         \\      --max-cost <usd>  abort the session when cumulative cost
         \\                        exceeds <usd> (e.g. 0.50; 0 = unlimited)
+        \\      --max-iterations <n>
+        \\                        max tool-use rounds per turn before
+        \\                        IterationBudgetExceeded (default: 10;
+        \\                        raise for bench harnesses)
         \\      --max-context <pct>
         \\                        auto-run /compact when cumulative input
         \\                        tokens reach <pct>% of the model's
@@ -571,4 +588,19 @@ test "parse: --watch sets the flag" {
 test "parse: watch defaults to false" {
     const o = try expectRun(parse(&.{ "velk", "hi" }));
     try testing.expect(!o.watch);
+}
+
+test "parse: --max-iterations sets the cap" {
+    const o = try expectRun(parse(&.{ "velk", "--max-iterations", "50", "hi" }));
+    try testing.expectEqual(@as(u32, 50), o.max_iterations);
+}
+
+test "parse: --max-iterations rejects 0" {
+    const e = try expectParseError(parse(&.{ "velk", "--max-iterations", "0", "hi" }));
+    try testing.expect(std.mem.indexOf(u8, e.message, "at least 1") != null);
+}
+
+test "parse: --max-iterations defaults to 0 (use session default)" {
+    const o = try expectRun(parse(&.{ "velk", "hi" }));
+    try testing.expectEqual(@as(u32, 0), o.max_iterations);
 }

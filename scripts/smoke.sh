@@ -327,6 +327,18 @@ MD
         env ANTHROPIC_API_KEY=sk-fake "$VELK" --watch
     unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
 
+    # --max-iterations parser surface. Reject 0; reject non-numeric.
+    # The full agent-loop integration with a high cap is exercised
+    # implicitly any time a multi-step fixture (diffwrite/, team/,
+    # spawnchild/) completes — those need >1 iteration.
+    SMOKE_EXPECT_STDERR="at least 1" run_case \
+        "max-iterations: --max-iterations 0 is rejected" 2 \
+        env ANTHROPIC_API_KEY=sk-fake "$VELK" --max-iterations 0 "hi"
+    SMOKE_EXPECT_STDERR="invalid integer" run_case \
+        "max-iterations: --max-iterations many is rejected" 2 \
+        env ANTHROPIC_API_KEY=sk-fake "$VELK" --max-iterations many "hi"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
     # Architect/coder split: --planner-model + --coder-model surfaces
     # an "architect/coder split" banner at startup. The mock backend
     # doesn't actually use a different model server-side — what we're

@@ -253,6 +253,7 @@ pub fn main(init: std.process.Init) !void {
                 .model = sub_default_model,
                 .max_tokens = opts.max_tokens,
                 .hook_io = init.io,
+                .max_iterations = if (opts.max_iterations > 0) opts.max_iterations else 5,
             };
 
             // Optional .gitignore — read once at startup. Failures
@@ -438,6 +439,7 @@ pub fn main(init: std.process.Init) !void {
                 .hook_io = init.io,
                 .max_wall_ms = opts.max_turn_ms,
                 .max_total_tokens = opts.max_turn_tokens,
+                .max_iterations = if (opts.max_iterations > 0) opts.max_iterations else 10,
             });
 
             if (opts.session) |name| {
