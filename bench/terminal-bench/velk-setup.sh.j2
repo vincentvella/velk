@@ -42,6 +42,11 @@ fetch() {
     fi
 }
 
+# Capture the caller's CWD so we can restore it; otherwise the
+# tmux session's working dir gets clobbered to wherever we extract,
+# and velk launches with the wrong CWD — which trips the lexical
+# path-safety check on tasks that operate inside /app.
+ORIG_CWD="$(pwd)"
 WORK="$(mktemp -d)"
 cd "$WORK"
 
@@ -58,7 +63,7 @@ fi
 tar -xzf velk.tar.gz
 install -Dm755 velk /usr/local/bin/velk
 
-cd /
+cd "$ORIG_CWD"
 rm -rf "$WORK"
 
 velk --version
