@@ -106,9 +106,11 @@ class VelkAgent(AbstractInstalledAgent):
             "VELK_BENCH_SYSTEM",
             (
                 "You are running unattended. No human is available to "
-                "answer questions or confirm actions. Make reasonable "
-                "choices and execute them through tool calls. End "
-                "your turn when the task is complete."
+                "answer questions, confirm actions, or supply missing "
+                "details. Do not ask clarifying questions; do not "
+                "describe what you would do — execute the work directly "
+                "through tool calls. End your turn only after the task "
+                "is complete."
             ),
         )
 

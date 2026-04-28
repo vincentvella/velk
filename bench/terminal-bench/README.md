@@ -13,6 +13,9 @@ velk runs inside the per-task Docker container and drives its own
 - **`velk-setup.sh.j2`** — installer template. Downloads the
   static linux-musl velk tarball from a GitHub release and drops
   it at `/usr/local/bin/velk`.
+- **`run-batch.sh`** — convenience runner that invokes `tb run`
+  and prints the tail of each task's `agent.log` afterwards so
+  you can see what each task actually did.
 
 ## Quickstart
 
@@ -21,16 +24,32 @@ git clone https://github.com/laude-institute/terminal-bench
 cd terminal-bench && uv sync
 
 export ANTHROPIC_API_KEY=sk-ant-...
-export VELK_VERSION=0.0.3   # or whatever's current
+export VELK_VERSION=0.0.4    # latest stable; see "Versioning" below
 
+# Single task:
 PYTHONPATH=/abs/path/to/velk/bench/terminal-bench \
     uv run tb run \
         --agent-import-path velk_agent:VelkAgent \
         --task-id hello-world \
         --dataset-path original-tasks
+
+# Or via the helper, which also tails each agent.log when done:
+TB_DIR=$(pwd) \
+    /abs/path/to/velk/bench/terminal-bench/run-batch.sh \
+    hello-world create-bucket regex-log
 ```
 
 For a full sweep, drop `--task-id …`.
+
+## Versioning
+
+velk uses **release candidate** tags during bench iteration. When
+a fix lands that would benefit from a fresh static-musl tarball,
+we cut `vX.Y.Z-rcN` (rc1, rc2, …) and bump `VELK_VERSION` to match.
+Once we're confident the fix is stable, the rc gets promoted to
+`vX.Y.Z` proper. Setting `VELK_VERSION=0.0.5-rc1` works the same
+way — the setup script downloads
+`velk-linux-{arch}-musl.tar.gz` from the matching release.
 
 ## Configuration
 
