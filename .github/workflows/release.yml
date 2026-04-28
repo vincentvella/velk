@@ -26,6 +26,13 @@ jobs:
             artifact: velk-linux-arm64
           - target: x86_64-linux
             artifact: velk-linux-x64
+          # Statically linked linux-musl builds for distro-agnostic
+          # distribution (Alpine, scratch containers, anywhere a
+          # glibc dep would bite).
+          - target: aarch64-linux-musl
+            artifact: velk-linux-arm64-musl
+          - target: x86_64-linux-musl
+            artifact: velk-linux-x64-musl
     steps:
       - uses: actions/checkout@v6
 

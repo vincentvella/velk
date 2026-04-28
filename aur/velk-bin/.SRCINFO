@@ -1,0 +1,16 @@
+pkgbase = velk-bin
+	pkgdesc = Zig 0.16 terminal AI harness (Anthropic + OpenAI, MCP, vim mode, OSC-52 clipboard)
+	pkgver = 0.0.1
+	pkgrel = 1
+	url = https://github.com/vincentvella/velk
+	arch = x86_64
+	arch = aarch64
+	license = Apache-2.0
+	provides = velk
+	conflicts = velk
+	source_x86_64 = velk-0.0.1-x86_64.tar.gz::https://github.com/vincentvella/velk/releases/download/v0.0.1/velk-linux-x64.tar.gz
+	source_aarch64 = velk-0.0.1-aarch64.tar.gz::https://github.com/vincentvella/velk/releases/download/v0.0.1/velk-linux-arm64.tar.gz
+	sha256sums_x86_64 = SKIP
+	sha256sums_aarch64 = SKIP
+
+pkgname = velk-bin

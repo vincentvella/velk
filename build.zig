@@ -6,6 +6,20 @@ const std = @import("std");
 // for defining build steps and express dependencies between them, allowing the
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
+/// Resolves an absolute install dir for `zig build install-local`.
+/// Honors `$XDG_BIN_HOME` then `$HOME/.local/bin`. Returns null when
+/// neither env var is available so the caller can surface a friendly
+/// diagnostic at step-run time. The returned slice is owned by `b`'s
+/// allocator; the build runner outlives the slice.
+fn resolveLocalBinDir(b: *std.Build) ?[]const u8 {
+    if (b.graph.environ_map.get("XDG_BIN_HOME")) |v| {
+        if (v.len > 0) return b.allocator.dupe(u8, v) catch null;
+    }
+    const home = b.graph.environ_map.get("HOME") orelse return null;
+    if (home.len == 0) return null;
+    return std.fmt.allocPrint(b.allocator, "{s}/.local/bin", .{home}) catch null;
+}
+
 pub fn build(b: *std.Build) void {
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
@@ -176,6 +190,33 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| mock_cmd.addArgs(args);
     const mock_step = b.step("mock", "Run the mock model server (Ctrl-C to stop)");
     mock_step.dependOn(&mock_cmd.step);
+
+    // `zig build install-local` installs the binary into the user's
+    // PATH without needing a tap or root. Honors `$XDG_BIN_HOME` (the
+    // XDG-formal home for user binaries), then `$HOME/.local/bin`, in
+    // that order. Implementation: build the binary via the standard
+    // install step, then `install` it (mkdir -p + cp) into the
+    // resolved absolute directory. The standard `zig build install`
+    // remains the no-op default.
+    const install_local_step = b.step("install-local", "Install velk into $XDG_BIN_HOME or ~/.local/bin");
+    if (resolveLocalBinDir(b)) |dest_dir| {
+        const dest_path = std.fmt.allocPrint(b.allocator, "{s}/velk", .{dest_dir}) catch dest_dir;
+        const cp_cmd = b.addSystemCommand(&.{ "install", "-d", dest_dir });
+        cp_cmd.step.dependOn(b.getInstallStep());
+        const cp_bin = b.addSystemCommand(&.{ "install", "-m", "0755" });
+        cp_bin.addArtifactArg(exe);
+        cp_bin.addArg(dest_path);
+        cp_bin.step.dependOn(&cp_cmd.step);
+        install_local_step.dependOn(&cp_bin.step);
+    } else {
+        // Defer the friendly diagnostic until the step actually runs;
+        // we don't want to spam the default-step build with it.
+        const fail = b.addSystemCommand(&.{
+            "sh", "-c",
+            "echo 'install-local: neither $XDG_BIN_HOME nor $HOME is set' >&2 && exit 1",
+        });
+        install_local_step.dependOn(&fail.step);
+    }
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

@@ -1,0 +1,24 @@
+# Maintainer: Vincent Vella <vincevella0@gmail.com>
+pkgname=velk-bin
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="Zig 0.16 terminal AI harness (Anthropic + OpenAI, MCP, vim mode, OSC-52 clipboard)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/vincentvella/velk"
+license=('Apache-2.0')
+provides=('velk')
+conflicts=('velk')
+source_x86_64=("velk-${pkgver}-x86_64.tar.gz::https://github.com/vincentvella/velk/releases/download/v${pkgver}/velk-linux-x64.tar.gz")
+source_aarch64=("velk-${pkgver}-aarch64.tar.gz::https://github.com/vincentvella/velk/releases/download/v${pkgver}/velk-linux-arm64.tar.gz")
+# Replace these with the actual sha256 values from
+# https://github.com/vincentvella/velk/releases/download/v<ver>/velk-linux-<arch>.tar.gz.sha256
+# The release.yml AUR job automates this on every tag (gated on
+# AUR_SSH_KEY); manual maintainers can fetch the .sha256 file and
+# substitute the digests here.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    install -Dm755 "${srcdir}/velk" "${pkgdir}/usr/bin/velk"
+    install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
