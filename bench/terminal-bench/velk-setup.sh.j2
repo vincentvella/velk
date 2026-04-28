@@ -66,4 +66,16 @@ install -Dm755 velk /usr/local/bin/velk
 cd "$ORIG_CWD"
 rm -rf "$WORK"
 
+# Workaround for a Zig 0.16 stdlib bug: std.Io.net.HostName.ResolvConf
+# uses takeSentinel('\n') which raises EndOfStream + bufferedLen != 0
+# (→ ResolvConfParseFailed) when /etc/resolv.conf lacks a final
+# newline. Several Terminal-Bench tasks (create-bucket via LocalStack,
+# any task that mucks with resolv.conf) ship the file without a
+# trailing newline and crash velk at the first DNS lookup. Append
+# one if missing — idempotent, harmless, side-effect only inside
+# this ephemeral container.
+if [ -s /etc/resolv.conf ] && [ "$(tail -c 1 /etc/resolv.conf)" != "" ]; then
+    printf '\n' >> /etc/resolv.conf 2>/dev/null || true
+fi
+
 velk --version
