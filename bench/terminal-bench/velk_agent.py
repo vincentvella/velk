@@ -86,11 +86,34 @@ class VelkAgent(AbstractInstalledAgent):
         max_cost = os.environ.get("VELK_MAX_COST", "1.00")
         max_turn_ms = os.environ.get("VELK_MAX_TURN_MS", "600000")
 
+        # System prompt nudging the model into autonomous-task mode.
+        # Without this, models default to a "chat with the user"
+        # demeanor — observed in v0.0.3's first batch run on the
+        # `create-bucket` task: the model produced the right
+        # commands, then asked clarifying questions instead of
+        # executing them. Override via $VELK_BENCH_SYSTEM if you
+        # want different framing.
+        system_prompt = os.environ.get(
+            "VELK_BENCH_SYSTEM",
+            (
+                "You are an autonomous agent running inside an ephemeral "
+                "Linux container with full root access. The user is not "
+                "available to answer questions — you must complete the "
+                "task on your own. Do not ask for confirmation; do not "
+                "ask clarifying questions. Use the bash, read_file, "
+                "write_file, and edit tools to inspect and modify the "
+                "filesystem as needed. When you believe the task is "
+                "complete, end your turn — the harness will run "
+                "automated tests to score your work."
+            ),
+        )
+
         cmd = (
             f"velk --no-tui"
             f" --provider {shlex.quote(provider)}"
             f" --model {shlex.quote(model)}"
             f" --mode bypass"
+            f" --system {shlex.quote(system_prompt)}"
             f" --max-iterations {shlex.quote(max_iters)}"
             f" --max-cost {shlex.quote(max_cost)}"
             f" --max-turn-ms {shlex.quote(max_turn_ms)}"
