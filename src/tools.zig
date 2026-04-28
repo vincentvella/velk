@@ -109,6 +109,8 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildWebSearch(arena, settings));
     try list.append(arena, try buildWorktree(arena, settings));
     try list.append(arena, try buildWritePlan(arena, settings));
+    try list.append(arena, try buildReadMemory(arena, settings));
+    try list.append(arena, try buildWriteMemory(arena, settings));
     if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
     if (settings.ask != null) try list.append(arena, try buildAskUserQuestion(arena, settings));
     if (settings.sub_agent != null) try list.append(arena, try buildTask(arena, settings));
@@ -1416,6 +1418,162 @@ fn getInt(value: std.json.Value, field: []const u8) !?i64 {
     };
 }
 
+// ───────── memory (memdir) ─────────
+
+const memory = @import("memory.zig");
+
+const read_memory_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "topic":{"type":"string","description":"Slug of the topic to read. Omit to get a list of all stored topics with sizes."}
+    \\ }}
+;
+
+const write_memory_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "topic":{"type":"string","description":"Topic name. Will be slugified to filename-safe form."},
+    \\   "content":{"type":"string","description":"Markdown body to store. Overwrites any prior content under this topic."}
+    \\ },
+    \\ "required":["topic","content"]}
+;
+
+pub fn buildReadMemory(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, read_memory_schema_json, .{});
+    return .{
+        .name = "read_memory",
+        .description = "Read persistent memory across velk sessions. With no `topic`, returns a catalog of all stored topics; with one, returns that topic's body. Memory lives at $XDG_DATA_HOME/velk/memdir/<topic>.md.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = readMemoryExecute,
+    };
+}
+
+fn readMemoryExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const topic_in = try getString(input, "topic");
+    if (topic_in) |raw| {
+        const env = settings.env_map orelse return errorOutput(arena, "read_memory: env_map not wired", .{});
+        const slug = memory.slugify(arena, raw) catch
+            return errorOutput(arena, "read_memory: topic '{s}' contains nothing storable", .{raw});
+        const body = memory.read(arena, settings.io, env, slug) catch |e|
+            return errorOutput(arena, "read_memory: read failed: {s}", .{@errorName(e)});
+        if (body == null) {
+            return .{
+                .text = try std.fmt.allocPrint(arena, "(no memory stored under '{s}')", .{slug}),
+                .is_error = false,
+            };
+        }
+        return .{ .text = body.?, .is_error = false };
+    }
+    const env2 = settings.env_map orelse return errorOutput(arena, "read_memory: env_map not wired", .{});
+    const entries = memory.list(arena, settings.io, env2) catch |e|
+        return errorOutput(arena, "read_memory: list failed: {s}", .{@errorName(e)});
+    if (entries.len == 0) {
+        return .{ .text = "(no memory stored yet — call write_memory to start)", .is_error = false };
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(arena, "{d} stored topic(s):\n", .{entries.len});
+    for (entries) |e| {
+        try buf.print(arena, "  {s} ({d} bytes)\n", .{ e.topic, e.bytes });
+    }
+    if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n') _ = buf.pop();
+    return .{ .text = buf.items, .is_error = false };
+}
+
+pub fn buildWriteMemory(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, write_memory_schema_json, .{});
+    return .{
+        .name = "write_memory",
+        .description = "Persist a markdown note across velk sessions. Stored at $XDG_DATA_HOME/velk/memdir/<topic>.md; overwrites any prior content under this topic. Use for facts, decisions, or context that should survive `/clear` and process restarts.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = writeMemoryExecute,
+    };
+}
+
+fn writeMemoryExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    if (settings.mode.refusesWrites()) {
+        return errorOutput(arena, "write_memory: refused — velk is in plan mode (read-only)", .{});
+    }
+    const raw_topic = (try getString(input, "topic")) orelse return errorOutput(arena, "write_memory: missing 'topic'", .{});
+    const content = (try getString(input, "content")) orelse return errorOutput(arena, "write_memory: missing 'content'", .{});
+    const slug = memory.slugify(arena, raw_topic) catch
+        return errorOutput(arena, "write_memory: topic '{s}' contains nothing storable", .{raw_topic});
+    const env = settings.env_map orelse return errorOutput(arena, "write_memory: env_map not wired", .{});
+    memory.write(arena, settings.io, env, slug, content) catch |e|
+        return errorOutput(arena, "write_memory: write failed: {s}", .{@errorName(e)});
+    return .{
+        .text = try std.fmt.allocPrint(arena, "wrote {d} byte(s) to memory topic '{s}'", .{ content.len, slug }),
+        .is_error = false,
+    };
+}
+
+// ───────── custom shell tool ─────────
+
+/// Spec for a user-declared shell tool. A new `tool.Tool` is built
+/// per spec at startup; the tool's input schema is empty (v1 has no
+/// argument substitution). Refused under plan mode like `bash`.
+pub const CustomToolDef = struct {
+    name: []const u8,
+    description: []const u8,
+    command: []const u8,
+};
+
+/// Per-tool context — the registry's tool slot points at this. It
+/// outlives the call so the closure-captured fields stay valid.
+const CustomToolCtx = struct {
+    settings: *const Settings,
+    spec: CustomToolDef,
+};
+
+const custom_schema_json: []const u8 =
+    \\{"type":"object","properties":{},"additionalProperties":false}
+;
+
+pub fn buildCustom(
+    arena: std.mem.Allocator,
+    settings: *const Settings,
+    spec: CustomToolDef,
+) !tool.Tool {
+    const ctx = try arena.create(CustomToolCtx);
+    ctx.* = .{ .settings = settings, .spec = spec };
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, custom_schema_json, .{});
+    return .{
+        .name = spec.name,
+        .description = spec.description,
+        .input_schema = schema,
+        .context = ctx,
+        .execute = customExecute,
+    };
+}
+
+fn customExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, _: std.json.Value) anyerror!tool.Output {
+    const c: *const CustomToolCtx = @ptrCast(@alignCast(ctx.?));
+    if (c.settings.mode.refusesWrites()) {
+        return errorOutput(arena, "{s}: refused — velk is in plan mode (read-only)", .{c.spec.name});
+    }
+    const result = runBash(arena, c.settings.io, c.spec.command, default_bash_timeout_ms) catch |e| switch (e) {
+        error.Timeout => return errorOutput(arena, "{s}: timed out after {d}ms", .{ c.spec.name, default_bash_timeout_ms }),
+        error.Canceled => return errorOutput(arena, "{s}: aborted", .{c.spec.name}),
+        else => return errorOutput(arena, "{s}: spawn failed: {s}", .{ c.spec.name, @errorName(e) }),
+    };
+    const exit_code: i32 = switch (result.term) {
+        .exited => |code| @intCast(code),
+        .signal => |s| -@as(i32, @intCast(@intFromEnum(s))),
+        else => -1,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "exit: {d}\n", .{exit_code});
+    if (result.stdout.len > 0) try out.print(arena, "--- stdout ---\n{s}", .{result.stdout});
+    if (result.stderr.len > 0) {
+        if (result.stdout.len > 0 and !std.mem.endsWith(u8, result.stdout, "\n")) try out.append(arena, '\n');
+        try out.print(arena, "--- stderr ---\n{s}", .{result.stderr});
+    }
+    return .{ .text = out.items, .is_error = exit_code != 0 };
+}
+
 // ───────── tests ─────────
 
 const testing = std.testing;
@@ -1543,6 +1701,60 @@ test "bash: captures stdout and exit code" {
     try testing.expect(!out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.text, "exit: 0") != null);
     try testing.expect(std.mem.indexOf(u8, out.text, "hi") != null);
+}
+
+test "custom: shells out to its configured command" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const t = try buildCustom(a, &settings, .{
+        .name = "say-hi",
+        .description = "echoes a known marker",
+        .command = "echo custom-tool-marker",
+    });
+    const empty: std.json.ObjectMap = .empty;
+    const out = try t.execute(t.context, a, .{ .object = empty });
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "exit: 0") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "custom-tool-marker") != null);
+}
+
+test "custom: refused under plan mode" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var settings = testSettings();
+    settings.mode = .plan;
+    const t = try buildCustom(a, &settings, .{
+        .name = "writes-something",
+        .description = "would write but plan mode refuses",
+        .command = "echo should-not-run",
+    });
+    const empty: std.json.ObjectMap = .empty;
+    const out = try t.execute(t.context, a, .{ .object = empty });
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "plan mode") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "writes-something") != null);
+}
+
+test "custom: nonzero exit marks is_error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const t = try buildCustom(a, &settings, .{
+        .name = "always-fails",
+        .description = "exits 7",
+        .command = "exit 7",
+    });
+    const empty: std.json.ObjectMap = .empty;
+    const out = try t.execute(t.context, a, .{ .object = empty });
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "exit: 7") != null);
 }
 
 test "bash: timeout kills a long-running command" {

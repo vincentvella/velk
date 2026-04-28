@@ -46,6 +46,19 @@ pub const Options = struct {
     max_turn_ms: u64 = 0,
     /// Per-turn cumulative-token cap (input + output). 0 = unlimited.
     max_turn_tokens: u64 = 0,
+    /// Session-wide USD cap. After every turn the running cost is
+    /// compared against this; on breach the TUI surfaces an abort
+    /// notice and exits. 0 = unlimited.
+    max_cost: f64 = 0,
+    /// Auto-compact threshold as a percentage of the model's known
+    /// context window (1..99). After every turn, if cumulative input
+    /// tokens / context_window >= threshold/100, /compact runs
+    /// automatically before the next turn. 0 = disabled.
+    max_context_pct: u8 = 0,
+    /// Named profile from settings.json. Values from the matching
+    /// profile layer between CLI flags (which still win) and the
+    /// base `defaults` block (which loses to the profile).
+    profile: ?[]const u8 = null,
 };
 
 pub const ParseError = struct {
@@ -135,8 +148,31 @@ pub fn parse(args: []const []const u8) Action {
                 return errAction("invalid integer for --max-turn-tokens", v);
             continue;
         }
+        if (eql(arg, "--max-cost")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.max_cost = std.fmt.parseFloat(f64, v) catch
+                return errAction("invalid number for --max-cost", v);
+            if (opts.max_cost < 0) return errAction("--max-cost must be non-negative", v);
+            continue;
+        }
+        if (eql(arg, "--max-context")) {
+            // Accept either "80" or "80%" — % is a common notation
+            // habit, but the value is a plain percentage either way.
+            const v_raw = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            const v: []const u8 = if (v_raw.len > 0 and v_raw[v_raw.len - 1] == '%') v_raw[0 .. v_raw.len - 1] else v_raw;
+            const pct = std.fmt.parseInt(u32, v, 10) catch
+                return errAction("invalid integer for --max-context", v_raw);
+            if (pct == 0 or pct > 99) return errAction("--max-context must be in 1..99", v_raw);
+            opts.max_context_pct = @intCast(pct);
+            continue;
+        }
         if (eql(arg, "--no-tui")) {
             opts.no_tui = true;
+            continue;
+        }
+        if (eql(arg, "--profile") or eql(arg, "-P")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.profile = v;
             continue;
         }
         if (eql(arg, "--session") or eql(arg, "-S")) {
@@ -203,6 +239,14 @@ pub fn printHelp(w: anytype) !void {
         \\      --max-turn-tokens <n>
         \\                        abort a turn if cumulative input+output
         \\                        tokens exceed n (0 = unlimited)
+        \\      --max-cost <usd>  abort the session when cumulative cost
+        \\                        exceeds <usd> (e.g. 0.50; 0 = unlimited)
+        \\      --max-context <pct>
+        \\                        auto-run /compact when cumulative input
+        \\                        tokens reach <pct>% of the model's
+        \\                        context window (1..99; 0 = disabled)
+        \\  -P, --profile <name>  apply a named profile from settings.json
+        \\                        (e.g. `-P review` for read-only flow)
         \\  -S, --session <name>  load/save chat history under
         \\                        $XDG_DATA_HOME/velk/sessions/<name>.json
         \\      --mcp <command>   spawn an MCP server (repeatable);
@@ -392,4 +436,69 @@ test "parse: unknown flag errors" {
 test "parse: extra positional errors" {
     const e = try expectParseError(parse(&.{ "velk", "first", "second" }));
     try testing.expectEqualStrings("second", e.arg.?);
+}
+
+test "parse: --max-cost parses float" {
+    const o = try expectRun(parse(&.{ "velk", "--max-cost", "0.5", "hi" }));
+    try testing.expectApproxEqAbs(@as(f64, 0.5), o.max_cost, 1e-9);
+}
+
+test "parse: --max-cost rejects negative" {
+    const e = try expectParseError(parse(&.{ "velk", "--max-cost", "-0.10", "hi" }));
+    try testing.expect(std.mem.indexOf(u8, e.message, "non-negative") != null);
+}
+
+test "parse: --max-cost rejects non-numeric" {
+    const e = try expectParseError(parse(&.{ "velk", "--max-cost", "free", "hi" }));
+    try testing.expect(std.mem.indexOf(u8, e.message, "invalid number") != null);
+}
+
+test "parse: --max-cost defaults to 0" {
+    const o = try expectRun(parse(&.{ "velk", "hi" }));
+    try testing.expectEqual(@as(f64, 0), o.max_cost);
+}
+
+test "parse: --max-context plain integer" {
+    const o = try expectRun(parse(&.{ "velk", "--max-context", "80", "hi" }));
+    try testing.expectEqual(@as(u8, 80), o.max_context_pct);
+}
+
+test "parse: --max-context with percent suffix" {
+    const o = try expectRun(parse(&.{ "velk", "--max-context", "75%", "hi" }));
+    try testing.expectEqual(@as(u8, 75), o.max_context_pct);
+}
+
+test "parse: --max-context rejects 0" {
+    const e = try expectParseError(parse(&.{ "velk", "--max-context", "0", "hi" }));
+    try testing.expect(std.mem.indexOf(u8, e.message, "1..99") != null);
+}
+
+test "parse: --max-context rejects 100" {
+    const e = try expectParseError(parse(&.{ "velk", "--max-context", "100", "hi" }));
+    try testing.expect(std.mem.indexOf(u8, e.message, "1..99") != null);
+}
+
+test "parse: --max-context rejects non-numeric" {
+    const e = try expectParseError(parse(&.{ "velk", "--max-context", "many", "hi" }));
+    try testing.expect(std.mem.indexOf(u8, e.message, "invalid integer") != null);
+}
+
+test "parse: --profile sets profile name" {
+    const o = try expectRun(parse(&.{ "velk", "--profile", "review", "hi" }));
+    try testing.expectEqualStrings("review", o.profile.?);
+}
+
+test "parse: -P short form" {
+    const o = try expectRun(parse(&.{ "velk", "-P", "fast", "hi" }));
+    try testing.expectEqualStrings("fast", o.profile.?);
+}
+
+test "parse: --profile missing value errors" {
+    const e = try expectParseError(parse(&.{ "velk", "--profile" }));
+    try testing.expectEqualStrings("--profile", e.arg.?);
+}
+
+test "parse: --profile defaults to null" {
+    const o = try expectRun(parse(&.{ "velk", "hi" }));
+    try testing.expect(o.profile == null);
 }

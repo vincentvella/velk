@@ -169,11 +169,25 @@ pub fn main(init: std.process.Init) !void {
             // Layer settings.json defaults underneath the CLI flags.
             // CLI flags WIN — overlaySettings only fills fields the
             // user didn't explicitly set on the command line.
-            const file_settings = settings_mod.loadAndMerge(arena, init.io, init.environ_map) catch |err| settings: {
+            var file_settings = settings_mod.loadAndMerge(arena, init.io, init.environ_map) catch |err| settings: {
                 try errw.print("velk: settings file: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 break :settings settings_mod.Settings{};
             };
+            // Profile overlay: a `-P review` rolls the named profile's
+            // Defaults onto the merged settings.defaults BEFORE we
+            // apply settings → CLI. Order: profile beats file
+            // defaults; CLI flags still win over both.
+            if (raw_opts.profile) |pname| {
+                if (file_settings.findProfile(pname)) |pdef| {
+                    file_settings.applyDefaults(pdef);
+                    try errw.print("velk: profile '{s}' applied\n", .{pname});
+                    try errw.flush();
+                } else {
+                    try errw.print("velk: profile '{s}' not found in settings.json — using base defaults\n", .{pname});
+                    try errw.flush();
+                }
+            }
             const opts = applySettingsToOptions(arena, raw_opts, file_settings);
 
             const holder = setupProvider(arena, init, errw, opts) catch |err| {
@@ -253,6 +267,40 @@ pub fn main(init: std.process.Init) !void {
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 
+            // User-declared shell tools from settings.json. Append
+            // after built-ins; refuse on name collision so users
+            // can't accidentally shadow `bash` or `read_file`. Each
+            // collision surfaces as a startup notice and the offender
+            // is dropped, not registered.
+            const custom_tools = blk: {
+                if (file_settings.custom_tools.len == 0) break :blk &[_]tool.Tool{};
+                var ct: std.ArrayList(tool.Tool) = .empty;
+                outer: for (file_settings.custom_tools) |spec| {
+                    for (builtin_tools) |bt| {
+                        if (std.mem.eql(u8, bt.name, spec.name)) {
+                            try errw.print("velk: custom tool '{s}' shadows a built-in — skipping\n", .{spec.name});
+                            try errw.flush();
+                            continue :outer;
+                        }
+                    }
+                    const t = tools.buildCustom(arena, settings, .{
+                        .name = spec.name,
+                        .description = spec.description,
+                        .command = spec.command,
+                    }) catch |e| {
+                        try errw.print("velk: custom tool '{s}' build failed: {s}\n", .{ spec.name, @errorName(e) });
+                        try errw.flush();
+                        continue :outer;
+                    };
+                    try ct.append(arena, t);
+                }
+                break :blk ct.items;
+            };
+            if (custom_tools.len > 0) {
+                try errw.print("velk: custom · {d} tool(s) added from settings.json\n", .{custom_tools.len});
+                try errw.flush();
+            }
+
             // Spawn any MCP servers the user passed via --mcp <cmd>;
             // their tools merge into the registry alongside built-ins.
             // Copy the cli's mcp_servers into the arena first (the cli
@@ -261,6 +309,12 @@ pub fn main(init: std.process.Init) !void {
             defer if (mcp_servers) |*s| s.deinit(init.io);
 
             var tool_set: []const tool.Tool = builtin_tools;
+            if (custom_tools.len > 0) {
+                const merged = try arena.alloc(tool.Tool, tool_set.len + custom_tools.len);
+                @memcpy(merged[0..tool_set.len], tool_set);
+                @memcpy(merged[tool_set.len..], custom_tools);
+                tool_set = merged;
+            }
             if (opts.mcp_servers.len > 0) {
                 const argvs = try arena.alloc([]const []const u8, opts.mcp_servers.len);
                 for (opts.mcp_servers, 0..) |cmd, i| {
@@ -272,9 +326,9 @@ pub fn main(init: std.process.Init) !void {
                 mcp_servers = servers;
 
                 if (servers.tools.len > 0) {
-                    const merged = try arena.alloc(tool.Tool, builtin_tools.len + servers.tools.len);
-                    @memcpy(merged[0..builtin_tools.len], builtin_tools);
-                    @memcpy(merged[builtin_tools.len..], servers.tools);
+                    const merged = try arena.alloc(tool.Tool, tool_set.len + servers.tools.len);
+                    @memcpy(merged[0..tool_set.len], tool_set);
+                    @memcpy(merged[tool_set.len..], servers.tools);
                     tool_set = merged;
                 }
 
@@ -428,7 +482,7 @@ pub fn main(init: std.process.Init) !void {
             const had_stale_lock = lockfile.touchAndCheckStale(arena, init.io, init.environ_map) catch false;
             defer lockfile.release(init.io, arena, init.environ_map);
 
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate, settings, had_stale_lock) catch |err| {
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate, settings, had_stale_lock, opts.max_cost, opts.max_context_pct) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);

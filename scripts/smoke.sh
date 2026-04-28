@@ -221,8 +221,8 @@ JSON
     # sub-agent dispatchers `task` + `team` (both work headlessly).
     # `todo_write` and `ask_user_question` need a TUI panel and are
     # NOT registered here.
-    SMOKE_EXPECT_STDERR="tools=13" run_case \
-        "worktree + write_plan + task + team registered alongside the 9 builtins" 0 \
+    SMOKE_EXPECT_STDERR="tools=15" run_case \
+        "worktree + write_plan + task + team + read_memory + write_memory registered alongside the 9 builtins" 0 \
         env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "anything"
@@ -315,6 +315,120 @@ MD
             "$VELK_ABS" --no-tui "anything"
     popd >/dev/null
     rm -rf "$SKILLS_TMP"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
+    # Memory tools (memdir): a turn that triggers the `write_memory`
+    # tool against a tmp XDG_DATA_HOME lands a markdown file at
+    # `<tmp>/velk/memdir/smoke-test-topic.md`. Confirms end-to-end:
+    # tool registration + slugify + on-disk write.
+    MEMDIR_TMP="$(mktemp -d)"
+    SMOKE_EXPECT_STDERR="wrote" run_case \
+        "memory: write_memory tool persists a markdown note" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "XDG_DATA_HOME=$MEMDIR_TMP" \
+            "$VELK" --no-tui "please writemem"
+    if [[ ! -f "$MEMDIR_TMP/velk/memdir/smoke-test-topic.md" ]]; then
+        echo "FAIL: memory: file not landed at expected path"
+        FAIL=$((FAIL + 1))
+        FAILED_CASES+=("memory: file not landed at expected path")
+    elif ! grep -qF "persistent-memo-marker" "$MEMDIR_TMP/velk/memdir/smoke-test-topic.md"; then
+        echo "FAIL: memory: file content mismatch"
+        FAIL=$((FAIL + 1))
+        FAILED_CASES+=("memory: file content mismatch")
+    else
+        echo "PASS: memory: file persisted at expected path with expected content"
+        PASS=$((PASS + 1))
+    fi
+    rm -rf "$MEMDIR_TMP"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
+    # Custom shell tools: a project-level .velk/settings.json with a
+    # `tools` array adds those entries to the registry. The startup
+    # banner reports the count; --debug reports tools=14 (13 builtin
+    # in headless mode + 1 custom). A name collision with a built-in
+    # surfaces a clear skip notice.
+    CUSTOM_TMP="$(mktemp -d)"
+    mkdir -p "$CUSTOM_TMP/.velk"
+    cat >"$CUSTOM_TMP/.velk/settings.json" <<'JSON'
+{
+  "tools": [
+    {"name": "say_hi", "command": "echo hi-from-custom-tool", "description": "Echo a hi marker"}
+  ]
+}
+JSON
+    VELK_ABS="$(cd "$(dirname "$VELK")" && pwd)/$(basename "$VELK")"
+    pushd "$CUSTOM_TMP" >/dev/null
+    SMOKE_EXPECT_STDERR="custom · 1 tool(s) added" run_case \
+        "custom-tools: registered + banner reports count" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            HOME="$CUSTOM_TMP" \
+            XDG_CONFIG_HOME="$CUSTOM_TMP/empty" \
+            "$VELK_ABS" --no-tui "anything"
+    # NOTE: this case uses --debug, which makes std.debug.print
+    # interleave with errw and clobber earlier buffered banner
+    # output when stderr is a regular file. The custom-tools
+    # banner check above runs without --debug; here we only need
+    # to confirm `tools=14` lands.
+    SMOKE_EXPECT_STDERR="tools=16" run_case \
+        "custom-tools: tool count bumps from 15 → 16" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            HOME="$CUSTOM_TMP" \
+            XDG_CONFIG_HOME="$CUSTOM_TMP/empty" \
+            "$VELK_ABS" --no-tui --debug "anything"
+
+    # Name collision: a custom tool with the same name as a built-in
+    # is skipped + flagged.
+    cat >"$CUSTOM_TMP/.velk/settings.json" <<'JSON'
+{
+  "tools": [
+    {"name": "bash", "command": "true", "description": "shadow attempt"}
+  ]
+}
+JSON
+    SMOKE_EXPECT_STDERR="custom tool 'bash' shadows a built-in" run_case \
+        "custom-tools: name collision with built-in is rejected" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            HOME="$CUSTOM_TMP" \
+            XDG_CONFIG_HOME="$CUSTOM_TMP/empty" \
+            "$VELK_ABS" --no-tui "anything"
+    popd >/dev/null
+    rm -rf "$CUSTOM_TMP"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
+    # Profiles v1: a project-level .velk/settings.json with a `profiles`
+    # block selected via `-P <name>` surfaces an "applied" banner; a
+    # missing profile name surfaces a clear "not found" warning.
+    PROFILE_TMP="$(mktemp -d)"
+    mkdir -p "$PROFILE_TMP/.velk"
+    cat >"$PROFILE_TMP/.velk/settings.json" <<'JSON'
+{
+  "profiles": {
+    "review": { "model": "claude-sonnet-4-6", "system": "be terse" }
+  }
+}
+JSON
+    VELK_ABS="$(cd "$(dirname "$VELK")" && pwd)/$(basename "$VELK")"
+    pushd "$PROFILE_TMP" >/dev/null
+    SMOKE_EXPECT_STDERR="profile 'review' applied" run_case \
+        "profiles: -P review applies named profile" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            HOME="$PROFILE_TMP" \
+            XDG_CONFIG_HOME="$PROFILE_TMP/empty" \
+            "$VELK_ABS" --no-tui -P review "anything"
+    SMOKE_EXPECT_STDERR="profile 'nope' not found" run_case \
+        "profiles: -P with unknown name warns" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            HOME="$PROFILE_TMP" \
+            XDG_CONFIG_HOME="$PROFILE_TMP/empty" \
+            "$VELK_ABS" --no-tui -P nope "anything"
+    popd >/dev/null
+    rm -rf "$PROFILE_TMP"
     unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
 
     kill "$MOCK_PID" 2>/dev/null || true

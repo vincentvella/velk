@@ -487,14 +487,34 @@ def run_slash_cases(bin_path: Path) -> None:
         tui.send_line("/system clear")
         case("/system clear drops prompt", tui.wait_for("System prompt cleared"))
 
+        # /style — output styles (Phase 13). With no args, show
+        # current + list catalog. Picking a style updates the
+        # session prompt; clear restores default. The catalog
+        # rendering uses unique description fragments so we can
+        # match around vaxis's cell-diff renderer (which fragments
+        # the byte stream on partial-line updates).
+        tui.send_line("/style")
+        case(
+            "/style with no args lists catalog",
+            tui.wait_for("no extra constraints")
+            and tui.saw("short answers, no preamble", screen=True)
+            and tui.saw("explain reasoning step by step", screen=True),
+        )
+        tui.send_line("/style concise")
+        case("/style sets a known style", tui.wait_for("set to 'concise'", screen=True))
+        tui.send_line("/style typoed")
+        case("/style errors on unknown name", tui.wait_for("unknown style 'typoed'"))
+        tui.send_line("/style clear")
+        case("/style clear restores default", tui.wait_for("Output style cleared"))
+
         tui.send_line("/copy")
-        case("/copy with no assistant text errors politely", tui.wait_for("Nothing to copy"))
+        case("/copy with no assistant text errors politely", tui.wait_for("Nothing to copy", screen=True))
 
         tui.send_line("/notarealthing")
         case("unknown command flagged", tui.wait_for("unknown command: /notarealthing"))
 
         tui.send_line("/clear")
-        case("/clear drops scrollback", tui.wait_for("Cleared scrollback"))
+        case("/clear drops scrollback", tui.wait_for("Cleared scrollback", screen=True))
 
         # /resume with no args lists saved sessions; with no XDG dir
         # set the test inherits the dev's $XDG_DATA_HOME, but we
@@ -901,6 +921,81 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
                 tui.close(signum=signal.SIGKILL)
 
 
+def run_max_cost_cases(bin_path: Path, fixtures_dir: Path) -> None:
+    """Verify --max-cost <usd> trips after the first turn when the cap
+    is set lower than a single turn's spend. The default mock fixture
+    streams 12 input / 7 output tokens on claude-opus-4-7, which costs
+    ~$0.000235 — a cap of 0.0001 is below that, so the second prompt
+    must never reach the model: the TUI surfaces the abort notice and
+    exits the event loop."""
+    print()
+    print(f"tui-test: --max-cost cases against mock (fixtures={fixtures_dir})")
+    with Mock(fixtures_dir) as mock:
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": "sk-fake",
+            "ANTHROPIC_BASE_URL": mock.anthropic_url,
+            "VELK_NOTIFY": "0",
+        }
+        tui = TUI([str(bin_path), "--max-cost", "0.0001"], env=env)
+        try:
+            case("max-cost: repl banner", tui.wait_for("velk REPL"))
+            tui.send_line("hi")
+            case(
+                "max-cost: first turn streams normally",
+                tui.wait_for("Mock reply from velk-mock-server", screen=True, timeout=3.0),
+            )
+            case(
+                "max-cost: budget-exceeded notice surfaces after the turn",
+                tui.wait_for("[max-cost]", screen=True, timeout=3.0),
+            )
+            case(
+                "max-cost: notice mentions the cap",
+                "exceeded cap" in tui.screen(),
+            )
+        finally:
+            if tui.alive():
+                tui.close(signum=signal.SIGKILL)
+
+
+def run_max_context_cases(bin_path: Path, fixtures_dir: Path) -> None:
+    """Verify --max-context <pct> auto-runs /compact after a turn whose
+    cumulative input tokens reach the threshold. The `bigturn.sse`
+    fixture reports 199_000 input tokens; against opus-4-7's 200K
+    context window that's 99.5%, so any threshold ≤ 99 trips. The
+    /compact call routes to summarize.sse via the canned summarize
+    keyword in the synthetic prompt — we look for both the auto-
+    compact label and the summary marker."""
+    print()
+    print(f"tui-test: --max-context auto-compact cases (fixtures={fixtures_dir})")
+    with Mock(fixtures_dir) as mock:
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": "sk-fake",
+            "ANTHROPIC_BASE_URL": mock.anthropic_url,
+            "VELK_NOTIFY": "0",
+        }
+        tui = TUI([str(bin_path), "--max-context", "80"], env=env)
+        try:
+            case("max-context: repl banner", tui.wait_for("velk REPL"))
+            tui.send_line("please bigturn")
+            case(
+                "max-context: turn streams normally",
+                tui.wait_for("bigturn-reply", screen=True, timeout=5.0),
+            )
+            case(
+                "max-context: auto-compact label appears",
+                tui.wait_for("[auto-compact 80%]", screen=True, timeout=5.0),
+            )
+            case(
+                "max-context: history replaced with summary",
+                tui.wait_for("compact-summary-marker", screen=True, timeout=5.0),
+            )
+        finally:
+            if tui.alive():
+                tui.close(signum=signal.SIGKILL)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bin", type=Path, default=Path("zig-out/bin/velk"))
@@ -917,6 +1012,8 @@ def main() -> int:
     run_slash_cases(args.bin)
     run_turn_cases(args.bin, args.fixtures)
     run_plan_mode_cases(args.bin, args.fixtures)
+    run_max_cost_cases(args.bin, args.fixtures)
+    run_max_context_cases(args.bin, args.fixtures)
 
     print()
     print(f"tui-test: {PASS} passed, {FAIL} failed")

@@ -55,6 +55,34 @@ pub fn priceFor(model: []const u8) ?PriceMillion {
     return null;
 }
 
+/// Maximum context window (in tokens) for a known model id. Returned
+/// as `null` for unknown ids — callers should skip auto-compaction
+/// rather than guess. Snapshots from public docs as of 2026-04; patches
+/// welcome. Like `priceFor`, prefix-matched so versioned ids resolve.
+pub fn contextWindowFor(model: []const u8) ?u64 {
+    const CtxEntry = struct { prefix: []const u8, tokens: u64 };
+    const ctx_table = [_]CtxEntry{
+        // Anthropic: Opus / Sonnet / Haiku 4.x ship with 200K, plus
+        // an opt-in 1M context tier on Sonnet 4.5+ via header. We
+        // assume the default 200K here — auto-compact is meant to
+        // protect users from the *default* limit.
+        .{ .prefix = "claude-opus-4", .tokens = 200_000 },
+        .{ .prefix = "claude-sonnet-4", .tokens = 200_000 },
+        .{ .prefix = "claude-haiku-4", .tokens = 200_000 },
+        .{ .prefix = "claude-haiku-3", .tokens = 200_000 },
+        // OpenAI GPT-5 family: 400K input window per public docs.
+        .{ .prefix = "gpt-5", .tokens = 400_000 },
+        .{ .prefix = "gpt-4o", .tokens = 128_000 },
+        .{ .prefix = "gpt-4.1", .tokens = 1_000_000 },
+        .{ .prefix = "o1", .tokens = 200_000 },
+        .{ .prefix = "o3", .tokens = 200_000 },
+    };
+    for (ctx_table) |entry| {
+        if (std.mem.startsWith(u8, model, entry.prefix)) return entry.tokens;
+    }
+    return null;
+}
+
 /// USD cost for a turn. Cache reads are billed at the cache_read rate;
 /// cache writes at the cache_write_5m rate; everything else at the base
 /// input rate. Output is straight output rate. Returns null for unknown
@@ -92,4 +120,18 @@ test "turnCost: cache reads are cheap" {
     // Sonnet 4.5: 100 * 3/1M + 10000 * 0.30/1M + 200 * 15/1M = 0.0003 + 0.003 + 0.003 = 0.0063
     const cost = turnCost("claude-sonnet-4-5", u).?;
     try testing.expectApproxEqAbs(@as(f64, 0.0063), cost, 1e-9);
+}
+
+test "contextWindowFor: matches versioned anthropic ids" {
+    try testing.expectEqual(@as(?u64, 200_000), contextWindowFor("claude-opus-4-7"));
+    try testing.expectEqual(@as(?u64, 200_000), contextWindowFor("claude-sonnet-4-6-20260101"));
+    try testing.expectEqual(@as(?u64, 200_000), contextWindowFor("claude-haiku-4-5"));
+}
+
+test "contextWindowFor: matches openai gpt-5" {
+    try testing.expectEqual(@as(?u64, 400_000), contextWindowFor("gpt-5-pro"));
+}
+
+test "contextWindowFor: returns null for unknown" {
+    try testing.expectEqual(@as(?u64, null), contextWindowFor("model-from-the-future"));
 }

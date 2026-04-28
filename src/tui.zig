@@ -24,6 +24,7 @@ const todos = @import("todos.zig");
 const ask = @import("ask.zig");
 const tools_mod = @import("tools.zig");
 const permissions = @import("permissions.zig");
+const styles = @import("styles.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -337,6 +338,32 @@ const Tui = struct {
     /// can mutate the permissions mode at runtime (`/exec` toggle).
     /// Null in headless smoke harnesses.
     tools_settings: ?*tools_mod.Settings = null,
+    /// Session-wide USD cap. 0 = unlimited. Compared against
+    /// `session_cost_usd` after every turn; on breach we surface a
+    /// notice and exit the event loop.
+    max_cost_usd: f64 = 0,
+    /// Running USD total for the session. Each `pushUsageNotice`
+    /// folds in `cost.turnCost(model, usage)` if known. Reset by
+    /// `/clear` alongside `cumulative_usage`.
+    session_cost_usd: f64 = 0,
+    /// Set by `pushUsageNotice` when `session_cost_usd` exceeds
+    /// `max_cost_usd`. The main event loop checks this in `a_done`
+    /// and breaks out.
+    budget_exceeded: bool = false,
+    /// Auto-compact threshold as a percentage of the model's known
+    /// context window (1..99). 0 = disabled. Read by `a_done` after
+    /// every turn; on breach the TUI runs `compactNow` synchronously
+    /// before returning control to the input loop.
+    max_context_pct: u8 = 0,
+    /// User's *base* system prompt — what `/system <text>` writes and
+    /// `--system` originally seeded. Output styles layer a suffix on
+    /// top of this without mutating the base, so toggling between
+    /// styles gives a clean swap. Initialized from `sess.config.system`
+    /// at startup.
+    base_system: ?[]const u8 = null,
+    /// Active output style. `null` means "default" — no suffix is
+    /// applied. Mutated by the `/style` slash command.
+    current_style: ?styles.Style = null,
 
     /// Adjust `scroll_offset` so `nav_cursor.line` is on screen. Must
     /// be called after touching `nav_cursor.line`. Uses the most recent
@@ -823,6 +850,73 @@ const Tui = struct {
         }}, .{ .row_offset = row, .wrap = .none });
     }
 
+    /// Synchronous summarize-and-replace. Caller must guarantee
+    /// `turn == null` and `sess.messages.items.len > 0`. `label` is
+    /// used as the prefix on the in-progress / error / completion
+    /// notices so the user knows whether this came from `/compact`
+    /// or `--max-context` auto-trigger. Resets cumulative_usage
+    /// because the new history is a single short summary message.
+    fn compactNow(self: *Tui, label: []const u8) !void {
+        const start_msg = try std.fmt.allocPrint(self.arena, "{s}: summarizing… (UI is paused for the duration of the call)", .{label});
+        try self.pushBlock(.notice, start_msg);
+        try self.render();
+
+        var harvest: CompactSink = .{ .arena = self.arena };
+        var msgs: std.ArrayList(provider_mod.Message) = .empty;
+        try msgs.appendSlice(self.arena, self.sess.messages.items);
+        try msgs.append(self.arena, try provider_mod.textMessage(self.arena, .user, compact_prompt));
+
+        const req: provider_mod.Request = .{
+            .model = self.model,
+            .max_tokens = self.sess.config.max_tokens,
+            .system = self.sess.config.system,
+            .messages = msgs.items,
+            .tools = &.{},
+        };
+
+        self.sess.provider.stream(req, .{
+            .ctx = &harvest,
+            .onText = CompactSink.cb,
+            .onToolUse = CompactSink.noop,
+            .onUsage = CompactSink.noopUsage,
+            .onStop = CompactSink.noopStop,
+        }) catch |err| {
+            const msg = try std.fmt.allocPrint(self.arena, "{s} failed: {s}", .{ label, @errorName(err) });
+            try self.pushBlock(.tool_result_error, msg);
+            return;
+        };
+
+        if (harvest.text.items.len == 0) {
+            const msg = try std.fmt.allocPrint(self.arena, "{s}: model returned an empty summary.", .{label});
+            try self.pushBlock(.tool_result_error, msg);
+            return;
+        }
+
+        const summary_owned = try self.arena.dupe(u8, harvest.text.items);
+        const synthetic = try std.fmt.allocPrint(
+            self.arena,
+            "(Previous conversation summary)\n{s}",
+            .{summary_owned},
+        );
+        self.sess.messages.clearRetainingCapacity();
+        try self.sess.messages.append(
+            self.arena,
+            try provider_mod.textMessage(self.arena, .user, synthetic),
+        );
+        // Cumulative-usage reset: the next turn rebuilds context
+        // from a single short message, so anchoring `% of context`
+        // at zero is the right baseline for further auto-compact
+        // checks.
+        self.cumulative_usage = .{};
+
+        const notice = try std.fmt.allocPrint(
+            self.arena,
+            "{s}: replaced history with a {d}-char summary.\n\n{s}",
+            .{ label, summary_owned.len, summary_owned },
+        );
+        try self.pushBlock(.notice, notice);
+    }
+
     fn pushUsageNotice(self: *Tui, usage: provider_mod.Usage) !void {
         if (usage.input_tokens == 0 and usage.output_tokens == 0) return;
         self.cumulative_usage.input_tokens += usage.input_tokens;
@@ -837,9 +931,19 @@ const Tui = struct {
         const this_turn_cost: ?f64 = cost.turnCost(self.model, usage);
         if (this_turn_cost) |c| {
             try buf.print(self.arena, " · ${d:.4}", .{c});
+            self.session_cost_usd += c;
         }
         try buf.append(self.arena, ']');
         try self.pushBlock(.notice, buf.items);
+
+        // Session-wide USD budget. We intentionally check AFTER the
+        // turn lands (rather than aborting mid-turn) so partial work
+        // still commits and the user has a clean picture of what the
+        // session cost. `budget_exceeded` is read in the event loop's
+        // `a_done` handler.
+        if (costBudgetExceeded(self.session_cost_usd, self.max_cost_usd)) {
+            self.budget_exceeded = true;
+        }
 
         // Append to the persistent cost log (best-effort: a write
         // failure here mustn't break the turn, just like notify).
@@ -863,6 +967,26 @@ const Tui = struct {
 /// we only render Latin + a handful of single-cell box-drawing /
 /// braille glyphs — wide East-Asian + emoji would over-count, but we
 /// don't render those here.
+/// True when the running session cost has surpassed the user's cap.
+/// `cap == 0` means "unlimited" — never trips. The comparison is
+/// strict so a cap exactly equal to a single turn's spend is still
+/// allowed; one cent over the cap is the abort condition.
+fn costBudgetExceeded(running_usd: f64, cap_usd: f64) bool {
+    if (cap_usd <= 0) return false;
+    return running_usd > cap_usd;
+}
+
+/// True when cumulative input tokens are at or above
+/// `pct%` of the model's context window. `pct == 0`, an unknown
+/// model (`window_tokens == 0`), or zero input tokens all return
+/// false — auto-compact stays inert in those cases.
+fn shouldAutoCompact(input_tokens: u64, window_tokens: u64, pct: u8) bool {
+    if (pct == 0 or window_tokens == 0 or input_tokens == 0) return false;
+    // Compare via cross-multiplication so we don't lose precision on
+    // very large windows (`gpt-4.1` claims 1M tokens).
+    return input_tokens * 100 >= window_tokens * @as(u64, pct);
+}
+
 fn displayWidth(text: []const u8) usize {
     var n: usize = 0;
     for (text) |b| {
@@ -1325,6 +1449,8 @@ fn slashClear(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     c.tui.assistant_buf.clearRetainingCapacity();
     c.tui.has_open_assistant = false;
     c.tui.cumulative_usage = .{};
+    c.tui.session_cost_usd = 0;
+    c.tui.budget_exceeded = false;
     c.tui.scroll_offset = 0;
     try c.tui.pushBlock(.notice, "Cleared scrollback and conversation history.");
     return .handled;
@@ -1347,8 +1473,11 @@ fn slashCost(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
         if (u.cache_read_tokens > 0 or u.cache_creation_tokens > 0) {
             try buf.print(c.tui.arena, " · cache {d} read / {d} write", .{ u.cache_read_tokens, u.cache_creation_tokens });
         }
-        if (cost.turnCost(c.tui.model, u)) |total| {
-            try buf.print(c.tui.arena, " · ${d:.4}", .{total});
+        if (c.tui.session_cost_usd > 0) {
+            try buf.print(c.tui.arena, " · ${d:.4}", .{c.tui.session_cost_usd});
+        }
+        if (c.tui.max_cost_usd > 0) {
+            try buf.print(c.tui.arena, " (cap ${d:.4})", .{c.tui.max_cost_usd});
         }
         try buf.append(c.tui.arena, '\n');
     }
@@ -1423,13 +1552,14 @@ fn slashModel(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
 fn slashSystem(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
     const c = slashCtx(ctx);
     if (args.len == 0) {
-        const cur = c.tui.sess.config.system orelse "(none)";
+        const cur = c.tui.base_system orelse "(none)";
         const msg = try std.fmt.allocPrint(c.tui.arena, "System prompt: {s}\nUsage: /system <text> (or /system clear)", .{cur});
         try c.tui.pushBlock(.notice, msg);
         return .handled;
     }
     if (std.mem.eql(u8, args, "clear")) {
-        c.tui.sess.config.system = null;
+        c.tui.base_system = null;
+        try rebuildEffectiveSystem(c.tui);
         try c.tui.pushBlock(.notice, "System prompt cleared.");
         return .handled;
     }
@@ -1442,8 +1572,47 @@ fn slashSystem(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
         text = text[1 .. text.len - 1];
     }
     const owned = try c.tui.arena.dupe(u8, text);
-    c.tui.sess.config.system = owned;
+    c.tui.base_system = owned;
+    try rebuildEffectiveSystem(c.tui);
     try c.tui.pushBlock(.notice, "System prompt updated.");
+    return .handled;
+}
+
+/// Apply the active style on top of `base_system` and write the
+/// result into `sess.config.system`. Called after either piece
+/// changes so the next turn picks up the layered prompt.
+fn rebuildEffectiveSystem(t: *Tui) !void {
+    t.sess.config.system = try styles.apply(t.arena, t.base_system, t.current_style);
+}
+
+fn slashStyle(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    if (args.len == 0) {
+        var buf: std.ArrayList(u8) = .empty;
+        const cur_name: []const u8 = if (c.tui.current_style) |s| s.name else "default";
+        try buf.print(c.tui.arena, "Output style: {s}\nAvailable:\n", .{cur_name});
+        for (styles.catalog) |s| {
+            try buf.print(c.tui.arena, "  {s:<12} {s}\n", .{ s.name, s.description });
+        }
+        if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n') _ = buf.pop();
+        try c.tui.pushBlock(.notice, buf.items);
+        return .handled;
+    }
+    if (std.mem.eql(u8, args, "clear") or std.mem.eql(u8, args, "default")) {
+        c.tui.current_style = null;
+        try rebuildEffectiveSystem(c.tui);
+        try c.tui.pushBlock(.notice, "Output style cleared (now: default).");
+        return .handled;
+    }
+    const picked = styles.find(args) orelse {
+        const msg = try std.fmt.allocPrint(c.tui.arena, "/style: unknown style '{s}' — try /style with no args to list.", .{args});
+        try c.tui.pushBlock(.tool_result_error, msg);
+        return .handled;
+    };
+    c.tui.current_style = picked;
+    try rebuildEffectiveSystem(c.tui);
+    const msg = try std.fmt.allocPrint(c.tui.arena, "Output style set to '{s}'.", .{picked.name});
+    try c.tui.pushBlock(.notice, msg);
     return .handled;
 }
 
@@ -1577,68 +1746,7 @@ fn slashCompact(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
         try c.tui.pushBlock(.notice, "/compact: a turn is in flight — wait for it to finish.");
         return .handled;
     }
-
-    try c.tui.pushBlock(.notice, "/compact: summarizing… (UI is paused for the duration of the call)");
-    try c.tui.render();
-
-    // Synchronous call on the main thread for v1. Future work: move
-    // to a worker so the spinner keeps animating + Ctrl-C cancels.
-    var harvest: CompactSink = .{ .arena = c.tui.arena };
-
-    // Build a request that's the existing history + a synthetic user
-    // turn asking for the summary. We deliberately don't pass tools
-    // — the summary should be plain text.
-    var msgs: std.ArrayList(provider_mod.Message) = .empty;
-    try msgs.appendSlice(c.tui.arena, c.tui.sess.messages.items);
-    try msgs.append(c.tui.arena, try provider_mod.textMessage(c.tui.arena, .user, compact_prompt));
-
-    const req: provider_mod.Request = .{
-        .model = c.tui.model,
-        .max_tokens = c.tui.sess.config.max_tokens,
-        .system = c.tui.sess.config.system,
-        .messages = msgs.items,
-        .tools = &.{},
-    };
-
-    c.tui.sess.provider.stream(req, .{
-        .ctx = &harvest,
-        .onText = CompactSink.cb,
-        .onToolUse = CompactSink.noop,
-        .onUsage = CompactSink.noopUsage,
-        .onStop = CompactSink.noopStop,
-    }) catch |err| {
-        const msg = try std.fmt.allocPrint(c.tui.arena, "/compact failed: {s}", .{@errorName(err)});
-        try c.tui.pushBlock(.tool_result_error, msg);
-        return .handled;
-    };
-
-    if (harvest.text.items.len == 0) {
-        try c.tui.pushBlock(.tool_result_error, "/compact: model returned an empty summary.");
-        return .handled;
-    }
-
-    // Replace history with a single user message containing the
-    // summary, prefixed so future turns can tell it's compacted
-    // context (not a real user turn). The next /save / autosave
-    // captures the new shorter history.
-    const summary_owned = try c.tui.arena.dupe(u8, harvest.text.items);
-    const synthetic = try std.fmt.allocPrint(
-        c.tui.arena,
-        "(Previous conversation summary)\n{s}",
-        .{summary_owned},
-    );
-    c.tui.sess.messages.clearRetainingCapacity();
-    try c.tui.sess.messages.append(
-        c.tui.arena,
-        try provider_mod.textMessage(c.tui.arena, .user, synthetic),
-    );
-
-    const notice = try std.fmt.allocPrint(
-        c.tui.arena,
-        "/compact: replaced history with a {d}-char summary.\n\n{s}",
-        .{ summary_owned.len, summary_owned },
-    );
-    try c.tui.pushBlock(.notice, notice);
+    try c.tui.compactNow("/compact");
     return .handled;
 }
 
@@ -1804,6 +1912,7 @@ const slash_commands = [_]slash.Command{
     .{ .name = "init", .description = "generate a VELK.md tailored to this repo (uses tools + write_file)", .handler = slashInit },
     .{ .name = "multiline", .description = "toggle multi-line input (Enter inserts newline, Ctrl-D submits)", .handler = slashMultiline },
     .{ .name = "exec", .description = "switch out of plan mode so write tools run again", .handler = slashExec },
+    .{ .name = "style", .description = "show or set the output style (default | concise | verbose | json | explanatory)", .handler = slashStyle },
 };
 
 const slash_registry: slash.Registry = .{ .commands = &slash_commands };
@@ -1834,6 +1943,8 @@ pub fn run(
     ask_gate: ?*ask.AskGate,
     tools_settings: ?*tools_mod.Settings,
     had_stale_lock: bool,
+    max_cost_usd: f64,
+    max_context_pct: u8,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -1881,6 +1992,9 @@ pub fn run(
         .todos = todos_store,
         .ask_gate = ask_gate,
         .tools_settings = tools_settings,
+        .max_cost_usd = max_cost_usd,
+        .max_context_pct = max_context_pct,
+        .base_system = sess.config.system,
     };
     defer if (todos_store) |s| s.deinit(io);
     if (ask_gate) |g| {
@@ -2550,6 +2664,41 @@ pub fn run(
                         try tui.pushBlock(.tool_result_error, msg);
                     },
                 };
+                // Session-wide cost budget enforcement. Set by the
+                // a_usage handler when session_cost_usd exceeds the
+                // user's --max-cost. We surface a notice and break
+                // out of the event loop so the harness exits cleanly.
+                if (tui.budget_exceeded) {
+                    const m = try std.fmt.allocPrint(
+                        tui_arena,
+                        "[max-cost] session cost ${d:.4} exceeded cap ${d:.4} — exiting.",
+                        .{ tui.session_cost_usd, tui.max_cost_usd },
+                    );
+                    try tui.pushBlock(.tool_result_error, m);
+                    try tui.render();
+                    return;
+                }
+                // Auto-compact: if --max-context is set and the
+                // turn we just finished pushed cumulative input
+                // tokens past the threshold, run /compact in-place
+                // before returning control to the input loop. Only
+                // fires on successful turns; a failed/canceled
+                // turn means context didn't grow past the cap by
+                // anything we should compact.
+                if (result.err == null and tui.max_context_pct > 0) {
+                    const window = cost.contextWindowFor(tui.model) orelse 0;
+                    if (shouldAutoCompact(tui.cumulative_usage.input_tokens, window, tui.max_context_pct)) {
+                        const lbl = try std.fmt.allocPrint(
+                            tui_arena,
+                            "[auto-compact {d}%]",
+                            .{tui.max_context_pct},
+                        );
+                        tui.compactNow(lbl) catch |e| {
+                            const m = try std.fmt.allocPrint(tui_arena, "[auto-compact] dispatch failed: {s}", .{@errorName(e)});
+                            try tui.pushBlock(.tool_result_error, m);
+                        };
+                    }
+                }
                 try tui.render();
             },
         }
@@ -2683,6 +2832,36 @@ test "wrapBlockInto: collapsed flag ignored on non-collapsible kinds" {
     };
     try wrapBlockInto(arena, &lines, block, 120);
     try testing.expectEqual(@as(usize, 3), lines.items.len);
+}
+
+test "costBudgetExceeded: cap of 0 is unlimited" {
+    try testing.expect(!costBudgetExceeded(100.0, 0.0));
+    try testing.expect(!costBudgetExceeded(0.0, 0.0));
+}
+
+test "costBudgetExceeded: trips strictly above cap" {
+    try testing.expect(!costBudgetExceeded(0.49, 0.50));
+    try testing.expect(!costBudgetExceeded(0.50, 0.50));
+    try testing.expect(costBudgetExceeded(0.51, 0.50));
+}
+
+test "shouldAutoCompact: pct of 0 is disabled" {
+    try testing.expect(!shouldAutoCompact(150_000, 200_000, 0));
+}
+
+test "shouldAutoCompact: unknown context window stays inert" {
+    try testing.expect(!shouldAutoCompact(150_000, 0, 80));
+}
+
+test "shouldAutoCompact: trips at and above threshold" {
+    try testing.expect(!shouldAutoCompact(159_999, 200_000, 80));
+    try testing.expect(shouldAutoCompact(160_000, 200_000, 80));
+    try testing.expect(shouldAutoCompact(170_000, 200_000, 80));
+}
+
+test "shouldAutoCompact: handles million-token window without overflow" {
+    try testing.expect(!shouldAutoCompact(799_999, 1_000_000, 80));
+    try testing.expect(shouldAutoCompact(800_000, 1_000_000, 80));
 }
 
 test "Block.isCollapsible: only tool kinds" {
