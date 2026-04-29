@@ -1,0 +1,64 @@
+{
+  "name": "velk",
+  "displayName": "velk",
+  "description": "Open the velk terminal AI harness in a VS Code terminal panel.",
+  "version": "0.0.1",
+  "publisher": "vincentvella",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/vincentvella/velk",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vincentvella/velk.git",
+    "directory": "vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/vincentvella/velk/issues"
+  },
+  "categories": ["AI", "Other"],
+  "keywords": ["velk", "ai", "anthropic", "claude", "openai", "agent", "repl"],
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "velk.openRepl",
+        "title": "velk: Open REPL",
+        "category": "velk"
+      },
+      {
+        "command": "velk.runOnSelection",
+        "title": "velk: Run on selection",
+        "category": "velk"
+      }
+    ],
+    "configuration": {
+      "title": "velk",
+      "properties": {
+        "velk.binaryPath": {
+          "type": "string",
+          "default": "velk",
+          "description": "Path to the velk binary. Defaults to `velk` on PATH."
+        },
+        "velk.extraArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra arguments passed to velk on every launch (e.g. [\"--model\", \"claude-opus-4-7\"])."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npm run compile && npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.4.0"
+  }
+}

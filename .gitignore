@@ -13,3 +13,13 @@ ROADMAP.md
 # Python bytecode caches
 bench/**/__pycache__/
 *.pyc
+
+# VS Code extension build artifacts
+vscode/node_modules/
+vscode/out/
+vscode/*.vsix
+
+# JetBrains plugin build artifacts
+jetbrains/.gradle/
+jetbrains/build/
+jetbrains/.idea/

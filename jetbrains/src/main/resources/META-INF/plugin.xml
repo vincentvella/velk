@@ -1,0 +1,47 @@
+<idea-plugin>
+    <id>com.vincentvella.velk</id>
+    <name>velk</name>
+    <vendor email="vincevella0@gmail.com" url="https://github.com/vincentvella/velk">Vincent Vella</vendor>
+
+    <description><![CDATA[
+      Open the <a href="https://github.com/vincentvella/velk">velk</a>
+      terminal AI harness in a JetBrains terminal panel.<br/><br/>
+      <b>Tools → velk: Open REPL</b> (or <kbd>Ctrl/Cmd-Shift-A</kbd> →
+      "velk") spawns a terminal running the velk binary in the project's
+      working directory.<br/><br/>
+      Configure the binary path under <b>Settings → Tools → velk</b> if
+      <code>velk</code> is not on PATH.
+    ]]></description>
+
+    <change-notes><![CDATA[
+      <h3>0.0.1</h3>
+      <ul>
+        <li>Initial release. <b>velk: Open REPL</b> action launches the
+            velk binary in a JetBrains terminal panel.</li>
+        <li>Configurable binary path + extra args.</li>
+      </ul>
+    ]]></change-notes>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.terminal</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationConfigurable
+                parentId="tools"
+                id="com.vincentvella.velk.settings"
+                displayName="velk"
+                instance="com.vincentvella.velk.VelkConfigurable"/>
+        <applicationService
+                serviceImplementation="com.vincentvella.velk.VelkSettings"/>
+    </extensions>
+
+    <actions>
+        <action
+                id="com.vincentvella.velk.OpenReplAction"
+                class="com.vincentvella.velk.OpenReplAction"
+                text="velk: Open REPL"
+                description="Open the velk terminal AI harness in a terminal panel.">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
