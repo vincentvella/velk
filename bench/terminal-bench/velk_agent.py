@@ -102,15 +102,22 @@ class VelkAgent(AbstractInstalledAgent):
         # "Terminal-Bench" / "benchmark" / "test", or any framing
         # that would let the model game tests it can see.
         # Override via $VELK_BENCH_SYSTEM if you want different framing.
+        # Single-line: tmux types the whole `velk --system '<prompt>'`
+        # command line as keystrokes; embedded literal newlines come
+        # out as shell continuation prompts (`> `) and the shell
+        # ends up parsing the prompt as multiple separate inputs.
+        # Use `; ` as a soft separator instead.
         system_prompt = os.environ.get(
             "VELK_BENCH_SYSTEM",
             (
-                "You are running unattended. No human is available to "
-                "answer questions, confirm actions, or supply missing "
-                "details. Do not ask clarifying questions; do not "
-                "describe what you would do — execute the work directly "
-                "through tool calls. End your turn only after the task "
-                "is complete."
+                "You are running in non-interactive (headless) mode. "
+                "Do not ask the user for input or confirmation; "
+                "do not describe what you would do — execute the work "
+                "through tool calls. Generally you can freely take "
+                "local, reversible actions like editing files or "
+                "running shell commands; make reasonable decisions "
+                "autonomously. Report errors clearly but continue "
+                "working. End your turn after the task is complete."
             ),
         )
 
