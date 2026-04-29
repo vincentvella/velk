@@ -718,18 +718,22 @@ fn runBash(
 ) !std.process.RunResult {
     // Run via bash with alias expansion + ~/.bashrc sourced when
     // available. Non-interactive bash normally skips both, so an
-    // `alias git='hub'` in the user's bashrc wouldn't apply. We
-    // turn on `expand_aliases`, source .bashrc if present (silently
-    // skipped on Alpine / non-bashrc distros), then run the user's
-    // command. Falls back to `/bin/sh -c` when bash isn't on PATH
-    // (Alpine without bash, scratch images).
-    const wrapped = std.fmt.allocPrint(
-        arena,
-        "shopt -s expand_aliases 2>/dev/null; if [ -f ~/.bashrc ]; then . ~/.bashrc 2>/dev/null; fi; {s}",
-        .{command},
-    ) catch command;
+    // `alias git='hub'` in the user's bashrc wouldn't apply.
+    //
+    // Subtle: bash parses a `;`-joined compound command as a unit
+    // before running any of it, so `shopt -s expand_aliases; .
+    // ~/.bashrc; some_alias` doesn't actually pick up `some_alias`
+    // — the parser has already resolved the third statement before
+    // the alias is in the table. The fix is to pass the user's
+    // command as a positional arg ($1) and `eval` it after the
+    // setup runs; eval re-parses in a fresh scope that sees the
+    // newly-defined aliases.
+    //
+    // Falls back to `/bin/sh -c` when bash isn't on PATH (Alpine
+    // without bash, scratch images).
+    const wrapper = "shopt -s expand_aliases 2>/dev/null; if [ -f ~/.bashrc ]; then . ~/.bashrc 2>/dev/null; fi; eval \"$1\"";
     const argv: []const []const u8 = if (bashAvailable())
-        &[_][]const u8{ "/bin/bash", "-c", wrapped }
+        &[_][]const u8{ "/bin/bash", "-c", wrapper, "_", command }
     else
         &[_][]const u8{ "/bin/sh", "-c", command };
     const timeout: Io.Timeout = if (timeout_ms <= 0) .none else .{
