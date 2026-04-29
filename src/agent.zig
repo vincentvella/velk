@@ -250,7 +250,11 @@ fn executeOne(
     // any invalid bytes with U+FFFD so the model sees something
     // representable.
     const safe = try sanitizeUtf8(arena, out.text);
-    return .{ .tool_use_id = use.id, .content = safe, .is_error = out.is_error };
+    const image: ?provider_mod.ImageAttachment = if (out.image) |img| .{
+        .media_type = img.media_type,
+        .base64_data = img.base64_data,
+    } else null;
+    return .{ .tool_use_id = use.id, .content = safe, .is_error = out.is_error, .image = image };
 }
 
 /// Returns `s` if it's already valid UTF-8, otherwise allocates a

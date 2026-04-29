@@ -18,6 +18,20 @@ pub const ToolResult = struct {
     tool_use_id: []const u8,
     content: []const u8,
     is_error: bool = false,
+    /// Optional image attachment. When non-null, the provider emits
+    /// the tool_result as an array `[{text: content}, {image: …}]`
+    /// so the model can see the image. The bytes are already
+    /// base64-encoded by the tool that produced this result.
+    image: ?ImageAttachment = null,
+};
+
+pub const ImageAttachment = struct {
+    /// IANA media type, e.g. "image/png" / "image/jpeg" / "image/gif" /
+    /// "image/webp". Both Anthropic and OpenAI accept these.
+    media_type: []const u8,
+    /// Base64-encoded image bytes. Caller is responsible for the
+    /// encoding so we don't allocate twice.
+    base64_data: []const u8,
 };
 
 pub const ContentBlock = union(enum) {

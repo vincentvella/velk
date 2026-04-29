@@ -125,6 +125,7 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildReadMemory(arena, settings));
     try list.append(arena, try buildWriteMemory(arena, settings));
     try list.append(arena, try buildLspDiagnostics(arena, settings));
+    try list.append(arena, try buildViewImage(arena, settings));
     if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
     if (settings.ask != null) try list.append(arena, try buildAskUserQuestion(arena, settings));
     if (settings.sub_agent != null) try list.append(arena, try buildTask(arena, settings));
@@ -1474,6 +1475,73 @@ fn getInt(value: std.json.Value, field: []const u8) !?i64 {
     };
 }
 
+// ───────── view_image ─────────
+
+const view_image_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "path":{"type":"string","description":"Path to an image file (PNG, JPEG, GIF, or WebP). Must be inside CWD unless --unsafe."}
+    \\ },
+    \\ "required":["path"]}
+;
+
+pub fn buildViewImage(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, view_image_schema_json, .{});
+    return .{
+        .name = "view_image",
+        .description = "Read an image file and attach it to your next message as a vision input. Use this when you need to see what's in a PNG/JPEG/GIF/WebP file (chess boards, diagrams, screenshots, charts, etc.). The model receives the image alongside the text response and can analyze it directly.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = viewImageExecute,
+    };
+}
+
+fn viewImageExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const path = (try getString(input, "path")) orelse return errorOutput(arena, "view_image: missing 'path'", .{});
+
+    _ = validatePath(settings, path) catch {
+        return errorOutput(arena, "view_image: refused — path '{s}' is outside CWD (use --unsafe to override)", .{path});
+    };
+
+    const max_image_bytes: usize = 5 * 1024 * 1024; // 5 MiB
+    const cwd = std.Io.Dir.cwd();
+    const bytes = cwd.readFileAlloc(settings.io, path, arena, .limited(max_image_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return errorOutput(arena, "view_image: '{s}' not found", .{path}),
+        error.StreamTooLong => return errorOutput(arena, "view_image: '{s}' larger than 5 MiB cap", .{path}),
+        else => return errorOutput(arena, "view_image: read failed: {s}", .{@errorName(e)}),
+    };
+
+    // Sniff the media type from the file's magic bytes. Falling back
+    // to the file extension would be wrong for files with the wrong
+    // suffix, and Anthropic / OpenAI care about the right media_type.
+    const media_type = sniffImageMediaType(bytes) orelse
+        return errorOutput(arena, "view_image: '{s}' isn't a recognized image (PNG/JPEG/GIF/WebP)", .{path});
+
+    const encoder = std.base64.standard.Encoder;
+    const encoded_len = encoder.calcSize(bytes.len);
+    const buf = try arena.alloc(u8, encoded_len);
+    _ = encoder.encode(buf, bytes);
+
+    const text = try std.fmt.allocPrint(arena, "Attached {s} ({d} bytes) from {s}", .{ media_type, bytes.len, path });
+    return .{
+        .text = text,
+        .image = .{ .media_type = media_type, .base64_data = buf },
+        .is_error = false,
+    };
+}
+
+/// Returns the IANA media type for a recognized image, or null when
+/// the bytes don't look like a supported format. Both Anthropic and
+/// OpenAI accept the four formats below.
+fn sniffImageMediaType(bytes: []const u8) ?[]const u8 {
+    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
+    if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "\xff\xd8\xff")) return "image/jpeg";
+    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) return "image/gif";
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
+    return null;
+}
+
 // ───────── lsp_diagnostics ─────────
 
 const lsp_mod = @import("lsp.zig");
@@ -1897,6 +1965,76 @@ test "custom: refused under plan mode" {
     try testing.expect(out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.text, "plan mode") != null);
     try testing.expect(std.mem.indexOf(u8, out.text, "writes-something") != null);
+}
+
+test "view_image: missing path is an error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildViewImage(a, &settings);
+    const input = try jsonObj(a, .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "missing 'path'") != null);
+}
+
+test "view_image: non-image bytes rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "fake.png", .data = "not an image" });
+
+    var settings = testSettings();
+    settings.unsafe = true;
+    const t = try buildViewImage(a, &settings);
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    const file_path = try std.fmt.allocPrint(a, "{s}/fake.png", .{tmp_abs});
+    const input = try jsonObj(a, .{ .path = file_path });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "isn't a recognized image") != null);
+}
+
+test "view_image: PNG magic bytes detected and base64-encoded" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Minimal PNG: signature + IHDR (1x1 RGBA) + IDAT + IEND. We
+    // don't need a valid image, just one that passes our magic-byte
+    // check.
+    const png_bytes = "\x89PNG\r\n\x1a\n" ++ ("data" ** 4);
+    try tmp.dir.writeFile(.{ .sub_path = "tiny.png", .data = png_bytes });
+
+    var settings = testSettings();
+    settings.unsafe = true;
+    const t = try buildViewImage(a, &settings);
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    const file_path = try std.fmt.allocPrint(a, "{s}/tiny.png", .{tmp_abs});
+    const input = try jsonObj(a, .{ .path = file_path });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "image/png") != null);
+    try testing.expect(out.image != null);
+    try testing.expectEqualStrings("image/png", out.image.?.media_type);
+    // Round-trip the base64 to verify it encodes cleanly.
+    const decoded = try a.alloc(u8, std.base64.standard.Decoder.calcSizeForSlice(out.image.?.base64_data) catch unreachable);
+    try std.base64.standard.Decoder.decode(decoded, out.image.?.base64_data);
+    try testing.expectEqualSlices(u8, png_bytes, decoded);
+}
+
+test "sniffImageMediaType: detects all four supported formats" {
+    try testing.expectEqualStrings("image/png", sniffImageMediaType("\x89PNG\r\n\x1a\nrest").?);
+    try testing.expectEqualStrings("image/jpeg", sniffImageMediaType("\xff\xd8\xff\xe0blob").?);
+    try testing.expectEqualStrings("image/gif", sniffImageMediaType("GIF89a...").?);
+    try testing.expectEqualStrings("image/gif", sniffImageMediaType("GIF87a...").?);
+    try testing.expectEqualStrings("image/webp", sniffImageMediaType("RIFF\x00\x00\x00\x00WEBPVP8X").?);
+    try testing.expectEqual(@as(?[]const u8, null), sniffImageMediaType("not magic"));
+    try testing.expectEqual(@as(?[]const u8, null), sniffImageMediaType(""));
 }
 
 test "lsp_diagnostics: missing file is an error" {

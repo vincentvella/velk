@@ -19,10 +19,12 @@ pub const ContentBlock = struct {
 
     // type = "tool_result"
     tool_use_id: ?[]const u8 = null,
-    /// For tool_result: the textual output the tool produced.
-    /// Anthropic also accepts an array of content blocks here, but a string
-    /// covers every case we care about today.
-    content: ?[]const u8 = null,
+    /// For tool_result: either a string (text-only output) or an
+    /// array of inner blocks `[{type:"text",text:…},{type:"image",source:…}]`
+    /// when the tool attaches an image. Stored as `std.json.Value`
+    /// so the encoder can emit either shape; the agent loop builds
+    /// it via `provider.zig`'s `ToolResult.image` plumbing.
+    content: ?std.json.Value = null,
     is_error: ?bool = null,
 };
 
@@ -226,7 +228,7 @@ test "MessagesRequest: serializes tool_use and tool_result content blocks" {
             .content = &.{.{
                 .type = "tool_result",
                 .tool_use_id = "tu_1",
-                .content = "hello\n",
+                .content = .{ .string = "hello\n" },
             }},
         },
     };

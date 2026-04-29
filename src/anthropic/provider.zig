@@ -92,11 +92,34 @@ fn translateMessage(arena: std.mem.Allocator, m: provider_mod.Message) !types.Me
                 .name = u.name,
                 .input = u.input,
             },
-            .tool_result => |r| .{
-                .type = "tool_result",
-                .tool_use_id = r.tool_use_id,
-                .content = r.content,
-                .is_error = if (r.is_error) true else null,
+            .tool_result => |r| blk: {
+                // Tool-result content is either a plain string (most
+                // tools) or a multi-block array when an image is
+                // attached. The Messages API accepts either shape.
+                const content_val: std.json.Value = if (r.image) |img| arr: {
+                    var inner: std.json.Array = .init(arena);
+                    if (r.content.len > 0) {
+                        var text_obj: std.json.ObjectMap = .empty;
+                        try text_obj.put(arena, "type", .{ .string = "text" });
+                        try text_obj.put(arena, "text", .{ .string = r.content });
+                        try inner.append(.{ .object = text_obj });
+                    }
+                    var src: std.json.ObjectMap = .empty;
+                    try src.put(arena, "type", .{ .string = "base64" });
+                    try src.put(arena, "media_type", .{ .string = img.media_type });
+                    try src.put(arena, "data", .{ .string = img.base64_data });
+                    var img_obj: std.json.ObjectMap = .empty;
+                    try img_obj.put(arena, "type", .{ .string = "image" });
+                    try img_obj.put(arena, "source", .{ .object = src });
+                    try inner.append(.{ .object = img_obj });
+                    break :arr .{ .array = inner };
+                } else .{ .string = r.content };
+                break :blk .{
+                    .type = "tool_result",
+                    .tool_use_id = r.tool_use_id,
+                    .content = content_val,
+                    .is_error = if (r.is_error) true else null,
+                };
             },
         };
     }

@@ -14,6 +14,17 @@ pub const Output = struct {
     /// Caller takes ownership; the agent will free it.
     text: []const u8,
     is_error: bool = false,
+    /// Optional image attachment. When set, the provider sees a
+    /// tool_result with an image content block alongside the text
+    /// — letting the model "view" the image. Used by `view_image`.
+    image: ?ImageAttachment = null,
+};
+
+pub const ImageAttachment = struct {
+    /// IANA media type, e.g. "image/png".
+    media_type: []const u8,
+    /// Base64-encoded image bytes.
+    base64_data: []const u8,
 };
 
 pub const ExecuteFn = *const fn (
