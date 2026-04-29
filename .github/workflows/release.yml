@@ -203,3 +203,122 @@ jobs:
 
           git commit -m "velk $VERSION"
           git push origin HEAD:main
+
+  vscode-marketplace:
+    name: publish VS Code extension
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v6
+
+      # Skip cleanly if the token isn't configured — same pattern as
+      # the homebrew job. This keeps the rest of the release pipeline
+      # green while a maintainer sets up Marketplace publishing.
+      - name: check for marketplace token
+        id: gate
+        run: |
+          if [[ -z "${{ secrets.VSCODE_MARKETPLACE_TOKEN }}" ]]; then
+            echo "VSCODE_MARKETPLACE_TOKEN secret not set — skipping VS Code publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: derive version
+        if: steps.gate.outputs.skip != 'true'
+        id: ver
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: setup Node
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: vscode/package-lock.json
+
+      - name: bump version + install + build
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: vscode
+        run: |
+          set -euo pipefail
+          # Sync package.json's version to the release tag so the
+          # Marketplace lists the right number. `npm version` rejects
+          # an unchanged version, so guard.
+          current=$(node -p "require('./package.json').version")
+          if [ "$current" != "${{ steps.ver.outputs.version }}" ]; then
+            npm version --no-git-tag-version "${{ steps.ver.outputs.version }}"
+          fi
+          npm ci
+          npm run compile
+
+      - name: publish to VS Code Marketplace
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCODE_MARKETPLACE_TOKEN }}
+        run: |
+          # `vsce publish` builds + uploads in one shot. --no-dependencies
+          # because we have no runtime deps; only @types are devDeps and
+          # vsce sometimes flags those without --skip-license / --no-deps.
+          npx --yes @vscode/vsce@latest publish --no-dependencies --pat "$VSCE_PAT"
+
+  jetbrains-marketplace:
+    name: publish JetBrains plugin
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: check for marketplace token
+        id: gate
+        run: |
+          if [[ -z "${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}" ]]; then
+            echo "JETBRAINS_MARKETPLACE_TOKEN secret not set — skipping JetBrains publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: derive version
+        if: steps.gate.outputs.skip != 'true'
+        id: ver
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: setup JDK 17
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: setup Gradle
+        if: steps.gate.outputs.skip != 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: bump plugin version
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: jetbrains
+        run: |
+          # Reflect the release tag in build.gradle.kts so the
+          # plugin .zip name + Marketplace listing stay in sync.
+          sed -i 's/^version = ".*"/version = "${{ steps.ver.outputs.version }}"/' build.gradle.kts
+
+      - name: publish to JetBrains Marketplace
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: jetbrains
+        env:
+          PUBLISH_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
+          # Optional: override the release channel ("default", "eap",
+          # "beta"). Default channel = stable Marketplace listing.
+          PUBLISH_CHANNEL: ${{ vars.JETBRAINS_PUBLISH_CHANNEL || 'default' }}
+        run: |
+          gradle publishPlugin \
+            -Pintellij.publish.token="$PUBLISH_TOKEN" \
+            -Pintellij.publish.channel="$PUBLISH_CHANNEL"

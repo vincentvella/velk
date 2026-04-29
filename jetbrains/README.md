@@ -39,12 +39,40 @@ Then in any JetBrains IDE:
 **Settings → Plugins → ⚙ → Install Plugin from Disk…** and pick the
 `.zip`.
 
+## Marketplace publishing (automated on tag)
+
+The `jetbrains-marketplace` job in `.github/workflows/release.yml` runs
+on every `v*` push. It bumps the `version = …` line in
+`build.gradle.kts` to the tag, then runs `gradle publishPlugin`. Skips
+cleanly when the token secret isn't set.
+
+**One-time setup (maintainer):**
+
+1. Create (or join) a vendor on the
+   [JetBrains Marketplace](https://plugins.jetbrains.com/) and verify
+   ownership of the `com.vincentvella.velk` plugin id (matches
+   `plugin.xml`).
+2. Generate a permanent token under
+   **Profile → My Tokens → Generate New Token**.
+3. Add it to the repo:
+   ```sh
+   gh secret set JETBRAINS_MARKETPLACE_TOKEN --body '<token>'
+   ```
+4. Optional: choose a release channel (`default`, `eap`, `beta`) via a
+   repo variable:
+   ```sh
+   gh variable set JETBRAINS_PUBLISH_CHANNEL --body 'default'
+   ```
+5. Tag a release as usual; the job picks it up.
+
+If the secret isn't set, the rest of the release pipeline still
+publishes the binaries + bumps the homebrew tap. Users can install
+the plugin from a locally-built `.zip` instead.
+
 ## Notes
 
 - Reuses the existing JetBrains integrated terminal — no custom
   rendering. velk's TUI handles vim mode, mouse, OSC-52 clipboard,
   and markdown rendering natively.
-- Marketplace publishing is a follow-up. Today the plugin installs
-  from a locally-built `.zip`.
 - Supports IntelliJ Platform 2024.3+ (build 243+). Earlier builds may
   work but aren't tested.
