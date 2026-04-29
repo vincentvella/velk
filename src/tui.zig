@@ -12,6 +12,7 @@ const provider_mod = @import("provider.zig");
 const session_mod = @import("session.zig");
 const persist = @import("persist.zig");
 const cost = @import("cost.zig");
+const token_estimate = @import("token_estimate.zig");
 const cost_log = @import("cost_log.zig");
 const slash = @import("slash.zig");
 const notify = @import("notify.zig");
@@ -1506,6 +1507,37 @@ fn slashCost(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     return .handled;
 }
 
+/// `/tokens` — show approximate input-token count for the current
+/// session's next request, plus where it sits relative to the model's
+/// context window and prompt-cache threshold. Approximate (no
+/// vendored tokenizer); good enough to gauge whether you're about
+/// to overflow.
+fn slashTokens(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
+    const c = slashCtx(ctx);
+    const fake_req: provider_mod.Request = .{
+        .model = c.tui.model,
+        .max_tokens = c.tui.sess.config.max_tokens,
+        .system = c.tui.sess.config.system,
+        .messages = c.tui.sess.messages.items,
+        .tools = &.{}, // tool defs aren't on the session; leave them out of the estimate
+    };
+    const tokens = token_estimate.estimateRequest(fake_req);
+
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(c.tui.arena, "Estimated next request · ~{d} input tokens\n", .{tokens});
+    if (cost.contextWindowFor(c.tui.model)) |window| {
+        const pct: u32 = @intCast(@min(100, @as(u64, tokens) * 100 / window));
+        try buf.print(c.tui.arena, "  · model context: {d} tokens ({d}% used)\n", .{ window, pct });
+    }
+    if (cost.cacheMinTokens(c.tui.model)) |min| {
+        const status: []const u8 = if (tokens >= min) "yes" else "no — short of threshold";
+        try buf.print(c.tui.arena, "  · cache threshold: {d} · engaged: {s}\n", .{ min, status });
+    }
+    try buf.appendSlice(c.tui.arena, "(approximate; chars/token heuristic — Anthropic tokenizer is proprietary)");
+    try c.tui.pushBlock(.notice, buf.items);
+    return .handled;
+}
+
 /// Find the most recent assistant text — either an unflushed in-flight
 /// buffer (during a turn) or the last `.assistant_text` block.
 fn lastAssistantText(tui: *Tui) ?[]const u8 {
@@ -1917,6 +1949,7 @@ const slash_commands = [_]slash.Command{
     .{ .name = "exit", .description = "leave the REPL", .handler = slashExit },
     .{ .name = "quit", .description = "alias for /exit", .handler = slashExit },
     .{ .name = "cost", .description = "show cumulative tokens + USD for this session", .handler = slashCost },
+    .{ .name = "tokens", .description = "show estimated input tokens for the next request (context window + cache status)", .handler = slashTokens },
     .{ .name = "copy", .description = "copy the last assistant message to the clipboard", .handler = slashCopy },
     .{ .name = "model", .description = "show or change the active model id", .handler = slashModel },
     .{ .name = "system", .description = "show or set the system prompt (use 'clear' to drop it)", .handler = slashSystem },

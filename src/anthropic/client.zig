@@ -10,11 +10,55 @@ pub fn shouldRetry(status: u16) bool {
     return status == 429 or (status >= 500 and status < 600);
 }
 
-/// Sleep before attempt N+1. Doubles each time: 1s, 2s, 4s, capped at 30s.
-pub fn retryBackoff(io: Io, attempt: u32) !void {
-    const base: u64 = 1000;
-    const ms = @min(base << @intCast(@min(attempt, 5)), 30_000);
+/// Parse the value of a `Retry-After` header. Anthropic + OpenAI both
+/// send a non-negative integer count of seconds (the HTTP spec also
+/// allows an HTTP-date form, but neither provider does that today).
+/// Returns null when absent / unparseable / negative; cap is enforced
+/// here so a server can't tell us to sleep for hours.
+pub fn parseRetryAfterMs(value: ?[]const u8) ?u64 {
+    const v = value orelse return null;
+    const trimmed = std.mem.trim(u8, v, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const seconds = std.fmt.parseInt(u32, trimmed, 10) catch return null;
+    if (seconds == 0) return 0;
+    const max_seconds: u32 = 60;
+    return @as(u64, @min(seconds, max_seconds)) * 1000;
+}
+
+/// Sleep before attempt N+1. Honors a `Retry-After` value when the
+/// server told us how long to wait; otherwise falls back to
+/// exponential backoff (1s, 2s, 4s, capped at 30s).
+pub fn retryBackoff(io: Io, attempt: u32, retry_after_ms: ?u64) !void {
+    const ms: u64 = if (retry_after_ms) |r|
+        // Server-directed wait. Add a small fixed jitter so we
+        // don't all wake up at the exact same instant.
+        r + 250
+    else blk: {
+        const base: u64 = 1000;
+        break :blk @min(base << @intCast(@min(attempt, 5)), 30_000);
+    };
     try Io.sleep(io, Io.Duration.fromMilliseconds(@intCast(ms)), .awake);
+}
+
+/// Look up `Retry-After` (case-insensitive) in a response's header
+/// iterator. Anthropic 429s carry this; OpenAI 429s do too. Returns
+/// null when absent.
+pub fn findRetryAfter(response: anytype) ?[]const u8 {
+    var iter = response.iterateHeaders();
+    while (iter.next()) |h| {
+        if (asciiEqlIgnoreCase(h.name, "retry-after")) return h.value;
+    }
+    return null;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const xl: u8 = if (x >= 'A' and x <= 'Z') x + 32 else x;
+        const yl: u8 = if (y >= 'A' and y <= 'Z') y + 32 else y;
+        if (xl != yl) return false;
+    }
+    return true;
 }
 
 pub const Error = error{
@@ -159,7 +203,12 @@ pub const Client = struct {
             const reader = response.reader(&transfer_buf);
 
             if (shouldRetry(status) and attempt < max_retries) {
-                try retryBackoff(self.io, attempt);
+                // Honor Retry-After when the server provides it
+                // (especially important on 429 — Anthropic tells
+                // us exactly how long to wait). Falls back to
+                // exponential backoff when the header is absent.
+                const retry_after = parseRetryAfterMs(findRetryAfter(response.head));
+                try retryBackoff(self.io, attempt, retry_after);
                 continue;
             }
 
@@ -199,3 +248,40 @@ pub const Client = struct {
         );
     }
 };
+
+// ───────── tests ─────────
+
+const testing = std.testing;
+
+test "parseRetryAfterMs: integer seconds" {
+    try testing.expectEqual(@as(?u64, 5000), parseRetryAfterMs("5"));
+    try testing.expectEqual(@as(?u64, 0), parseRetryAfterMs("0"));
+    try testing.expectEqual(@as(?u64, 1000), parseRetryAfterMs("1"));
+}
+
+test "parseRetryAfterMs: trims whitespace" {
+    try testing.expectEqual(@as(?u64, 3000), parseRetryAfterMs("  3 \r\n"));
+}
+
+test "parseRetryAfterMs: caps at 60 seconds so a server can't hold us hostage" {
+    try testing.expectEqual(@as(?u64, 60_000), parseRetryAfterMs("3600"));
+    try testing.expectEqual(@as(?u64, 60_000), parseRetryAfterMs("99999"));
+}
+
+test "parseRetryAfterMs: null / empty / non-numeric returns null" {
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs(null));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs(""));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs("   "));
+    // HTTP-date form (RFC 7231) — neither Anthropic nor OpenAI sends
+    // this, and supporting it adds a date parser; reject for now.
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs("Wed, 21 Oct 2026 07:28:00 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs("soon"));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs("-5"));
+}
+
+test "asciiEqlIgnoreCase: matches across case" {
+    try testing.expect(asciiEqlIgnoreCase("Retry-After", "retry-after"));
+    try testing.expect(asciiEqlIgnoreCase("RETRY-AFTER", "Retry-After"));
+    try testing.expect(!asciiEqlIgnoreCase("Retry-After", "Content-Type"));
+    try testing.expect(!asciiEqlIgnoreCase("short", "longer"));
+}

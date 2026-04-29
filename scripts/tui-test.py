@@ -465,6 +465,14 @@ def run_slash_cases(bin_path: Path) -> None:
         case("/cost on empty session", tui.wait_for("Session totals"))
         case("/cost shows rolling-window labels", tui.saw("Today") and tui.saw("Week") and tui.saw("All"))
 
+        tui.send_line("/tokens")
+        case("/tokens shows estimated count", tui.wait_for("Estimated next request"))
+        case(
+            "/tokens reports model context + cache threshold",
+            tui.saw("model context:")
+            and tui.saw("cache threshold:"),
+        )
+
         tui.send_line("/model")
         case("/model with no args shows current", tui.wait_for("Current model:"))
 
@@ -485,7 +493,7 @@ def run_slash_cases(bin_path: Path) -> None:
         case("/system shows current value", tui.wait_for("be terse"))
 
         tui.send_line("/system clear")
-        case("/system clear drops prompt", tui.wait_for("System prompt cleared"))
+        case("/system clear drops prompt", tui.wait_for("System prompt cleared", screen=True))
 
         # /style — output styles (Phase 13). With no args, show
         # current + list catalog. Picking a style updates the
@@ -496,7 +504,7 @@ def run_slash_cases(bin_path: Path) -> None:
         tui.send_line("/style")
         case(
             "/style with no args lists catalog",
-            tui.wait_for("no extra constraints")
+            tui.wait_for("no extra constraints", screen=True)
             and tui.saw("short answers, no preamble", screen=True)
             and tui.saw("explain reasoning step by step", screen=True),
         )

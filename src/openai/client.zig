@@ -94,7 +94,8 @@ pub const Client = struct {
             const reader = response.reader(&transfer_buf);
 
             if (anth_client.shouldRetry(status) and attempt < anth_client.max_retries) {
-                try anth_client.retryBackoff(self.io, attempt);
+                const retry_after = anth_client.parseRetryAfterMs(anth_client.findRetryAfter(response.head));
+                try anth_client.retryBackoff(self.io, attempt, retry_after);
                 continue;
             }
 
