@@ -242,7 +242,86 @@ fn executeOne(
         }
     }
 
-    return .{ .tool_use_id = use.id, .content = out.text, .is_error = out.is_error };
+    // Sanitize: tool output may include non-UTF-8 bytes (e.g. `cat`
+    // on a binary file). The Anthropic API requires content strings
+    // be valid JSON, which in turn requires valid UTF-8. Invalid
+    // sequences cause the server to reject the whole request with
+    // an opaque "Input should be a valid dictionary" error. Replace
+    // any invalid bytes with U+FFFD so the model sees something
+    // representable.
+    const safe = try sanitizeUtf8(arena, out.text);
+    return .{ .tool_use_id = use.id, .content = safe, .is_error = out.is_error };
+}
+
+/// Returns `s` if it's already valid UTF-8, otherwise allocates a
+/// copy with each invalid byte replaced by U+FFFD (the Unicode
+/// replacement character). Truncates to `max_tool_output_bytes`
+/// since model context windows aren't free.
+const max_tool_output_bytes: usize = 64 * 1024;
+
+fn sanitizeUtf8(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const truncated = if (s.len > max_tool_output_bytes) s[0..max_tool_output_bytes] else s;
+    if (std.unicode.utf8ValidateSlice(truncated)) {
+        if (truncated.len == s.len) return s;
+        return try std.fmt.allocPrint(arena, "{s}\n…[truncated at {d} bytes]", .{ truncated, max_tool_output_bytes });
+    }
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < truncated.len) {
+        const len = std.unicode.utf8ByteSequenceLength(truncated[i]) catch {
+            try out.appendSlice(arena, "\u{FFFD}");
+            i += 1;
+            continue;
+        };
+        if (i + len > truncated.len) {
+            try out.appendSlice(arena, "\u{FFFD}");
+            i += 1;
+            continue;
+        }
+        if (!std.unicode.utf8ValidateSlice(truncated[i .. i + len])) {
+            try out.appendSlice(arena, "\u{FFFD}");
+            i += 1;
+            continue;
+        }
+        try out.appendSlice(arena, truncated[i .. i + len]);
+        i += len;
+    }
+    if (truncated.len < s.len) {
+        try out.print(arena, "\n…[truncated at {d} bytes]", .{max_tool_output_bytes});
+    }
+    return out.items;
+}
+
+test "sanitizeUtf8: valid input returns same slice" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const out = try sanitizeUtf8(a, "hello world");
+    try std.testing.expectEqualStrings("hello world", out);
+}
+
+test "sanitizeUtf8: replaces invalid bytes with U+FFFD" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const bad: []const u8 = &.{ 'h', 'i', 0xFF, 0xFE, 0x80, 'x' };
+    const out = try sanitizeUtf8(a, bad);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\u{FFFD}") != null);
+    try std.testing.expect(std.mem.startsWith(u8, out, "hi"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "x"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "sanitizeUtf8: PDF header sanitizes cleanly" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // First few bytes of a typical PDF — has invalid-UTF-8 binary
+    // payload after the header.
+    const pdf: []const u8 = &.{ '%', 'P', 'D', 'F', '-', '1', '.', '3', '\n', '%', 0xC1, 0xC2, 0xC3, 0xC4, '\n' };
+    const out = try sanitizeUtf8(a, pdf);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    try std.testing.expect(std.mem.startsWith(u8, out, "%PDF-1.3"));
 }
 
 const TurnState = struct {
