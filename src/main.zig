@@ -609,6 +609,15 @@ fn setupProvider(
                 .adapter = undefined,
             } };
             holder.anthropic.client.debug = opts.debug;
+            // Fixture recording: when VELK_RECORD_FIXTURES_DIR is
+            // set, every streamed Anthropic response is captured to
+            // <dir>/<turn>.sse so it can be replayed via
+            // scripts/mock-server.py for CI integration tests.
+            if (init.environ_map.get("VELK_RECORD_FIXTURES_DIR")) |dir| {
+                holder.anthropic.client.record_dir = dir;
+                try errw.print("velk: recording fixtures to {s}\n", .{dir});
+                try errw.flush();
+            }
             holder.anthropic.adapter = anthropic.Adapter.init(arena, &holder.anthropic.client);
         },
         .openai => {

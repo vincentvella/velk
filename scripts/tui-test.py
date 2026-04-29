@@ -905,6 +905,33 @@ def run_turn_cases(bin_path: Path, fixtures_dir: Path) -> None:
                 "── todos" in tui.screen(),
             )
 
+            # ── view_image (multimodal flow) ────────────────────
+            # `seeimg/` fixture: step 1 emits a tool_use for
+            # `view_image` against tests/fixtures/seeimg-target.png
+            # (a real 68-byte PNG). The tool reads it, base64-
+            # encodes, and returns a tool.Output with an
+            # ImageAttachment. The Anthropic adapter packages that
+            # into a tool_result content array `[{text},{image}]`.
+            # Step 2 is the model's wrap-up — its arrival proves
+            # the image-bearing tool_result round-tripped without
+            # the API rejecting the malformed content (which would
+            # crash velk before step 2). End-to-end coverage of
+            # the Phase 15 multimodal architecture.
+            tui.send_line("please seeimg")
+            case(
+                "view_image: tool call emitted",
+                tui.wait_for("opening-image-now", screen=True, timeout=5.0),
+            )
+            case(
+                "view_image: tool result mentions media type + bytes",
+                tui.wait_for("image/png", screen=True, timeout=5.0)
+                and tui.saw("Attached", screen=True),
+            )
+            case(
+                "view_image: model wraps up after seeing the image",
+                tui.wait_for("image-received-and-viewed", screen=True, timeout=5.0),
+            )
+
             # ── /compact ────────────────────────────────────────
             # The /compact handler builds a request whose final user
             # message contains "summarize", which the mock maps to

@@ -483,6 +483,40 @@ JSON
     rm -rf "$PROFILE_TMP"
     unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
 
+    # Fixture recording: VELK_RECORD_FIXTURES_DIR captures every
+    # streamed Anthropic response to <dir>/<turn>.sse so a real
+    # session can be replayed by the mock server later. Verify
+    # that running against the mock with the env var set creates
+    # a 1.sse file with the same canned content the mock served.
+    REC_TMP="$(mktemp -d)"
+    SMOKE_EXPECT_STDERR="recording fixtures to" run_case \
+        "record: VELK_RECORD_FIXTURES_DIR captures the SSE response" 0 \
+        env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
+            ANTHROPIC_API_KEY=sk-fake \
+            "VELK_RECORD_FIXTURES_DIR=$REC_TMP" \
+            "$VELK" --no-tui "hi"
+    if [[ ! -f "$REC_TMP/1.sse" ]]; then
+        echo "FAIL: record: 1.sse not written"
+        echo "  REC_TMP contents: $(ls $REC_TMP)"
+        FAIL=$((FAIL + 1))
+        FAILED_CASES+=("record: 1.sse not written")
+    elif ! grep -qF "msg_mock_default" "$REC_TMP/1.sse"; then
+        # The mock's `Mock reply from velk-mock-server` text is split
+        # across separate content_block_delta events in the SSE
+        # stream and so isn't contiguous in the file. Use the
+        # message id from message_start (single chunk) instead.
+        echo "FAIL: record: 1.sse content didn't include the mock's message id"
+        echo "  size: $(wc -c < $REC_TMP/1.sse) bytes"
+        echo "  head: $(head -c 200 $REC_TMP/1.sse)"
+        FAIL=$((FAIL + 1))
+        FAILED_CASES+=("record: 1.sse content didn't include the mock's message id")
+    else
+        echo "PASS: record: SSE captured to <dir>/1.sse with expected payload"
+        PASS=$((PASS + 1))
+    fi
+    rm -rf "$REC_TMP"
+    unset SMOKE_EXPECT_STDOUT SMOKE_EXPECT_STDERR
+
     kill "$MOCK_PID" 2>/dev/null || true
     trap - EXIT
 else

@@ -93,6 +93,17 @@ pub const Client = struct {
     /// When true, dump a one-line request envelope summary to stderr
     /// before each call. Driven by the CLI `--debug` flag.
     debug: bool = false,
+    /// When non-null, every streamMessage response body is captured
+    /// to `<dir>/<turn>.sse` (and the request to `<dir>/<turn>-req.json`)
+    /// for fixture replay via scripts/mock-server.py. Driven by the
+    /// `VELK_RECORD_FIXTURES_DIR` env var, set by main.zig at startup.
+    /// Recording disables the streaming UX (we read the whole body
+    /// before dispatching events) — fine for dev/CI fixture capture,
+    /// not intended for normal use.
+    record_dir: ?[]const u8 = null,
+    /// Per-client counter so multi-turn sessions get sequential
+    /// `1.sse`, `2.sse`, … files matching the harness convention.
+    record_turn: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, api_key: []const u8, base_url: ?[]const u8) Client {
         return .{
@@ -219,8 +230,73 @@ pub const Client = struct {
 
             keep_req = true;
             defer http_req.deinit();
+
+            // Recording mode: drain the full response body to a file
+            // and feed it back through the SSE parser from a fixed
+            // buffer. Disables streaming UX (events all arrive at
+            // once) — fine for fixture capture; the mock server
+            // replays at normal pace.
+            if (self.record_dir) |dir| {
+                self.record_turn += 1;
+                var buf: Io.Writer.Allocating = .init(self.gpa);
+                defer buf.deinit();
+                _ = reader.streamRemaining(&buf.writer) catch {};
+                const body_bytes = buf.writer.buffered();
+                writeRecordingFile(self.gpa, self.io, dir, self.record_turn, ".sse", body_bytes) catch |e| {
+                    std.log.warn("velk: record fixture failed: {s}", .{@errorName(e)});
+                };
+                writeRecordingFile(self.gpa, self.io, dir, self.record_turn, "-req.json", body) catch {};
+                var fixed: Io.Reader = .fixed(body_bytes);
+                try sse.stream(self.gpa, &fixed, ctx, onEvent);
+                return;
+            }
+
             try sse.stream(self.gpa, reader, ctx, onEvent);
             return;
+        }
+    }
+
+    /// Write `bytes` to `<dir>/<turn><suffix>`. Creates `<dir>` if
+    /// missing. Best-effort: a write failure is logged but does not
+    /// disrupt the API call. `suffix` includes the leading dot
+    /// (e.g. `.sse`, `-req.json`).
+    fn writeRecordingFile(
+        gpa: std.mem.Allocator,
+        io: Io,
+        dir: []const u8,
+        turn: u32,
+        suffix: []const u8,
+        bytes: []const u8,
+    ) !void {
+        try mkdirAllAbsolute(io, dir);
+        const path = try std.fmt.allocPrint(gpa, "{s}/{d}{s}", .{ dir, turn, suffix });
+        defer gpa.free(path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    }
+
+    fn mkdirAllAbsolute(io: Io, path: []const u8) !void {
+        if (path.len == 0) return;
+        const is_abs = path[0] == '/';
+        var i: usize = if (is_abs) 1 else 0;
+        while (true) {
+            const next = std.mem.indexOfScalarPos(u8, path, i, '/');
+            const end = next orelse path.len;
+            if (end > 0) {
+                const prefix = path[0..end];
+                if (is_abs) {
+                    Io.Dir.createDirAbsolute(io, prefix, .default_dir) catch |e| switch (e) {
+                        error.PathAlreadyExists => {},
+                        else => return e,
+                    };
+                } else {
+                    Io.Dir.cwd().createDir(io, prefix, .default_dir) catch |e| switch (e) {
+                        error.PathAlreadyExists => {},
+                        else => return e,
+                    };
+                }
+            }
+            if (next == null) return;
+            i = end + 1;
         }
     }
 
