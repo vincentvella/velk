@@ -135,3 +135,49 @@ test "contextWindowFor: matches openai gpt-5" {
 test "contextWindowFor: returns null for unknown" {
     try testing.expectEqual(@as(?u64, null), contextWindowFor("model-from-the-future"));
 }
+
+/// Minimum cacheable prefix (tokens) for Anthropic's prompt-cache
+/// feature, by model. Used by `/doctor` and `/cost` to predict
+/// whether the system prompt will actually engage the cache. The
+/// request path itself doesn't gate on this — it always emits
+/// `cache_control: ephemeral`, and Anthropic silently ignores the
+/// marker for prefixes under threshold. Snapshots from public
+/// docs; OpenAI returns null because their cache mechanics differ
+/// (automatic, not user-flagged).
+pub fn cacheMinTokens(model: []const u8) ?u32 {
+    const CacheEntry = struct { prefix: []const u8, tokens: u32 };
+    const tbl = [_]CacheEntry{
+        .{ .prefix = "claude-opus-4-5", .tokens = 4096 },
+        .{ .prefix = "claude-opus-4-6", .tokens = 4096 },
+        .{ .prefix = "claude-opus-4-7", .tokens = 4096 },
+        .{ .prefix = "claude-opus-4-1", .tokens = 1024 },
+        .{ .prefix = "claude-opus-4", .tokens = 1024 },
+        .{ .prefix = "claude-sonnet-4-6", .tokens = 2048 },
+        .{ .prefix = "claude-sonnet-4-5", .tokens = 2048 },
+        .{ .prefix = "claude-sonnet-4", .tokens = 2048 },
+        .{ .prefix = "claude-haiku-4-5", .tokens = 1024 },
+        .{ .prefix = "claude-haiku-3-5", .tokens = 1024 },
+    };
+    for (tbl) |e| {
+        if (std.mem.startsWith(u8, model, e.prefix)) return e.tokens;
+    }
+    return null;
+}
+
+test "cacheMinTokens: opus 4.5+ needs 4096" {
+    try testing.expectEqual(@as(?u32, 4096), cacheMinTokens("claude-opus-4-7"));
+    try testing.expectEqual(@as(?u32, 4096), cacheMinTokens("claude-opus-4-6-20260101"));
+}
+
+test "cacheMinTokens: sonnet needs 2048" {
+    try testing.expectEqual(@as(?u32, 2048), cacheMinTokens("claude-sonnet-4-6"));
+}
+
+test "cacheMinTokens: haiku 4.5 needs 1024" {
+    try testing.expectEqual(@as(?u32, 1024), cacheMinTokens("claude-haiku-4-5"));
+}
+
+test "cacheMinTokens: unknown returns null" {
+    try testing.expectEqual(@as(?u32, null), cacheMinTokens("gpt-5"));
+    try testing.expectEqual(@as(?u32, null), cacheMinTokens("future-model"));
+}

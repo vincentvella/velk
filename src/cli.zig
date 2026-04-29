@@ -78,6 +78,17 @@ pub const Options = struct {
     /// session.Config default (10). Bench harnesses (terminal-
     /// bench etc.) routinely want 20–50.
     max_iterations: u32 = 0,
+    /// Extra system-prompt content appended *after* velk's default
+    /// base. Use this to add session-specific guidance without
+    /// nuking the default behavioral scaffolding (the way `--system`
+    /// does). Bench adapters / CI wrappers should prefer this.
+    system_append: ?[]const u8 = null,
+    /// Drop the built-in default system prompt entirely. Useful for
+    /// users who want bare-model behavior or who supply their own
+    /// scaffolding via `--system`. `--system <text>` already
+    /// replaces the default; this flag is for the
+    /// "no system prompt at all" case.
+    no_system_prompt: bool = false,
 };
 
 pub const ParseError = struct {
@@ -216,6 +227,15 @@ pub fn parse(args: []const []const u8) Action {
             opts.max_iterations = n;
             continue;
         }
+        if (eql(arg, "--system-append")) {
+            const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
+            opts.system_append = v;
+            continue;
+        }
+        if (eql(arg, "--no-system-prompt")) {
+            opts.no_system_prompt = true;
+            continue;
+        }
         if (eql(arg, "--session") or eql(arg, "-S")) {
             const v = nextValue(args, &i) orelse return errAction("missing value for", arg);
             opts.session = v;
@@ -286,6 +306,14 @@ pub fn printHelp(w: anytype) !void {
         \\                        max tool-use rounds per turn before
         \\                        IterationBudgetExceeded (default: 10;
         \\                        raise for bench harnesses)
+        \\      --system-append <text>
+        \\                        extra system prompt content appended
+        \\                        after velk's default base; lets you
+        \\                        add guidance without dropping the
+        \\                        default scaffolding
+        \\      --no-system-prompt
+        \\                        drop the built-in default system
+        \\                        prompt entirely (bare-model behavior)
         \\      --max-context <pct>
         \\                        auto-run /compact when cumulative input
         \\                        tokens reach <pct>% of the model's
@@ -603,4 +631,20 @@ test "parse: --max-iterations rejects 0" {
 test "parse: --max-iterations defaults to 0 (use session default)" {
     const o = try expectRun(parse(&.{ "velk", "hi" }));
     try testing.expectEqual(@as(u32, 0), o.max_iterations);
+}
+
+test "parse: --system-append captures the value" {
+    const o = try expectRun(parse(&.{ "velk", "--system-append", "extra", "hi" }));
+    try testing.expectEqualStrings("extra", o.system_append.?);
+}
+
+test "parse: --no-system-prompt sets the flag" {
+    const o = try expectRun(parse(&.{ "velk", "--no-system-prompt", "hi" }));
+    try testing.expect(o.no_system_prompt);
+}
+
+test "parse: --system-append + --no-system-prompt default unset" {
+    const o = try expectRun(parse(&.{ "velk", "hi" }));
+    try testing.expect(o.system_append == null);
+    try testing.expect(!o.no_system_prompt);
 }

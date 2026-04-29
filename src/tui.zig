@@ -1767,6 +1767,22 @@ fn slashDoctor(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     try buf.print(c.tui.arena, "  · model: {s}\n", .{c.tui.model});
     try buf.print(c.tui.arena, "  · mcp servers attached: {d}\n", .{c.tui.mcp_count});
 
+    // System-prompt size + cache eligibility. Approximate token
+    // count via /4 byte heuristic (good enough for English; the
+    // model server tokenizes for the actual price). Engages
+    // Anthropic's prompt cache once the prefix exceeds the
+    // model's minimum cacheable size.
+    if (c.tui.sess.config.system) |sys| {
+        const approx_tokens: u32 = @intCast(sys.len / 4);
+        try buf.print(c.tui.arena, "  · system prompt: {d} bytes (~{d} tokens)\n", .{ sys.len, approx_tokens });
+        if (cost.cacheMinTokens(c.tui.model)) |min| {
+            const status: []const u8 = if (approx_tokens >= min) "yes" else "no — short of threshold";
+            try buf.print(c.tui.arena, "  · cache threshold ({s}): {d} tokens · engaged: {s}\n", .{ c.tui.model, min, status });
+        }
+    } else {
+        try buf.appendSlice(c.tui.arena, "  · system prompt: (none)\n");
+    }
+
     // Saved-session count.
     const sessions = persist.listSessions(c.tui.arena, c.tui.io, c.env_map) catch &[_]persist.SessionMeta{};
     try buf.print(c.tui.arena, "  · saved sessions: {d}\n", .{sessions.len});

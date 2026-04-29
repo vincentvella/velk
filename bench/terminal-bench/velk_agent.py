@@ -121,12 +121,16 @@ class VelkAgent(AbstractInstalledAgent):
             ),
         )
 
+        # `--system-append` instead of `--system`: keeps velk's
+        # built-in default scaffolding (read-before-write, scope
+        # discipline, executing-actions-with-care) and tacks the
+        # bench-specific non-interactive bullet on the end.
         cmd = (
             f"velk --no-tui"
             f" --provider {shlex.quote(provider)}"
             f" --model {shlex.quote(model)}"
             f" --mode bypass"
-            f" --system {shlex.quote(system_prompt)}"
+            f" --system-append {shlex.quote(system_prompt)}"
             f" --max-iterations {shlex.quote(max_iters)}"
             f" --max-cost {shlex.quote(max_cost)}"
             f" --max-turn-ms {shlex.quote(max_turn_ms)}"

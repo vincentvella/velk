@@ -20,6 +20,7 @@ const skills_mod = @import("skills.zig");
 const ignore_mod = @import("ignore.zig");
 const lockfile = @import("lockfile.zig");
 const watch_mod = @import("watch.zig");
+const system_prompts = @import("system_prompts.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
 const persist = @import("persist.zig");
@@ -378,18 +379,30 @@ pub fn main(init: std.process.Init) !void {
                 try errw.flush();
             }
 
+            // Resolve the *base* system prompt before layering on
+            // project context / skills / repo-map. Precedence:
+            //   1. `--system <text>`     replaces everything
+            //   2. `--no-system-prompt`  drops the default
+            //   3. otherwise             velk's built-in default
+            const base_system: ?[]const u8 = if (opts.system) |s|
+                s
+            else if (opts.no_system_prompt)
+                null
+            else
+                system_prompts.default;
+
             // Project-context auto-load: walk up from CWD looking
             // for a git repo root, then look for AGENTS.md /
             // VELK.md / CLAUDE.md in either CWD or root and prepend
             // the contents to the system prompt. Failures here are
-            // non-fatal — we just run with the user's --system as-is.
+            // non-fatal — we just run with the base prompt as-is.
             const repo_root = workspace_mod.findRepoRoot(arena, init.io) catch null;
             const ctx_loaded = workspace_mod.findContextFile(arena, init.io, repo_root) catch null;
             var final_system: ?[]const u8 = if (ctx_loaded) |loaded| blk: {
                 try errw.print("velk: auto-loaded {s} ({d} bytes)\n", .{ loaded.path, loaded.contents.len });
                 try errw.flush();
-                break :blk try workspace_mod.buildSystemPrompt(arena, opts.system, loaded.contents, loaded.path);
-            } else opts.system;
+                break :blk try workspace_mod.buildSystemPrompt(arena, base_system, loaded.contents, loaded.path);
+            } else base_system;
 
             // Skills catalog: walk the discovery roots, prepend a
             // catalog summary so the model knows what's available.
@@ -420,6 +433,14 @@ pub fn main(init: std.process.Init) !void {
                     try errw.print("velk: repo-map prepended ({d} bytes)\n", .{map.len});
                     try errw.flush();
                 }
+            }
+
+            // `--system-append`: tack a session-specific block onto
+            // the very end so it's the last thing the model reads
+            // before user content. We wrap it with a header so the
+            // model can tell it's not part of the default scaffold.
+            if (opts.system_append) |extra| {
+                final_system = try system_prompts.formatAppend(arena, final_system orelse "", extra);
             }
 
             // Now that tool_set + final_system are settled, finish
