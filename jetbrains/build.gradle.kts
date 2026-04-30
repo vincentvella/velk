@@ -38,6 +38,15 @@ intellijPlatform {
             untilBuild = provider { null }
         }
     }
+    // Publishing config — token reads from $PUBLISH_TOKEN, channel
+    // from $PUBLISH_CHANNEL (default = stable Marketplace listing).
+    // The CI release.yml job sets both. For manual local publishing,
+    // set PUBLISH_TOKEN in your shell before running
+    // `gradle publishPlugin`.
+    publishing {
+        token = providers.environmentVariable("PUBLISH_TOKEN")
+        channels = providers.environmentVariable("PUBLISH_CHANNEL").orElse("default").map { listOf(it) }
+    }
 }
 
 kotlin {

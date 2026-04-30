@@ -9,6 +9,13 @@ on:
 permissions:
   contents: write
 
+# All JS-based actions opt into Node 24. GitHub deprecated Node 20
+# on Sept 2025 and will force-upgrade on June 2026; setting this
+# now silences the deprecation warnings and runs every JS action
+# under the new runtime today.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 
 jobs:
   build:
@@ -314,11 +321,10 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         working-directory: jetbrains
         env:
+          # Both env vars are read by build.gradle.kts's
+          # intellijPlatform.publishing block via
+          # `providers.environmentVariable(...)`. PUBLISH_CHANNEL
+          # defaults to "default" (stable Marketplace listing).
           PUBLISH_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
-          # Optional: override the release channel ("default", "eap",
-          # "beta"). Default channel = stable Marketplace listing.
           PUBLISH_CHANNEL: ${{ vars.JETBRAINS_PUBLISH_CHANNEL || 'default' }}
-        run: |
-          gradle publishPlugin \
-            -Pintellij.publish.token="$PUBLISH_TOKEN" \
-            -Pintellij.publish.channel="$PUBLISH_CHANNEL"
+        run: gradle publishPlugin
