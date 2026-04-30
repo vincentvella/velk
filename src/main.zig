@@ -18,6 +18,7 @@ const todos_mod = @import("todos.zig");
 const ask_mod = @import("ask.zig");
 const skills_mod = @import("skills.zig");
 const memory_mod = @import("memory.zig");
+const styles_mod = @import("styles.zig");
 const ignore_mod = @import("ignore.zig");
 const lockfile = @import("lockfile.zig");
 const watch_mod = @import("watch.zig");
@@ -181,9 +182,11 @@ pub fn main(init: std.process.Init) !void {
             // Defaults onto the merged settings.defaults BEFORE we
             // apply settings → CLI. Order: profile beats file
             // defaults; CLI flags still win over both.
+            var active_profile_tools: []const []const u8 = &.{};
             if (raw_opts.profile) |pname| {
-                if (file_settings.findProfile(pname)) |pdef| {
-                    file_settings.applyDefaults(pdef);
+                if (file_settings.findProfileFull(pname)) |prof| {
+                    file_settings.applyDefaults(prof.defaults);
+                    active_profile_tools = prof.tools;
                     try errw.print("velk: profile '{s}' applied\n", .{pname});
                     try errw.flush();
                 } else {
@@ -312,10 +315,19 @@ pub fn main(init: std.process.Init) !void {
                             continue :outer;
                         }
                     }
+                    const args_buf = try arena.alloc(tools.CustomToolArg, spec.args.len);
+                    for (spec.args, 0..) |a, i| args_buf[i] = .{
+                        .name = a.name,
+                        .description = a.description,
+                        .required = a.required,
+                    };
                     const t = tools.buildCustom(arena, settings, .{
                         .name = spec.name,
                         .description = spec.description,
                         .command = spec.command,
+                        .args = args_buf,
+                        .timeout_ms = spec.timeout_ms,
+                        .cwd = spec.cwd,
                     }) catch |e| {
                         try errw.print("velk: custom tool '{s}' build failed: {s}\n", .{ spec.name, @errorName(e) });
                         try errw.flush();
@@ -362,6 +374,35 @@ pub fn main(init: std.process.Init) !void {
                 }
 
                 try errw.print("velk: mcp · {d} server(s) · {d} tool(s) added\n", .{ servers.clients.items.len, servers.tools.len });
+                try errw.flush();
+            }
+
+            // Profile tool allowlist: filter the registry to just the
+            // names the active profile permits. Skips silently when
+            // the active profile has no `tools:` field — only an
+            // explicit, non-empty list is treated as a constraint.
+            // Names that don't match anything in the registry are
+            // surfaced as a warning so a typoed entry doesn't silently
+            // narrow the toolset to the empty set.
+            if (active_profile_tools.len > 0) {
+                const before = tool_set.len;
+                var filtered: std.ArrayList(tool.Tool) = .empty;
+                for (active_profile_tools) |allowed| {
+                    var matched = false;
+                    for (tool_set) |t| {
+                        if (std.mem.eql(u8, t.name, allowed)) {
+                            try filtered.append(arena, t);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched) {
+                        try errw.print("velk: profile tool '{s}' not registered — ignoring\n", .{allowed});
+                        try errw.flush();
+                    }
+                }
+                tool_set = filtered.items;
+                try errw.print("velk: profile tools · {d} → {d}\n", .{ before, tool_set.len });
                 try errw.flush();
             }
 
@@ -595,7 +636,17 @@ pub fn main(init: std.process.Init) !void {
             const had_stale_lock = lockfile.touchAndCheckStale(arena, init.io, init.environ_map) catch false;
             defer lockfile.release(init.io, arena, init.environ_map);
 
-            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate, settings, had_stale_lock, opts.max_cost, opts.max_context_pct) catch |err| {
+            // Resolve the persisted output style (`.velk/settings.json` →
+            // `defaults.style`) so the TUI starts in the user's last
+            // selection. Unknown style names are ignored with a warning.
+            const initial_style: ?styles_mod.Style = if (file_settings.defaults.style) |sn| blk: {
+                if (styles_mod.find(sn)) |s| break :blk s;
+                try errw.print("velk: settings.json defaults.style '{s}' not in catalog — ignoring\n", .{sn});
+                try errw.flush();
+                break :blk null;
+            } else null;
+
+            tui.run(arena, init.io, init.gpa, init.environ_map, &sess, model, mcp_count, approval_gate, opts.auto_commit, hook_engine_ptr, todos_store, ask_gate, settings, had_stale_lock, opts.max_cost, opts.max_context_pct, initial_style) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 std.process.exit(1);

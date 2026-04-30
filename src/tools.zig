@@ -1742,10 +1742,21 @@ fn writeMemoryExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.jso
 /// Spec for a user-declared shell tool. A new `tool.Tool` is built
 /// per spec at startup; the tool's input schema is empty (v1 has no
 /// argument substitution). Refused under plan mode like `bash`.
+/// Mirror of `settings.CustomToolArg` — duplicated here for the
+/// same reason `LspServerConfig` is duplicated above (cycle-break).
+pub const CustomToolArg = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    required: bool = false,
+};
+
 pub const CustomToolDef = struct {
     name: []const u8,
     description: []const u8,
     command: []const u8,
+    args: []const CustomToolArg = &.{},
+    timeout_ms: ?u32 = null,
+    cwd: ?[]const u8 = null,
 };
 
 /// Per-tool context — the registry's tool slot points at this. It
@@ -1755,9 +1766,103 @@ const CustomToolCtx = struct {
     spec: CustomToolDef,
 };
 
-const custom_schema_json: []const u8 =
+const custom_schema_empty: []const u8 =
     \\{"type":"object","properties":{},"additionalProperties":false}
 ;
+
+/// Build a JSON Schema object for a custom tool. With no args this is
+/// the empty-object schema; with args, each becomes a string property
+/// (descriptions surfaced if set, required fields collected).
+fn buildCustomSchema(arena: std.mem.Allocator, args: []const CustomToolArg) !std.json.Value {
+    if (args.len == 0) {
+        return try std.json.parseFromSliceLeaky(std.json.Value, arena, custom_schema_empty, .{});
+    }
+    var props: std.json.ObjectMap = .empty;
+    var required: std.json.Array = .init(arena);
+    for (args) |a| {
+        var prop: std.json.ObjectMap = .empty;
+        try prop.put(arena, "type", .{ .string = "string" });
+        if (a.description.len > 0) try prop.put(arena, "description", .{ .string = a.description });
+        try props.put(arena, a.name, .{ .object = prop });
+        if (a.required) try required.append(.{ .string = a.name });
+    }
+    var root: std.json.ObjectMap = .empty;
+    try root.put(arena, "type", .{ .string = "object" });
+    try root.put(arena, "properties", .{ .object = props });
+    if (required.items.len > 0) try root.put(arena, "required", .{ .array = required });
+    try root.put(arena, "additionalProperties", .{ .bool = false });
+    return .{ .object = root };
+}
+
+/// Single-quote a value for safe inclusion in a shell command:
+/// wrap in `'…'` and replace any embedded `'` with `'\''`. The
+/// result can be substituted into a `bash -c` / `sh -c` string and
+/// will be treated as one literal token regardless of whitespace,
+/// metachars, or quoting in the original value.
+fn shellEscape(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.append(arena, '\'');
+    for (value) |c| {
+        if (c == '\'') {
+            try buf.appendSlice(arena, "'\\''");
+        } else {
+            try buf.append(arena, c);
+        }
+    }
+    try buf.append(arena, '\'');
+    return buf.items;
+}
+
+/// Replace every `${name}` in `template` with the (shell-escaped)
+/// matching JSON-input value. Unknown placeholders become empty
+/// strings — the tool author is expected to mark required args via
+/// `required: true` so the schema rejects missing inputs at the
+/// wire layer rather than producing a half-substituted command here.
+/// Literal `$$` collapses to `$` so a tool author can still emit a
+/// single dollar without breaking substitution.
+fn substituteCommand(
+    arena: std.mem.Allocator,
+    template: []const u8,
+    input: std.json.Value,
+) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] == '$' and i + 1 < template.len and template[i + 1] == '$') {
+            try buf.append(arena, '$');
+            i += 2;
+            continue;
+        }
+        if (template[i] == '$' and i + 1 < template.len and template[i + 1] == '{') {
+            const close = std.mem.indexOfScalarPos(u8, template, i + 2, '}') orelse {
+                try buf.append(arena, template[i]);
+                i += 1;
+                continue;
+            };
+            const key = template[i + 2 .. close];
+            const value: []const u8 = blk: {
+                if (input == .object) {
+                    if (input.object.get(key)) |v| switch (v) {
+                        .string => |s| break :blk s,
+                        .integer => |n| break :blk try std.fmt.allocPrint(arena, "{d}", .{n}),
+                        .float => |f| break :blk try std.fmt.allocPrint(arena, "{d}", .{f}),
+                        .bool => |b| break :blk if (b) "true" else "false",
+                        .null => break :blk "",
+                        else => break :blk "",
+                    };
+                }
+                break :blk "";
+            };
+            const escaped = try shellEscape(arena, value);
+            try buf.appendSlice(arena, escaped);
+            i = close + 1;
+            continue;
+        }
+        try buf.append(arena, template[i]);
+        i += 1;
+    }
+    return buf.items;
+}
 
 pub fn buildCustom(
     arena: std.mem.Allocator,
@@ -1766,7 +1871,7 @@ pub fn buildCustom(
 ) !tool.Tool {
     const ctx = try arena.create(CustomToolCtx);
     ctx.* = .{ .settings = settings, .spec = spec };
-    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, custom_schema_json, .{});
+    const schema = try buildCustomSchema(arena, spec.args);
     return .{
         .name = spec.name,
         .description = spec.description,
@@ -1776,13 +1881,25 @@ pub fn buildCustom(
     };
 }
 
-fn customExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, _: std.json.Value) anyerror!tool.Output {
+fn customExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
     const c: *const CustomToolCtx = @ptrCast(@alignCast(ctx.?));
     if (c.settings.mode.refusesWrites()) {
         return errorOutput(arena, "{s}: refused — velk is in plan mode (read-only)", .{c.spec.name});
     }
-    const result = runBash(arena, c.settings.io, c.spec.command, default_bash_timeout_ms) catch |e| switch (e) {
-        error.Timeout => return errorOutput(arena, "{s}: timed out after {d}ms", .{ c.spec.name, default_bash_timeout_ms }),
+    // Substitute ${arg} placeholders. With no declared args this is a
+    // pass-through (no `${…}` will match anything to replace).
+    const cmd_substituted = substituteCommand(arena, c.spec.command, input) catch |e| {
+        return errorOutput(arena, "{s}: substitution failed: {s}", .{ c.spec.name, @errorName(e) });
+    };
+    // Wrap with `cd <cwd> && …` when a per-tool cwd is set. shellEscape
+    // makes the path safe for spaces / quotes.
+    const cmd_with_cwd: []const u8 = if (c.spec.cwd) |dir| blk: {
+        const escaped = try shellEscape(arena, dir);
+        break :blk try std.fmt.allocPrint(arena, "cd {s} && {s}", .{ escaped, cmd_substituted });
+    } else cmd_substituted;
+    const tmo: i64 = if (c.spec.timeout_ms) |t| @intCast(t) else default_bash_timeout_ms;
+    const result = runBash(arena, c.settings.io, cmd_with_cwd, tmo) catch |e| switch (e) {
+        error.Timeout => return errorOutput(arena, "{s}: timed out after {d}ms", .{ c.spec.name, tmo }),
         error.Canceled => return errorOutput(arena, "{s}: aborted", .{c.spec.name}),
         else => return errorOutput(arena, "{s}: spawn failed: {s}", .{ c.spec.name, @errorName(e) }),
     };
@@ -1946,6 +2063,130 @@ test "custom: shells out to its configured command" {
     try testing.expect(!out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.text, "exit: 0") != null);
     try testing.expect(std.mem.indexOf(u8, out.text, "custom-tool-marker") != null);
+}
+
+test "shellEscape: wraps in single quotes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const out = try shellEscape(arena.allocator(), "hello world");
+    try testing.expectEqualStrings("'hello world'", out);
+}
+
+test "shellEscape: handles embedded single quote" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const out = try shellEscape(arena.allocator(), "it's");
+    try testing.expectEqualStrings("'it'\\''s'", out);
+}
+
+test "shellEscape: neutralises shell metachars" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const out = try shellEscape(arena.allocator(), "$(rm -rf /)");
+    try testing.expectEqualStrings("'$(rm -rf /)'", out);
+}
+
+test "substituteCommand: replaces ${name} with quoted JSON value" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "path", .{ .string = "src/x y.zig" });
+    const out = try substituteCommand(a, "wc -l ${path}", .{ .object = obj });
+    try testing.expectEqualStrings("wc -l 'src/x y.zig'", out);
+}
+
+test "substituteCommand: missing key becomes empty quoted slot" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const obj: std.json.ObjectMap = .empty;
+    const out = try substituteCommand(a, "echo ${missing}", .{ .object = obj });
+    try testing.expectEqualStrings("echo ''", out);
+}
+
+test "substituteCommand: $$ collapses to literal $" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const obj: std.json.ObjectMap = .empty;
+    const out = try substituteCommand(a, "echo $$HOME", .{ .object = obj });
+    try testing.expectEqualStrings("echo $HOME", out);
+}
+
+test "substituteCommand: integer args get stringified" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "n", .{ .integer = 42 });
+    const out = try substituteCommand(a, "head -n ${n}", .{ .object = obj });
+    try testing.expectEqualStrings("head -n '42'", out);
+}
+
+test "buildCustomSchema: empty when no args" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const v = try buildCustomSchema(arena.allocator(), &.{});
+    try testing.expect(v == .object);
+    try testing.expect(v.object.get("properties") != null);
+    try testing.expect(v.object.get("required") == null);
+}
+
+test "buildCustomSchema: emits properties + required list" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const args = [_]CustomToolArg{
+        .{ .name = "path", .description = "file to read", .required = true },
+        .{ .name = "limit", .description = "", .required = false },
+    };
+    const v = try buildCustomSchema(arena.allocator(), &args);
+    try testing.expect(v.object.get("properties").?.object.get("path") != null);
+    try testing.expect(v.object.get("properties").?.object.get("limit") != null);
+    const req = v.object.get("required").?.array;
+    try testing.expectEqual(@as(usize, 1), req.items.len);
+    try testing.expectEqualStrings("path", req.items[0].string);
+}
+
+test "custom: substitutes ${arg} from input at exec time" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const args = [_]CustomToolArg{.{ .name = "msg", .required = true }};
+    const t = try buildCustom(a, &settings, .{
+        .name = "echo-msg",
+        .description = "echoes a user-supplied marker",
+        .command = "echo ${msg}",
+        .args = &args,
+    });
+    const input = try jsonObj(a, .{ .msg = @as([]const u8, "hello-from-arg") });
+    const out = try t.execute(t.context, a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "hello-from-arg") != null);
+}
+
+test "custom: per-tool cwd runs the command in that directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "marker.txt", .data = "hello\n" });
+    const t = try buildCustom(a, &settings, .{
+        .name = "ls-cwd",
+        .description = "lists per-tool cwd",
+        .command = "ls",
+        .cwd = tmp_abs,
+    });
+    const empty: std.json.ObjectMap = .empty;
+    const out = try t.execute(t.context, a, .{ .object = empty });
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "marker.txt") != null);
 }
 
 test "custom: refused under plan mode" {

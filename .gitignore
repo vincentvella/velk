@@ -2,6 +2,7 @@ zig-out/
 .zig-cache/
 zig-pkg/
 ROADMAP.md
+.velk/
 
 # Local-only tool / editor config
 .claude/

@@ -26,6 +26,7 @@ const ask = @import("ask.zig");
 const tools_mod = @import("tools.zig");
 const permissions = @import("permissions.zig");
 const styles = @import("styles.zig");
+const settings_mod = @import("settings.zig");
 
 const Event = union(enum) {
     // vaxis-posted events
@@ -1633,7 +1634,15 @@ fn slashStyle(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
     if (std.mem.eql(u8, args, "clear") or std.mem.eql(u8, args, "default")) {
         c.tui.current_style = null;
         try rebuildEffectiveSystem(c.tui);
-        try c.tui.pushBlock(.notice, "Output style cleared (now: default).");
+        // Best-effort persistence — surface the failure inline but
+        // don't roll back the in-memory change. The session still
+        // has the right style for this run.
+        if (settings_mod.setProjectStyle(c.tui.arena, c.tui.io, null)) |_| {
+            try c.tui.pushBlock(.notice, "Output style cleared (now: default). Persisted to .velk/settings.json.");
+        } else |err| {
+            const msg = try std.fmt.allocPrint(c.tui.arena, "Output style cleared (now: default). Persist failed: {s}", .{@errorName(err)});
+            try c.tui.pushBlock(.notice, msg);
+        }
         return .handled;
     }
     const picked = styles.find(args) orelse {
@@ -1643,7 +1652,11 @@ fn slashStyle(ctx: *anyopaque, args: []const u8) anyerror!slash.Action {
     };
     c.tui.current_style = picked;
     try rebuildEffectiveSystem(c.tui);
-    const msg = try std.fmt.allocPrint(c.tui.arena, "Output style set to '{s}'.", .{picked.name});
+    const persist_msg: []const u8 = if (settings_mod.setProjectStyle(c.tui.arena, c.tui.io, picked.name)) |_|
+        " (persisted to .velk/settings.json)"
+    else |_|
+        "";
+    const msg = try std.fmt.allocPrint(c.tui.arena, "Output style set to '{s}'.{s}", .{ picked.name, persist_msg });
     try c.tui.pushBlock(.notice, msg);
     return .handled;
 }
@@ -1994,6 +2007,7 @@ pub fn run(
     had_stale_lock: bool,
     max_cost_usd: f64,
     max_context_pct: u8,
+    initial_style: ?styles.Style,
 ) !void {
     // Dedicated arena for TUI-state allocations (blocks, history,
     // input buffer). Separate from `arena` (which the agent worker
@@ -2044,7 +2058,15 @@ pub fn run(
         .max_cost_usd = max_cost_usd,
         .max_context_pct = max_context_pct,
         .base_system = sess.config.system,
+        .current_style = initial_style,
     };
+    // If a default style is preselected, apply it on top of the
+    // base system prompt before the first turn renders. Failures
+    // here are silent — falling back to the bare base prompt is the
+    // worst case and matches "no style".
+    if (initial_style != null) {
+        tui.sess.config.system = styles.apply(tui.arena, tui.base_system, tui.current_style) catch tui.base_system;
+    }
     defer if (todos_store) |s| s.deinit(io);
     if (ask_gate) |g| {
         g.post_fn = postAskEvent;

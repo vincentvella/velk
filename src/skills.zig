@@ -36,6 +36,12 @@ pub const Skill = struct {
     /// allowlist when the model is acting under a skill is a
     /// follow-up (would need an "active skill" runtime concept).
     tools: []const []const u8 = &.{},
+    /// Optional output-style hint declared as `style: concise` in
+    /// the frontmatter. Surfaced in the catalog so the model knows
+    /// the author's preferred output shape when applying the skill.
+    /// Same honor-system caveat as `tools` — runtime auto-switch is
+    /// out of scope for catalog-only skills.
+    style: ?[]const u8 = null,
 };
 
 pub const Source = enum { user_claude, user_velk, project_claude, project_velk };
@@ -84,6 +90,9 @@ pub fn formatCatalog(arena: std.mem.Allocator, skills: []const Skill) ![]const u
             }
             try buf.append(arena, '\n');
         }
+        if (s.style) |st| {
+            try buf.print(arena, "  recommended output style: {s}\n", .{st});
+        }
     }
     try buf.appendSlice(arena, "</skills>\n");
     return buf.items;
@@ -130,6 +139,7 @@ fn loadFrom(
             .description = desc_owned,
             .path = skill_md,
             .tools = fm.tools,
+            .style = fm.style,
         });
     }
 }
@@ -138,6 +148,7 @@ const Frontmatter = struct {
     name: []const u8,
     description: []const u8,
     tools: []const []const u8 = &.{},
+    style: ?[]const u8 = null,
 };
 
 /// Parse the `---`-delimited YAML header at the start of `body`.
@@ -195,6 +206,7 @@ pub fn parseFrontmatterAlloc(arena: std.mem.Allocator, body: []const u8) ?Frontm
     var desc: ?[]const u8 = null;
     var tools: std.ArrayList([]const u8) = .empty;
     var in_tools_block: bool = false;
+    var style: ?[]const u8 = null;
 
     var lines = std.mem.splitScalar(u8, block, '\n');
     while (lines.next()) |line_raw| {
@@ -223,6 +235,12 @@ pub fn parseFrontmatterAlloc(arena: std.mem.Allocator, body: []const u8) ?Frontm
 
         if (parseKeyValue(trimmed, "name")) |v| name = v;
         if (parseKeyValue(trimmed, "description")) |v| desc = v;
+        if (parseKeyValue(trimmed, "style")) |v| {
+            if (v.len > 0) {
+                const owned = arena.dupe(u8, stripQuotes(v)) catch return null;
+                style = owned;
+            }
+        }
         if (parseKeyValue(trimmed, "tools")) |v| {
             // Empty value → expect a block list on the following lines.
             if (v.len == 0) {
@@ -241,7 +259,7 @@ pub fn parseFrontmatterAlloc(arena: std.mem.Allocator, body: []const u8) ?Frontm
         }
     }
     if (name == null or desc == null) return null;
-    return .{ .name = name.?, .description = desc.?, .tools = tools.items };
+    return .{ .name = name.?, .description = desc.?, .tools = tools.items, .style = style };
 }
 
 fn stripQuotes(s: []const u8) []const u8 {
@@ -397,6 +415,50 @@ test "parseFrontmatterAlloc: missing tools key yields empty list" {
     ;
     const fm = parseFrontmatterAlloc(arena_state.allocator(), body).?;
     try testing.expectEqual(@as(usize, 0), fm.tools.len);
+}
+
+test "parseFrontmatterAlloc: extracts style field" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body =
+        \\---
+        \\name: bug-triage
+        \\description: when to apply
+        \\style: concise
+        \\---
+        \\body
+    ;
+    const fm = parseFrontmatterAlloc(arena_state.allocator(), body).?;
+    try testing.expectEqualStrings("concise", fm.style.?);
+}
+
+test "parseFrontmatterAlloc: missing style yields null" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body =
+        \\---
+        \\name: x
+        \\description: y
+        \\---
+        \\
+    ;
+    const fm = parseFrontmatterAlloc(arena_state.allocator(), body).?;
+    try testing.expect(fm.style == null);
+}
+
+test "formatCatalog: surfaces recommended output style" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const skills = [_]Skill{
+        .{
+            .name = "tidy",
+            .description = "clean up a file",
+            .path = ".velk/skills/tidy/SKILL.md",
+            .style = "concise",
+        },
+    };
+    const out = try formatCatalog(arena_state.allocator(), &skills);
+    try testing.expect(std.mem.indexOf(u8, out, "recommended output style: concise") != null);
 }
 
 test "formatCatalog: empty list yields empty string" {

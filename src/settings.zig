@@ -24,11 +24,21 @@ pub const Defaults = struct {
     model: ?[]const u8 = null,
     system: ?[]const u8 = null,
     max_tokens: ?u32 = null,
+    /// Optional default output style by name ("concise", "verbose",
+    /// etc.). Persisted by `/style` so the next launch starts in the
+    /// last-selected style.
+    style: ?[]const u8 = null,
 };
 
 pub const Profile = struct {
     name: []const u8,
     defaults: Defaults = .{},
+    /// Optional tool-name allowlist. When non-empty, the registry is
+    /// filtered to just these names while this profile is active —
+    /// useful for `review`, `audit`, or other read-only personas.
+    /// Null/empty = no filtering (all tools exposed). Mirrors how the
+    /// `task` sub-agent's `tools:` array filters the parent registry.
+    tools: []const []const u8 = &.{},
 };
 
 /// User-declared shell tool. The model invokes it like any other
@@ -40,6 +50,25 @@ pub const CustomTool = struct {
     name: []const u8,
     command: []const u8,
     description: []const u8,
+    /// Optional named arguments. Each name appears in `command` as
+    /// `${name}` and is shell-escaped at substitution time. When
+    /// `args` is empty the input schema is `{}` (no parameters).
+    args: []const CustomToolArg = &.{},
+    /// Per-tool timeout. Falls back to the default bash timeout when
+    /// null so existing entries keep their behaviour.
+    timeout_ms: ?u32 = null,
+    /// Working directory the command runs in. Resolved relative to
+    /// CWD when relative; null = inherit CWD (current behaviour).
+    cwd: ?[]const u8 = null,
+};
+
+pub const CustomToolArg = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    /// When true, the model MUST supply this arg. Default false: the
+    /// substitution falls back to an empty string when the arg is
+    /// missing, so optional args degrade gracefully.
+    required: bool = false,
 };
 
 /// Per-language LSP server config. `extension` is matched against a
@@ -89,6 +118,7 @@ pub const Settings = struct {
         if (b.model) |m| self.defaults.model = m;
         if (b.system) |s| self.defaults.system = s;
         if (b.max_tokens) |t| self.defaults.max_tokens = t;
+        if (b.style) |s| self.defaults.style = s;
     }
 
     /// Look up a named profile. Case-sensitive. Returns null when no
@@ -97,6 +127,16 @@ pub const Settings = struct {
     pub fn findProfile(self: Settings, name: []const u8) ?Defaults {
         for (self.profiles) |p| {
             if (std.mem.eql(u8, p.name, name)) return p.defaults;
+        }
+        return null;
+    }
+
+    /// Like `findProfile` but returns the whole record so callers
+    /// can also read the tools allowlist. Kept separate so existing
+    /// callers that only care about `Defaults` don't need to change.
+    pub fn findProfileFull(self: Settings, name: []const u8) ?Profile {
+        for (self.profiles) |p| {
+            if (std.mem.eql(u8, p.name, name)) return p;
         }
         return null;
     }
@@ -189,6 +229,65 @@ pub fn loadFile(
     return try parse(arena, data);
 }
 
+/// Persist the active output-style name to `.velk/settings.json` so
+/// the next launch picks it back up. The mutation is targeted: read
+/// the existing file (or start from `{}`), set `defaults.style`, and
+/// rewrite. Other top-level keys and unknown fields are preserved
+/// — the JSON round-trip is via `std.json.Value`, which keeps
+/// everything we don't touch intact.
+///
+/// Pass `null` for `style_name` to clear the persisted style.
+pub fn setProjectStyle(
+    arena: std.mem.Allocator,
+    io: Io,
+    style_name: ?[]const u8,
+) !void {
+    const path = try projectPath(arena);
+    try setStyleAtPath(arena, io, Io.Dir.cwd(), project_dir_name, path, style_name);
+}
+
+/// Path-taking primitive used by `setProjectStyle`. Tests target this
+/// directly via a tmp `Io.Dir` so they don't have to chdir.
+fn setStyleAtPath(
+    arena: std.mem.Allocator,
+    io: Io,
+    dir: Io.Dir,
+    dir_name: []const u8,
+    file_path: []const u8,
+    style_name: ?[]const u8,
+) !void {
+    var root: std.json.Value = .{ .object = .empty };
+    if (dir.readFileAlloc(io, file_path, arena, .limited(1 * 1024 * 1024))) |data| {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, data, .{}) catch
+            return Error.InvalidSettingsJson;
+        if (parsed != .object) return Error.InvalidSettingsJson;
+        root = parsed;
+    } else |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    }
+
+    var defaults: std.json.ObjectMap = if (root.object.get("defaults")) |d|
+        if (d == .object) d.object else .empty
+    else
+        .empty;
+    if (style_name) |name| {
+        try defaults.put(arena, "style", .{ .string = try arena.dupe(u8, name) });
+    } else {
+        _ = defaults.swapRemove("style");
+    }
+    try root.object.put(arena, "defaults", .{ .object = defaults });
+
+    dir.createDirPath(io, dir_name) catch |e| switch (e) {
+        error.PathAlreadyExists => {},
+        else => return e,
+    };
+
+    const out = try std.json.Stringify.valueAlloc(arena, root, .{ .whitespace = .indent_2 });
+    const with_nl = try std.fmt.allocPrint(arena, "{s}\n", .{out});
+    try dir.writeFile(io, .{ .sub_path = file_path, .data = with_nl });
+}
+
 /// Convenience: load both user and project files (if present) and
 /// merge user → project so project wins.
 pub fn loadAndMerge(
@@ -231,6 +330,15 @@ const WireCustomTool = struct {
     name: ?[]const u8 = null,
     command: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    args: ?[]WireCustomToolArg = null,
+    timeout_ms: ?u32 = null,
+    cwd: ?[]const u8 = null,
+};
+
+const WireCustomToolArg = struct {
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    required: ?bool = null,
 };
 
 const WireLsp = struct {
@@ -256,6 +364,7 @@ const WireDefaults = struct {
     model: ?[]const u8 = null,
     system: ?[]const u8 = null,
     max_tokens: ?u32 = null,
+    style: ?[]const u8 = null,
 };
 
 fn parse(arena: std.mem.Allocator, data: []const u8) !Settings {
@@ -273,6 +382,7 @@ fn parse(arena: std.mem.Allocator, data: []const u8) !Settings {
         out.defaults.model = d.model;
         out.defaults.system = d.system;
         out.defaults.max_tokens = d.max_tokens;
+        out.defaults.style = d.style;
     }
     if (wire.mcp_servers) |m| out.mcp_servers = m;
     if (wire.permissions) |p| {
@@ -327,10 +437,26 @@ fn parseCustomTools(arena: std.mem.Allocator, raw: []WireCustomTool) ![]const Cu
         const name = w.name orelse return Error.InvalidSettingsJson;
         const command = w.command orelse return Error.InvalidSettingsJson;
         const description = w.description orelse return Error.InvalidSettingsJson;
+        var args_out: []CustomToolArg = &.{};
+        if (w.args) |raw_args| {
+            const buf = try arena.alloc(CustomToolArg, raw_args.len);
+            for (raw_args, 0..) |wa, i| {
+                const aname = wa.name orelse return Error.InvalidSettingsJson;
+                buf[i] = .{
+                    .name = try arena.dupe(u8, aname),
+                    .description = if (wa.description) |d| try arena.dupe(u8, d) else "",
+                    .required = wa.required orelse false,
+                };
+            }
+            args_out = buf;
+        }
         try list.append(arena, .{
             .name = try arena.dupe(u8, name),
             .command = try arena.dupe(u8, command),
             .description = try arena.dupe(u8, description),
+            .args = args_out,
+            .timeout_ms = w.timeout_ms,
+            .cwd = if (w.cwd) |c| try arena.dupe(u8, c) else null,
         });
     }
     return list.items;
@@ -397,6 +523,19 @@ fn parseProfiles(arena: std.mem.Allocator, v: std.json.Value) ![]const Profile {
                     .integer => |i| if (i < 0) return Error.InvalidSettingsJson else @intCast(i),
                     else => return Error.InvalidSettingsJson,
                 };
+            } else if (std.mem.eql(u8, k, "tools")) {
+                const arr = switch (val) {
+                    .array => |a| a,
+                    else => return Error.InvalidSettingsJson,
+                };
+                const buf = try arena.alloc([]const u8, arr.items.len);
+                for (arr.items, 0..) |item, i| {
+                    buf[i] = switch (item) {
+                        .string => |s| try arena.dupe(u8, s),
+                        else => return Error.InvalidSettingsJson,
+                    };
+                }
+                prof.tools = buf;
             }
             // Unknown keys inside a profile are ignored (forward-compat).
         }
@@ -509,6 +648,69 @@ test "merge: mcp_servers are concatenated" {
     try testing.expectEqualStrings("c", user.mcp_servers[2]);
 }
 
+test "setStyleAtPath: writes defaults.style when file is fresh" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    const dir_name = try std.fmt.allocPrint(a, "{s}/.velk", .{tmp_abs});
+    const file_path = try std.fmt.allocPrint(a, "{s}/.velk/settings.json", .{tmp_abs});
+
+    try setStyleAtPath(a, testing.io, Io.Dir.cwd(), dir_name, file_path, "concise");
+    const data = try Io.Dir.cwd().readFileAlloc(testing.io, file_path, a, .limited(64 * 1024));
+    try testing.expect(std.mem.indexOf(u8, data, "\"style\": \"concise\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"defaults\"") != null);
+}
+
+test "setStyleAtPath: preserves unrelated keys on update" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    const dir_name = try std.fmt.allocPrint(a, "{s}/.velk", .{tmp_abs});
+    const file_path = try std.fmt.allocPrint(a, "{s}/.velk/settings.json", .{tmp_abs});
+
+    Io.Dir.cwd().createDirPath(testing.io, dir_name) catch {};
+    const seed =
+        \\{ "defaults": { "model": "claude-sonnet-4-6" },
+        \\  "mcp_servers": ["a","b"] }
+    ;
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file_path, .data = seed });
+
+    try setStyleAtPath(a, testing.io, Io.Dir.cwd(), dir_name, file_path, "verbose");
+    const data = try Io.Dir.cwd().readFileAlloc(testing.io, file_path, a, .limited(64 * 1024));
+    try testing.expect(std.mem.indexOf(u8, data, "\"model\": \"claude-sonnet-4-6\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"style\": \"verbose\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"mcp_servers\"") != null);
+}
+
+test "setStyleAtPath: null style_name removes defaults.style" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    const dir_name = try std.fmt.allocPrint(a, "{s}/.velk", .{tmp_abs});
+    const file_path = try std.fmt.allocPrint(a, "{s}/.velk/settings.json", .{tmp_abs});
+
+    try setStyleAtPath(a, testing.io, Io.Dir.cwd(), dir_name, file_path, "concise");
+    try setStyleAtPath(a, testing.io, Io.Dir.cwd(), dir_name, file_path, null);
+    const data = try Io.Dir.cwd().readFileAlloc(testing.io, file_path, a, .limited(64 * 1024));
+    try testing.expect(std.mem.indexOf(u8, data, "\"style\"") == null);
+}
+
+test "defaults.style: parsed from settings.json" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const s = try parse(arena_state.allocator(), "{\"defaults\":{\"style\":\"concise\"}}");
+    try testing.expectEqualStrings("concise", s.defaults.style.?);
+}
+
 test "userPath: uses XDG_CONFIG_HOME when set" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -546,6 +748,37 @@ test "profiles: parsed and looked up by name" {
 
     const fast = s.findProfile("fast").?;
     try testing.expectEqualStrings("claude-haiku-4-5", fast.model.?);
+}
+
+test "profiles: tools allowlist parsed" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{ "profiles": {
+        \\   "review": { "model": "claude-sonnet-4-6", "tools": ["read_file","grep","bash"] }
+        \\}}
+    ;
+    const s = try parse(arena_state.allocator(), json);
+    const prof = s.findProfileFull("review").?;
+    try testing.expectEqual(@as(usize, 3), prof.tools.len);
+    try testing.expectEqualStrings("read_file", prof.tools[0]);
+    try testing.expectEqualStrings("grep", prof.tools[1]);
+    try testing.expectEqualStrings("bash", prof.tools[2]);
+}
+
+test "profiles: tools field defaults to empty when absent" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const s = try parse(arena_state.allocator(), "{\"profiles\":{\"a\":{\"model\":\"x\"}}}");
+    const prof = s.findProfileFull("a").?;
+    try testing.expectEqual(@as(usize, 0), prof.tools.len);
+}
+
+test "profiles: tools must be string array" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json = "{\"profiles\":{\"a\":{\"tools\":\"read_file\"}}}";
+    try testing.expectError(Error.InvalidSettingsJson, parse(arena_state.allocator(), json));
 }
 
 test "profiles: lookup miss returns null" {
@@ -606,6 +839,58 @@ test "custom_tools: parsed from tools array" {
     try testing.expectEqualStrings("npm run lint", s.custom_tools[0].command);
     try testing.expectEqualStrings("Run the linter", s.custom_tools[0].description);
     try testing.expectEqualStrings("tests", s.custom_tools[1].name);
+}
+
+test "custom_tools: parses args + timeout_ms + cwd" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{ "tools": [{
+        \\  "name": "wcfile",
+        \\  "command": "wc -l ${path}",
+        \\  "description": "count lines",
+        \\  "args": [
+        \\    {"name":"path","description":"file to count","required":true}
+        \\  ],
+        \\  "timeout_ms": 5000,
+        \\  "cwd": "/tmp"
+        \\}]}
+    ;
+    const s = try parse(arena_state.allocator(), json);
+    try testing.expectEqual(@as(usize, 1), s.custom_tools.len);
+    const ct = s.custom_tools[0];
+    try testing.expectEqualStrings("wcfile", ct.name);
+    try testing.expectEqual(@as(usize, 1), ct.args.len);
+    try testing.expectEqualStrings("path", ct.args[0].name);
+    try testing.expectEqualStrings("file to count", ct.args[0].description);
+    try testing.expect(ct.args[0].required);
+    try testing.expectEqual(@as(?u32, 5000), ct.timeout_ms);
+    try testing.expectEqualStrings("/tmp", ct.cwd.?);
+}
+
+test "custom_tools: args optional fields default sanely" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{ "tools": [{
+        \\  "name": "x", "command": "echo ${y}", "description": "d",
+        \\  "args": [{"name":"y"}]
+        \\}]}
+    ;
+    const s = try parse(arena_state.allocator(), json);
+    const arg = s.custom_tools[0].args[0];
+    try testing.expectEqualStrings("y", arg.name);
+    try testing.expectEqualStrings("", arg.description);
+    try testing.expect(!arg.required);
+}
+
+test "custom_tools: arg missing name rejects file" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{"tools":[{"name":"x","command":"y","description":"z","args":[{"required":true}]}]}
+    ;
+    try testing.expectError(Error.InvalidSettingsJson, parse(arena_state.allocator(), json));
 }
 
 test "custom_tools: missing required field rejects file" {
