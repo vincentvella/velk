@@ -90,7 +90,38 @@ pub const Entry = struct {
     /// Bytes on disk — useful for the catalog summary so the
     /// model knows whether a topic is a one-liner or a long note.
     bytes: u64,
+    /// Tags declared in the topic's optional `---`-fenced YAML
+    /// frontmatter (`tags: [a, b]` or `tags: a, b`). Empty when
+    /// the topic has no frontmatter or no `tags:` key.
+    tags: []const []const u8 = &.{},
 };
+
+/// Read up to the first 4 KB of a memory file and extract any
+/// `tags:` value from its YAML frontmatter. Pure helper — exposed for
+/// tests; callers normally see tags via `Entry.tags` from `list`.
+pub fn parseTags(arena: std.mem.Allocator, body: []const u8) ![]const []const u8 {
+    if (!std.mem.startsWith(u8, body, "---")) return &.{};
+    const after_open = body[3..];
+    const header_start = std.mem.indexOfScalar(u8, after_open, '\n') orelse return &.{};
+    const block_start: usize = 3 + header_start + 1;
+    if (block_start > body.len) return &.{};
+    const close_rel = std.mem.indexOf(u8, body[block_start..], "\n---") orelse return &.{};
+    const block = body[block_start .. block_start + close_rel];
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "tags:")) continue;
+        var v = std.mem.trim(u8, line["tags:".len..], " \t");
+        if (v.len >= 2 and v[0] == '[' and v[v.len - 1] == ']') v = v[1 .. v.len - 1];
+        var it = std.mem.splitScalar(u8, v, ',');
+        while (it.next()) |raw_tag| {
+            const t = std.mem.trim(u8, raw_tag, " \t\"'");
+            if (t.len > 0) try out.append(arena, try arena.dupe(u8, t));
+        }
+    }
+    return out.items;
+}
 
 /// Enumerate every `<root>/*.md` file. Returns an empty slice when
 /// memdir doesn't exist yet — the model can call `write_memory` to
@@ -110,12 +141,122 @@ pub fn list(arena: std.mem.Allocator, io: Io, env_map: *std.process.Environ.Map)
         if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
         const slug = entry.name[0 .. entry.name.len - 3];
         const stat = dir.statFile(io, entry.name, .{}) catch continue;
+        // Read just enough to cover any frontmatter without paying
+        // the cost of slurping every body up-front. 4 KB comfortably
+        // accommodates a few-line `---`-fenced YAML header.
+        const head = dir.readFileAlloc(io, entry.name, arena, .limited(4 * 1024)) catch "";
+        const tags = parseTags(arena, head) catch &.{};
         try out.append(arena, .{
             .topic = try arena.dupe(u8, slug),
             .bytes = stat.size,
+            .tags = tags,
         });
     }
     return out.items;
+}
+
+pub const Hit = struct {
+    /// Topic slug (no `.md`).
+    topic: []const u8,
+    /// 0-based line number where the match landed.
+    line: usize,
+    /// Up to 240 chars of the matching line, trimmed.
+    snippet: []const u8,
+};
+
+/// Substring search across every memdir topic. Case-insensitive when
+/// `query` is all-lowercase (the common case); literal otherwise.
+/// Returns up to `max_hits` hits, scanned in directory-iteration
+/// order. Long match lines are truncated to 240 chars to keep tool
+/// output bounded.
+pub fn search(
+    arena: std.mem.Allocator,
+    io: Io,
+    env_map: *std.process.Environ.Map,
+    query: []const u8,
+    max_hits: usize,
+    tag_filter: ?[]const u8,
+) ![]const Hit {
+    if (query.len == 0 and tag_filter == null) return &.{};
+    const lower_query = std.ascii.allocLowerString(arena, query) catch return &.{};
+    const case_insensitive = std.mem.eql(u8, lower_query, query);
+
+    const root = rootPath(arena, env_map) catch return &.{};
+    var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return &.{},
+        else => return e,
+    };
+    defer dir.close(io);
+
+    var hits: std.ArrayList(Hit) = .empty;
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (hits.items.len >= max_hits) break;
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        const slug = entry.name[0 .. entry.name.len - 3];
+
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, entry.name });
+        const data = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 * 1024 * 1024)) catch continue;
+
+        // Tag filter: if set, the topic's frontmatter must include
+        // a matching tag. Topics without frontmatter are skipped.
+        if (tag_filter) |needle| {
+            const tags = parseTags(arena, data) catch &.{};
+            var matched = false;
+            for (tags) |t| if (std.mem.eql(u8, t, needle)) {
+                matched = true;
+                break;
+            };
+            if (!matched) continue;
+        }
+
+        // Empty query + tag filter: synthesize a single hit per
+        // matching topic so the model gets a useful list back.
+        if (query.len == 0) {
+            try hits.append(arena, .{
+                .topic = try arena.dupe(u8, slug),
+                .line = 0,
+                .snippet = "",
+            });
+            continue;
+        }
+
+        var line_no: usize = 0;
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| : (line_no += 1) {
+            if (hits.items.len >= max_hits) break;
+            const found: bool = if (case_insensitive)
+                indexOfCaseInsensitive(line, query) != null
+            else
+                std.mem.indexOf(u8, line, query) != null;
+            if (!found) continue;
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            const cap = @min(trimmed.len, 240);
+            try hits.append(arena, .{
+                .topic = try arena.dupe(u8, slug),
+                .line = line_no,
+                .snippet = try arena.dupe(u8, trimmed[0..cap]),
+            });
+        }
+    }
+    return hits.items;
+}
+
+fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (haystack.len < needle.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            const a = std.ascii.toLower(haystack[i + j]);
+            const b = std.ascii.toLower(needle[j]);
+            if (a != b) break;
+        }
+        if (j == needle.len) return i;
+    }
+    return null;
 }
 
 /// Render a `<memory-index>` block listing every topic + its byte
@@ -127,9 +268,17 @@ pub fn formatIndex(arena: std.mem.Allocator, entries: []const Entry) ![]const u8
     if (entries.len == 0) return "";
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(arena, "<memory-index>\n");
-    try buf.appendSlice(arena, "Long-term memory topics. Read with `read_memory <topic>`, write with `write_memory <topic> <body>`.\n\n");
+    try buf.appendSlice(arena, "Long-term memory topics. Read with `read_memory <topic>`, write with `write_memory <topic> <body>`, find with `search_memory <query>`.\n\n");
     for (entries) |e| {
-        try buf.print(arena, "- {s} ({d} bytes)\n", .{ e.topic, e.bytes });
+        try buf.print(arena, "- {s} ({d} bytes)", .{ e.topic, e.bytes });
+        if (e.tags.len > 0) {
+            try buf.appendSlice(arena, " · tags: ");
+            for (e.tags, 0..) |t, i| {
+                if (i > 0) try buf.appendSlice(arena, ", ");
+                try buf.appendSlice(arena, t);
+            }
+        }
+        try buf.append(arena, '\n');
     }
     try buf.appendSlice(arena, "</memory-index>\n");
     return buf.items;
@@ -279,6 +428,156 @@ test "formatIndex: lists topics + byte sizes inside fence" {
     try testing.expect(std.mem.endsWith(u8, out, "</memory-index>\n"));
     try testing.expect(std.mem.indexOf(u8, out, "user-prefs (42 bytes)") != null);
     try testing.expect(std.mem.indexOf(u8, out, "project-notes (1024 bytes)") != null);
+}
+
+test "parseTags: inline list" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body =
+        \\---
+        \\tags: [decision, security]
+        \\---
+        \\body
+    ;
+    const tags = try parseTags(arena_state.allocator(), body);
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("decision", tags[0]);
+    try testing.expectEqualStrings("security", tags[1]);
+}
+
+test "parseTags: bare comma list" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body =
+        \\---
+        \\tags: alpha, beta
+        \\---
+        \\body
+    ;
+    const tags = try parseTags(arena_state.allocator(), body);
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("alpha", tags[0]);
+    try testing.expectEqualStrings("beta", tags[1]);
+}
+
+test "parseTags: missing frontmatter yields empty" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const tags = try parseTags(arena_state.allocator(), "no frontmatter here");
+    try testing.expectEqual(@as(usize, 0), tags.len);
+}
+
+test "search: substring match returns topic + line + snippet" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("XDG_DATA_HOME", tmp_abs);
+
+    try write(a, testing.io, &env, "decisions",
+        \\line one
+        \\our retry policy is exponential backoff
+        \\line three
+    );
+    try write(a, testing.io, &env, "other", "nothing relevant\n");
+
+    const hits = try search(a, testing.io, &env, "retry policy", 50, null);
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expectEqualStrings("decisions", hits[0].topic);
+    try testing.expect(std.mem.indexOf(u8, hits[0].snippet, "exponential backoff") != null);
+}
+
+test "search: case-insensitive when query is all-lowercase" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("XDG_DATA_HOME", tmp_abs);
+
+    try write(a, testing.io, &env, "notes", "RETRY POLICY: backoff\n");
+    const hits = try search(a, testing.io, &env, "retry policy", 50, null);
+    try testing.expectEqual(@as(usize, 1), hits.len);
+}
+
+test "search: tag filter narrows to matching frontmatter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("XDG_DATA_HOME", tmp_abs);
+
+    try write(a, testing.io, &env, "alpha",
+        \\---
+        \\tags: [decision]
+        \\---
+        \\retry policy lives here
+    );
+    try write(a, testing.io, &env, "beta",
+        \\---
+        \\tags: [scratch]
+        \\---
+        \\retry policy lives here too
+    );
+    const hits = try search(a, testing.io, &env, "retry", 50, "decision");
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expectEqualStrings("alpha", hits[0].topic);
+}
+
+test "search: empty query + tag enumerates topics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("XDG_DATA_HOME", tmp_abs);
+
+    try write(a, testing.io, &env, "alpha",
+        \\---
+        \\tags: [decision]
+        \\---
+        \\
+    );
+    try write(a, testing.io, &env, "beta",
+        \\---
+        \\tags: [decision, security]
+        \\---
+        \\
+    );
+    try write(a, testing.io, &env, "gamma", "no frontmatter\n");
+    const hits = try search(a, testing.io, &env, "", 50, "decision");
+    try testing.expectEqual(@as(usize, 2), hits.len);
+}
+
+test "list: populates tags from frontmatter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("XDG_DATA_HOME", tmp_abs);
+
+    try write(a, testing.io, &env, "tagged",
+        \\---
+        \\tags: [foo, bar]
+        \\---
+        \\body
+    );
+    const entries = try list(a, testing.io, &env);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(usize, 2), entries[0].tags.len);
 }
 
 test "write: overwrites existing topic" {

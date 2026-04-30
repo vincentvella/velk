@@ -122,8 +122,10 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildWebSearch(arena, settings));
     try list.append(arena, try buildWorktree(arena, settings));
     try list.append(arena, try buildWritePlan(arena, settings));
+    try list.append(arena, try buildVerifyPlan(arena, settings));
     try list.append(arena, try buildReadMemory(arena, settings));
     try list.append(arena, try buildWriteMemory(arena, settings));
+    try list.append(arena, try buildSearchMemory(arena, settings));
     try list.append(arena, try buildLspDiagnostics(arena, settings));
     try list.append(arena, try buildViewImage(arena, settings));
     if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
@@ -951,6 +953,123 @@ fn writePlanExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.
     return .{ .text = text };
 }
 
+// ───────── verify_plan ─────────
+
+const verify_plan_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "path":{"type":"string","description":"Optional path to the plan file. Defaults to PLAN.md."}
+    \\ }}
+;
+
+pub fn buildVerifyPlan(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, verify_plan_schema_json, .{});
+    return .{
+        .name = "verify_plan",
+        .description = "Read a Markdown plan file (PLAN.md by default) and report which `- [ ]` / `- [x]` items are still pending. Use this between turns to track which step you're on without having to re-read the whole file.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = verifyPlanExecute,
+    };
+}
+
+fn verifyPlanExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const path: []const u8 = (try getString(input, "path")) orelse "PLAN.md";
+    const safe_path = validatePath(settings, path) catch |e| switch (e) {
+        Error.PathOutsideCwd => return errorOutput(arena, "verify_plan: path '{s}' is outside CWD", .{path}),
+        else => return errorOutput(arena, "verify_plan: invalid path '{s}'", .{path}),
+    };
+    const data = Io.Dir.cwd().readFileAlloc(settings.io, safe_path, arena, .limited(1 * 1024 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => return errorOutput(arena, "verify_plan: '{s}' not found — run write_plan first or pass a different `path`.", .{safe_path}),
+        else => return errorOutput(arena, "verify_plan: read failed: {s}", .{@errorName(e)}),
+    };
+
+    const summary = countPlanItems(data);
+
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(arena, "{s}: {d}/{d} complete ({d} pending)\n", .{
+        safe_path,
+        summary.done,
+        summary.total,
+        summary.pending,
+    });
+    if (summary.pending > 0) {
+        try buf.appendSlice(arena, "\nPending items:\n");
+        // Walk again to surface the actual unchecked-item text. Cap
+        // at 50 lines so a giant plan doesn't blow up the response.
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        var shown: usize = 0;
+        while (lines.next()) |raw| {
+            if (shown >= 50) {
+                try buf.print(arena, "  … ({d} more)\n", .{summary.pending - shown});
+                break;
+            }
+            const line = std.mem.trim(u8, raw, " \t");
+            if (planItemKind(line)) |k| {
+                if (k == .pending) {
+                    const text = stripPlanMarker(line);
+                    try buf.print(arena, "  - {s}\n", .{text});
+                    shown += 1;
+                }
+            }
+        }
+    }
+    return .{ .text = buf.items };
+}
+
+const PlanCount = struct { total: usize, done: usize, pending: usize };
+
+const PlanItemKind = enum { pending, done };
+
+fn planItemKind(line: []const u8) ?PlanItemKind {
+    // Recognise `- [ ]`, `- [x]`, `* [ ]`, `* [x]`, plus indented forms.
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    if (i >= line.len) return null;
+    const bullet = line[i];
+    if (bullet != '-' and bullet != '*' and bullet != '+') return null;
+    i += 1;
+    if (i >= line.len or line[i] != ' ') return null;
+    i += 1;
+    if (i + 3 > line.len or line[i] != '[') return null;
+    const inner = line[i + 1];
+    if (line[i + 2] != ']') return null;
+    return switch (inner) {
+        ' ' => .pending,
+        'x', 'X' => .done,
+        else => null,
+    };
+}
+
+fn stripPlanMarker(line: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    if (i >= line.len) return line;
+    i += 1; // bullet
+    if (i < line.len and line[i] == ' ') i += 1;
+    if (i + 3 < line.len and line[i] == '[' and line[i + 2] == ']') {
+        i += 3;
+        if (i < line.len and line[i] == ' ') i += 1;
+    }
+    return line[i..];
+}
+
+fn countPlanItems(body: []const u8) PlanCount {
+    var c: PlanCount = .{ .total = 0, .done = 0, .pending = 0 };
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        if (planItemKind(line)) |k| {
+            c.total += 1;
+            switch (k) {
+                .pending => c.pending += 1,
+                .done => c.done += 1,
+            }
+        }
+    }
+    return c;
+}
+
 // ───────── todo_write ─────────
 
 const todo_write_schema_json: []const u8 =
@@ -1039,10 +1158,19 @@ const task_schema_json: []const u8 =
     \\   "prompt":{"type":"string","description":"The instructions for the sub-agent. The sub-agent has its own message history and runs to completion before returning."},
     \\   "tools":{"type":"array","description":"Optional. Names of parent tools the child is allowed to call. When omitted, the child inherits the full registry minus `task` itself.",
     \\     "items":{"type":"string"}},
-    \\   "model":{"type":"string","description":"Optional. Run the child with this model id instead of the sub-agent default. Use to delegate reasoning-heavy work to a more capable (and expensive) model — e.g. `model='claude-opus-4-7'` from a Haiku parent."}
+    \\   "model":{"type":"string","description":"Optional. Run the child with this model id instead of the sub-agent default. Use to delegate reasoning-heavy work to a more capable (and expensive) model — e.g. `model='claude-opus-4-7'` from a Haiku parent."},
+    \\   "brief":{"type":"boolean","description":"Optional. When true, run the child as a short status-update writer: capped to ~256 output tokens, one iteration, with a 'be terse' system suffix. Use for quick status checks or one-shot summaries where the answer should fit in a sentence or two."}
     \\ },
     \\ "required":["prompt"]}
 ;
+
+const brief_system_suffix: []const u8 =
+    "Output style: brief status writer. Answer in 1–3 sentences. " ++
+    "No preamble, no closing summary, no Markdown headers. " ++
+    "If a tool call is required, make at most one and report only the result.";
+
+const brief_max_tokens: u32 = 256;
+const brief_max_iterations: u32 = 1;
 
 pub fn buildTask(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
     const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, task_schema_json, .{});
@@ -1115,13 +1243,35 @@ fn taskExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
     // the parent's model).
     const child_model: []const u8 = (try getString(input, "model")) orelse sub.model;
 
+    // `brief: true` switches the child into "short status writer"
+    // mode: tight output budget, one iteration, terse system suffix.
+    // Stacks on top of any existing `sub.system` so project context
+    // still applies — the suffix just adds a shape constraint.
+    const brief_flag: bool = blk: {
+        if (input != .object) break :blk false;
+        const v = input.object.get("brief") orelse break :blk false;
+        break :blk switch (v) {
+            .bool => |b| b,
+            else => false,
+        };
+    };
+    const child_system: ?[]const u8 = if (brief_flag)
+        if (sub.system) |s|
+            try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ s, brief_system_suffix })
+        else
+            brief_system_suffix
+    else
+        sub.system;
+    const child_max_tokens: u32 = if (brief_flag) @min(sub.max_tokens, brief_max_tokens) else sub.max_tokens;
+    const child_iters: u32 = if (brief_flag) brief_max_iterations else sub.max_iterations;
+
     _ = agent_mod.run(child_arena, sub.provider, sink, .{
         .model = child_model,
-        .max_tokens = sub.max_tokens,
-        .system = sub.system,
+        .max_tokens = child_max_tokens,
+        .system = child_system,
         .prompt = prompt,
         .tools = child_tools.items,
-        .max_iterations = sub.max_iterations,
+        .max_iterations = child_iters,
         .hook_engine = sub.hook_engine,
         .hook_gpa = settings.gpa,
         .hook_io = sub.hook_io,
@@ -1735,6 +1885,71 @@ fn writeMemoryExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.jso
         .text = try std.fmt.allocPrint(arena, "wrote {d} byte(s) to memory topic '{s}'", .{ content.len, slug }),
         .is_error = false,
     };
+}
+
+// ───────── search_memory ─────────
+
+const search_memory_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "query":{"type":"string","description":"Substring to find inside topic bodies. Case-insensitive when all-lowercase. Pass an empty string to enumerate every topic that matches `tag` (tag-only listing)."},
+    \\   "tag":{"type":"string","description":"Optional. Restrict to topics whose YAML frontmatter `tags:` value contains this name. Use to slice the catalog by category (e.g. tag='decisions')."},
+    \\   "max_hits":{"type":"integer","description":"Optional. Cap on matches returned (default 50)."}
+    \\ }}
+;
+
+pub fn buildSearchMemory(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, search_memory_schema_json, .{});
+    return .{
+        .name = "search_memory",
+        .description = "Substring-search across every memdir topic. Use to find a fact you wrote earlier without enumerating topics. Returns up to `max_hits` matches, each with the topic, line number, and a snippet.",
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = searchMemoryExecute,
+    };
+}
+
+fn searchMemoryExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const env = settings.env_map orelse return errorOutput(arena, "search_memory: env_map not wired", .{});
+    const query = (try getString(input, "query")) orelse "";
+    const tag = try getString(input, "tag");
+    if (query.len == 0 and tag == null) {
+        return errorOutput(arena, "search_memory: pass at least one of 'query' or 'tag'", .{});
+    }
+
+    const max_hits: usize = blk: {
+        if ((try getInt(input, "max_hits"))) |n| {
+            if (n <= 0) break :blk 50;
+            break :blk @as(usize, @intCast(n));
+        }
+        break :blk 50;
+    };
+
+    const hits = memory.search(arena, settings.io, env, query, max_hits, tag) catch |e|
+        return errorOutput(arena, "search_memory: search failed: {s}", .{@errorName(e)});
+
+    if (hits.len == 0) {
+        const text = if (tag) |tg|
+            try std.fmt.allocPrint(arena, "no matches for query='{s}' tag='{s}'", .{ query, tg })
+        else
+            try std.fmt.allocPrint(arena, "no matches for '{s}'", .{query});
+        return .{ .text = text, .is_error = false };
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(arena, "{d} match(es)", .{hits.len});
+    if (query.len > 0) try buf.print(arena, " for '{s}'", .{query});
+    if (tag) |tg| try buf.print(arena, " (tag={s})", .{tg});
+    try buf.append(arena, '\n');
+    for (hits) |h| {
+        if (h.snippet.len == 0) {
+            try buf.print(arena, "  {s}\n", .{h.topic});
+        } else {
+            try buf.print(arena, "  {s}:{d}  {s}\n", .{ h.topic, h.line + 1, h.snippet });
+        }
+    }
+    if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n') _ = buf.pop();
+    return .{ .text = buf.items, .is_error = false };
 }
 
 // ───────── custom shell tool ─────────
@@ -2438,6 +2653,69 @@ test "bash: nonzero exit marked is_error" {
     try testing.expect(std.mem.indexOf(u8, out.text, "exit: 7") != null);
 }
 
+// ───────── verify_plan ─────────
+
+test "verify_plan: counts done/pending across mixed bullet styles" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const body =
+        \\# Plan
+        \\
+        \\- [x] step one
+        \\- [X] step two
+        \\* [ ] step three
+        \\+ [ ] step four
+        \\not a plan item
+    ;
+    const c = countPlanItems(body);
+    try testing.expectEqual(@as(usize, 4), c.total);
+    try testing.expectEqual(@as(usize, 2), c.done);
+    try testing.expectEqual(@as(usize, 2), c.pending);
+}
+
+test "verify_plan: end-to-end via PLAN.md in tmpdir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = testSettings();
+    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    const plan_path = try std.fs.path.join(a, &.{ tmp_abs, "PLAN.md" });
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "PLAN.md",
+        .data =
+            \\# Plan
+            \\
+            \\- [x] done item
+            \\- [ ] pending one
+            \\- [ ] pending two
+        ,
+    });
+
+    const t = try buildVerifyPlan(a, &settings);
+    const input = try jsonObj(a, .{ .path = @as([]const u8, plan_path) });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "1/3 complete (2 pending)") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "pending one") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "pending two") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "done item") == null);
+}
+
+test "verify_plan: missing file emits a clear error" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = testSettings();
+    const t = try buildVerifyPlan(a, &settings);
+    const input = try jsonObj(a, .{ .path = @as([]const u8, "this-file-does-not-exist-xyz.md") });
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "not found") != null);
+}
+
 // ───────── todo_write validation ─────────
 
 test "todo_write: refuses without a store" {
@@ -2687,6 +2965,27 @@ test "task: 'tools' must be an array" {
     const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
     try testing.expect(out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.text, "must be an array") != null);
+}
+
+test "task: 'brief' is a valid input shape" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = stubStream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTask(a, &settings);
+    // stubStream returns no content; we just verify that passing
+    // `brief: true` doesn't trip a JSON-shape error and that the
+    // child is invoked (no_text path emits "no final text produced").
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"prompt\":\"status?\",\"brief\":true}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "task complete") != null);
 }
 
 test "team: refuses without runtime" {

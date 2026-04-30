@@ -215,14 +215,15 @@ JSON
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "explain @maybeRequestApproval"
 
-    # Tools registry: --no-tui ships 13 tools — 9 base builtins
+    # Tools registry: --no-tui ships 19 tools — 9 base builtins
     # (echo, read_file, write_file, edit, ls, grep, bash, web_fetch,
-    # web_search), plus `worktree`, `write_plan`, and the two
-    # sub-agent dispatchers `task` + `team` (both work headlessly).
-    # `todo_write` and `ask_user_question` need a TUI panel and are
-    # NOT registered here.
-    SMOKE_EXPECT_STDERR="tools=17" run_case \
-        "worktree + write_plan + task + team + read/write_memory + lsp_diagnostics + view_image registered alongside the 9 builtins" 0 \
+    # web_search), plus `worktree`, `write_plan`, `verify_plan`,
+    # `read_memory`, `write_memory`, `search_memory`, `lsp_diagnostics`,
+    # `view_image`, and the two sub-agent dispatchers `task` + `team`
+    # (both work headlessly). `todo_write` and `ask_user_question`
+    # need a TUI panel and are NOT registered here.
+    SMOKE_EXPECT_STDERR="tools=19" run_case \
+        "worktree + write_plan + verify_plan + task + team + read/write/search_memory + lsp_diagnostics + view_image registered alongside the 9 builtins" 0 \
         env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
             ANTHROPIC_API_KEY=sk-fake \
             "$VELK" --no-tui --debug "anything"
@@ -423,8 +424,8 @@ JSON
     # output when stderr is a regular file. The custom-tools
     # banner check above runs without --debug; here we only need
     # to confirm `tools=14` lands.
-    SMOKE_EXPECT_STDERR="tools=18" run_case \
-        "custom-tools: tool count bumps from 17 → 18" 0 \
+    SMOKE_EXPECT_STDERR="tools=20" run_case \
+        "custom-tools: tool count bumps from 19 → 20" 0 \
         env "ANTHROPIC_BASE_URL=http://127.0.0.1:$MOCK_PORT/v1/messages" \
             ANTHROPIC_API_KEY=sk-fake \
             HOME="$CUSTOM_TMP" \
