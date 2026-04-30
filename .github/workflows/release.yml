@@ -61,7 +61,7 @@ jobs:
           tar -czf ${{ matrix.artifact }}.tar.gz -C dist velk LICENSE
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -241,7 +241,7 @@ jobs:
 
       - name: setup Node
         if: steps.gate.outputs.skip != 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: npm
@@ -300,14 +300,14 @@ jobs:
 
       - name: setup JDK 17
         if: steps.gate.outputs.skip != 'true'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: setup Gradle
         if: steps.gate.outputs.skip != 'true'
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: bump plugin version
         if: steps.gate.outputs.skip != 'true'
