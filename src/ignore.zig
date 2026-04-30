@@ -184,11 +184,68 @@ pub const Matcher = struct {
     /// Read `<dir>/.gitignore` if it exists; return `Matcher.empty()`
     /// when the file is missing or unreadable. `dir` is relative to
     /// CWD.
+    ///
+    /// Walks upward from `dir` toward the filesystem root, parsing
+    /// every `.gitignore` it finds and concatenating their patterns.
+    /// Outer (more general) gitignores load first; inner ones load
+    /// after so their later-match-wins negations override outer
+    /// rules, matching git's own resolution semantics.
+    ///
+    /// Stops at one of:
+    ///   - the filesystem root (`/`)
+    ///   - a directory containing `.git` (the repo root)
+    ///   - the user's `$HOME` (avoid leaking unrelated rules)
     pub fn fromGitignore(
         arena: std.mem.Allocator,
         io: Io,
         dir: []const u8,
     ) !Matcher {
+        const cwd = Io.Dir.cwd();
+        // Resolve to an absolute path so the walk-up is unambiguous.
+        // If we can't (e.g. dir doesn't exist), fall back to the
+        // single-file legacy behavior at the requested path.
+        var stack: std.ArrayList([]const u8) = .empty;
+        var cur: []const u8 = std.fs.path.resolve(arena, &.{dir}) catch
+            return fromSingleGitignore(arena, io, dir);
+
+        var hops: u8 = 0;
+        const max_hops: u8 = 32; // hard cap so a symlink loop can't lock us up
+        while (hops < max_hops) : (hops += 1) {
+            try stack.append(arena, cur);
+            // Stop at the repo root (.git directory present).
+            const dotgit = try std.fs.path.join(arena, &.{ cur, ".git" });
+            if (cwd.statFile(io, dotgit, .{})) |_| {
+                break;
+            } else |_| {}
+            const parent = std.fs.path.dirname(cur) orelse break;
+            if (parent.len == 0 or std.mem.eql(u8, parent, cur)) break;
+            // Don't escape into $HOME's parent — gitignore rules
+            // outside a project aren't meant to apply.
+            cur = parent;
+        }
+
+        // Outer-first ordering: walk the stack in reverse (we
+        // appended innermost first). Concatenate so later (inner)
+        // negations win via the existing last-match-wins logic.
+        var combined: std.ArrayList(u8) = .empty;
+        var i: usize = stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            const path = try std.fmt.allocPrint(arena, "{s}/.gitignore", .{stack.items[i]});
+            const body = cwd.readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch |e| switch (e) {
+                error.FileNotFound => continue,
+                else => continue,
+            };
+            try combined.appendSlice(arena, body);
+            if (combined.items.len > 0 and combined.items[combined.items.len - 1] != '\n') {
+                try combined.append(arena, '\n');
+            }
+        }
+        if (combined.items.len == 0) return Matcher.empty();
+        return try parse(arena, combined.items);
+    }
+
+    fn fromSingleGitignore(arena: std.mem.Allocator, io: Io, dir: []const u8) !Matcher {
         const path = try std.fmt.allocPrint(arena, "{s}/.gitignore", .{dir});
         const body = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch |e| switch (e) {
             error.FileNotFound => return Matcher.empty(),
@@ -292,6 +349,52 @@ fn globMatchRecursive(pat: []const u8, pi: usize, txt: []const u8, ti: usize) bo
             }
             return false;
         }
+        if (pat[p] == '?') {
+            // Single-char wildcard. Like `*`, doesn't cross segment
+            // boundaries — `?` matches any byte except `/`.
+            if (t >= txt.len or txt[t] == '/') return false;
+            p += 1;
+            t += 1;
+            continue;
+        }
+        if (pat[p] == '[') {
+            // Character class: `[abc]`, `[a-z]`, `[!abc]` (negated).
+            // Like `?`, never matches `/`. Falls back to a literal `[`
+            // if the class is malformed (no closing `]`).
+            const close = std.mem.indexOfScalarPos(u8, pat, p + 1, ']');
+            if (close == null) {
+                // Malformed — match `[` literally.
+                if (t >= txt.len or txt[t] != '[') return false;
+                p += 1;
+                t += 1;
+                continue;
+            }
+            if (t >= txt.len or txt[t] == '/') return false;
+            const class_end = close.?;
+            var class_start = p + 1;
+            const negated = class_start < class_end and pat[class_start] == '!';
+            if (negated) class_start += 1;
+            const c = txt[t];
+            var matched = false;
+            var i = class_start;
+            while (i < class_end) {
+                // Range form: `a-z`. Hyphen at the very start or end
+                // of the class is a literal `-`.
+                if (i + 2 < class_end and pat[i + 1] == '-') {
+                    const lo = pat[i];
+                    const hi = pat[i + 2];
+                    if (c >= lo and c <= hi) matched = true;
+                    i += 3;
+                } else {
+                    if (pat[i] == c) matched = true;
+                    i += 1;
+                }
+            }
+            if (matched == negated) return false;
+            p = class_end + 1;
+            t += 1;
+            continue;
+        }
         if (t >= txt.len) return false;
         if (pat[p] != txt[t]) return false;
         p += 1;
@@ -318,6 +421,40 @@ test "globMatch: double star crosses /" {
     try testing.expect(globMatch("**/*.log", "a/b/c.log"));
     try testing.expect(globMatch("**/build", "x/y/build"));
     try testing.expect(globMatch("a/**", "a/b/c/d"));
+}
+
+test "globMatch: ? is one-char wildcard, segment-bounded" {
+    try testing.expect(globMatch("?ello", "hello"));
+    try testing.expect(globMatch("h?llo", "hello"));
+    try testing.expect(!globMatch("?ello", "ello")); // ? requires exactly 1
+    try testing.expect(!globMatch("?ello", "/ello")); // ? doesn't match /
+    try testing.expect(!globMatch("?ello", "hhello")); // not greedy
+}
+
+test "globMatch: [abc] character class" {
+    try testing.expect(globMatch("[abc]at", "bat"));
+    try testing.expect(globMatch("[abc]at", "cat"));
+    try testing.expect(!globMatch("[abc]at", "dat"));
+    try testing.expect(!globMatch("[abc]at", "/at"));
+}
+
+test "globMatch: [a-z] range" {
+    try testing.expect(globMatch("[a-z]oo", "foo"));
+    try testing.expect(globMatch("[A-Z][a-z]*", "Hello"));
+    try testing.expect(!globMatch("[a-z]oo", "5oo"));
+    try testing.expect(!globMatch("[0-9]", "a"));
+}
+
+test "globMatch: [!abc] negated class" {
+    try testing.expect(globMatch("[!abc]at", "dat"));
+    try testing.expect(!globMatch("[!abc]at", "bat"));
+    try testing.expect(!globMatch("[!abc]at", "/at")); // / never matches
+}
+
+test "globMatch: malformed [ falls back to literal" {
+    // No closing ] → match the `[` as a literal char.
+    try testing.expect(globMatch("[abc", "[abc"));
+    try testing.expect(!globMatch("[abc", "abc"));
 }
 
 test "Matcher.parse: comments + blanks skipped, patterns retained" {
@@ -380,4 +517,39 @@ test "Matcher.fromGitignore: missing file yields empty matcher" {
     defer arena_state.deinit();
     const m = try Matcher.fromGitignore(arena_state.allocator(), testing.io, "/nonexistent/dir");
     try testing.expectEqual(@as(usize, 0), m.patterns.len);
+}
+
+test "Matcher.fromGitignore: walks up to parent gitignores until .git" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Tree:
+    //   <repo>/.git/HEAD                 ← stops walk-up here
+    //   <repo>/.gitignore                ← outer: ignores *.log
+    //   <repo>/sub/.gitignore            ← inner: !keep.log (last-match-wins)
+    try tmp.dir.makePath(".git");
+    try tmp.dir.writeFile(.{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/main\n" });
+    try tmp.dir.writeFile(.{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try tmp.dir.makePath("sub");
+    try tmp.dir.writeFile(.{ .sub_path = "sub/.gitignore", .data = "!keep.log\n" });
+    const sub_abs = try tmp.dir.realpathAlloc(a, "sub");
+
+    const m = try Matcher.fromGitignore(a, testing.io, sub_abs);
+    // Both rules loaded → 2 patterns total.
+    try testing.expectEqual(@as(usize, 2), m.patterns.len);
+    // Outer-first: index 0 is the *.log ignore, index 1 is the negation.
+    try testing.expectEqualStrings("*.log", m.patterns[0].glob);
+    try testing.expect(!m.patterns[0].negate);
+    try testing.expect(m.patterns[1].negate);
+}
+
+test "Matcher.fromGitignore: walk-up stops at filesystem boundary" {
+    // Resolves to "/" → no walk-up beyond root, no .gitignore there
+    // (presumably). Just shouldn't loop / panic.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    _ = try Matcher.fromGitignore(arena_state.allocator(), testing.io, "/");
 }

@@ -118,6 +118,23 @@ pub fn list(arena: std.mem.Allocator, io: Io, env_map: *std.process.Environ.Map)
     return out.items;
 }
 
+/// Render a `<memory-index>` block listing every topic + its byte
+/// size. Suitable for prepending onto the system prompt at startup
+/// so the model knows which long-term notes exist without having to
+/// call `list_memories` first. Returns an empty slice when memdir is
+/// empty — the caller skips the block entirely in that case.
+pub fn formatIndex(arena: std.mem.Allocator, entries: []const Entry) ![]const u8 {
+    if (entries.len == 0) return "";
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(arena, "<memory-index>\n");
+    try buf.appendSlice(arena, "Long-term memory topics. Read with `read_memory <topic>`, write with `write_memory <topic> <body>`.\n\n");
+    for (entries) |e| {
+        try buf.print(arena, "- {s} ({d} bytes)\n", .{ e.topic, e.bytes });
+    }
+    try buf.appendSlice(arena, "</memory-index>\n");
+    return buf.items;
+}
+
 fn mkdirAllAbsolute(io: Io, abs_path: []const u8) !void {
     if (abs_path.len == 0 or abs_path[0] != '/') return;
     var i: usize = 1;
@@ -242,6 +259,26 @@ test "write+read+list: round-trip" {
         if (std.mem.eql(u8, e.topic, "second-topic")) saw_second = true;
     }
     try testing.expect(saw_first and saw_second);
+}
+
+test "formatIndex: empty list yields empty string" {
+    const out = try formatIndex(testing.allocator, &.{});
+    try testing.expectEqualStrings("", out);
+}
+
+test "formatIndex: lists topics + byte sizes inside fence" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const entries = [_]Entry{
+        .{ .topic = "user-prefs", .bytes = 42 },
+        .{ .topic = "project-notes", .bytes = 1024 },
+    };
+    const out = try formatIndex(a, &entries);
+    try testing.expect(std.mem.startsWith(u8, out, "<memory-index>\n"));
+    try testing.expect(std.mem.endsWith(u8, out, "</memory-index>\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "user-prefs (42 bytes)") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "project-notes (1024 bytes)") != null);
 }
 
 test "write: overwrites existing topic" {

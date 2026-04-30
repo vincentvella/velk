@@ -17,6 +17,7 @@ const hooks_mod = @import("hooks.zig");
 const todos_mod = @import("todos.zig");
 const ask_mod = @import("ask.zig");
 const skills_mod = @import("skills.zig");
+const memory_mod = @import("memory.zig");
 const ignore_mod = @import("ignore.zig");
 const lockfile = @import("lockfile.zig");
 const watch_mod = @import("watch.zig");
@@ -415,6 +416,22 @@ pub fn main(init: std.process.Init) !void {
                 if (catalog.len > 0) {
                     final_system = try workspace_mod.buildSystemPrompt(arena, final_system, catalog, "skills");
                     try errw.print("velk: {d} skill(s) loaded\n", .{skill_list.len});
+                    try errw.flush();
+                }
+            }
+
+            // Memdir index: surface every long-term-memory topic +
+            // size at the top of the prompt so the model knows what
+            // it has stored before the first turn. Bodies stay on
+            // disk; the model fetches via `read_memory` when needed.
+            // Failures are silent — a bad XDG path shouldn't break
+            // the session.
+            const mem_entries = memory_mod.list(arena, init.io, init.environ_map) catch &.{};
+            if (mem_entries.len > 0) {
+                const mem_index = memory_mod.formatIndex(arena, mem_entries) catch "";
+                if (mem_index.len > 0) {
+                    final_system = try workspace_mod.buildSystemPrompt(arena, final_system, mem_index, "memdir");
+                    try errw.print("velk: {d} memory topic(s) indexed\n", .{mem_entries.len});
                     try errw.flush();
                 }
             }

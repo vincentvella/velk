@@ -23,3 +23,5 @@ vscode/*.vsix
 jetbrains/.gradle/
 jetbrains/build/
 jetbrains/.idea/
+jetbrains/.intellijPlatform/
+jetbrains/.kotlin/

@@ -28,6 +28,14 @@ pub const Skill = struct {
     /// Path to `SKILL.md`. Surfaced in the catalog so the model can
     /// `read_file` it without guessing.
     path: []const u8,
+    /// Optional tool allowlist declared in the YAML frontmatter as
+    /// `tools: [bash, edit]` (inline) or `tools: bash, edit`. Empty
+    /// when unset — the catalog then advertises the skill as
+    /// using all tools. v1 is honor-system: the catalog surfaces
+    /// the constraint to the model; runtime enforcement of the
+    /// allowlist when the model is acting under a skill is a
+    /// follow-up (would need an "active skill" runtime concept).
+    tools: []const []const u8 = &.{},
 };
 
 pub const Source = enum { user_claude, user_velk, project_claude, project_velk };
@@ -68,6 +76,14 @@ pub fn formatCatalog(arena: std.mem.Allocator, skills: []const Skill) ![]const u
     try buf.appendSlice(arena, "Skills available in this workspace. Each skill lives at the path shown; read it via the `read_file` tool when you decide to apply it.\n\n");
     for (skills) |s| {
         try buf.print(arena, "- **{s}** — {s}\n  path: {s}\n", .{ s.name, s.description, s.path });
+        if (s.tools.len > 0) {
+            try buf.appendSlice(arena, "  allowed tools (when applying this skill): ");
+            for (s.tools, 0..) |t, i| {
+                if (i > 0) try buf.appendSlice(arena, ", ");
+                try buf.appendSlice(arena, t);
+            }
+            try buf.append(arena, '\n');
+        }
     }
     try buf.appendSlice(arena, "</skills>\n");
     return buf.items;
@@ -106,13 +122,14 @@ fn loadFrom(
             error.FileNotFound => continue,
             else => continue,
         };
-        const fm = parseFrontmatter(body) orelse continue;
+        const fm = parseFrontmatterAlloc(arena, body) orelse continue;
         const name_owned = try arena.dupe(u8, fm.name);
         const desc_owned = try arena.dupe(u8, fm.description);
         try out.put(name_owned, .{
             .name = name_owned,
             .description = desc_owned,
             .path = skill_md,
+            .tools = fm.tools,
         });
     }
 }
@@ -120,12 +137,18 @@ fn loadFrom(
 const Frontmatter = struct {
     name: []const u8,
     description: []const u8,
+    tools: []const []const u8 = &.{},
 };
 
 /// Parse the `---`-delimited YAML header at the start of `body`.
 /// Recognises `name:` and `description:` keys; ignores everything
 /// else. Returns null when the frontmatter is missing either key
 /// or malformed.
+///
+/// String-only path (no `tools:` allowlist parsing — that requires
+/// an allocator for the dynamic list). Use `parseFrontmatterAlloc`
+/// to pick up the tools field; both share the same name/description
+/// extraction.
 pub fn parseFrontmatter(body: []const u8) ?Frontmatter {
     if (!std.mem.startsWith(u8, body, "---")) return null;
     const after_open = body[3..];
@@ -147,6 +170,85 @@ pub fn parseFrontmatter(body: []const u8) ?Frontmatter {
     }
     if (name == null or desc == null) return null;
     return .{ .name = name.?, .description = desc.? };
+}
+
+/// Same as `parseFrontmatter` but also extracts `tools:` as a list
+/// of allowed tool names. Supported forms (both case-insensitive
+/// at the YAML key):
+///   tools: [bash, edit, write_file]      ← inline flow
+///   tools: bash, edit, write_file        ← bare comma-separated
+/// Block-style (one entry per line under `tools:`) is recognised
+/// when the lines that follow start with `- ` and at least two
+/// spaces of indent. Anything else is silently ignored — the
+/// catalog still lists the skill, just with no tool restriction.
+pub fn parseFrontmatterAlloc(arena: std.mem.Allocator, body: []const u8) ?Frontmatter {
+    if (!std.mem.startsWith(u8, body, "---")) return null;
+    const after_open = body[3..];
+    const header_start = std.mem.indexOfScalar(u8, after_open, '\n') orelse return null;
+    const block_start: usize = 3 + header_start + 1;
+    if (block_start > body.len) return null;
+    const close_rel = std.mem.indexOf(u8, body[block_start..], "\n---") orelse return null;
+    const block = body[block_start .. block_start + close_rel];
+    if (block.len > max_frontmatter_bytes) return null;
+
+    var name: ?[]const u8 = null;
+    var desc: ?[]const u8 = null;
+    var tools: std.ArrayList([]const u8) = .empty;
+    var in_tools_block: bool = false;
+
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |line_raw| {
+        // Strip CR but keep leading whitespace so we can detect
+        // block-list indentation.
+        var line = line_raw;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        // Block-list continuation: `  - bash` while in_tools_block.
+        if (in_tools_block and line.len >= 2 and line[0] == ' ') {
+            if (std.mem.startsWith(u8, trimmed, "- ")) {
+                const item = std.mem.trim(u8, trimmed[2..], " \t");
+                if (item.len > 0) {
+                    const owned = arena.dupe(u8, stripQuotes(item)) catch return null;
+                    tools.append(arena, owned) catch return null;
+                }
+                continue;
+            }
+            // Indented but not a list item — block ended.
+            in_tools_block = false;
+        } else {
+            in_tools_block = false;
+        }
+
+        if (parseKeyValue(trimmed, "name")) |v| name = v;
+        if (parseKeyValue(trimmed, "description")) |v| desc = v;
+        if (parseKeyValue(trimmed, "tools")) |v| {
+            // Empty value → expect a block list on the following lines.
+            if (v.len == 0) {
+                in_tools_block = true;
+                continue;
+            }
+            // Inline flow `[a, b, c]` or bare `a, b, c`.
+            const inner: []const u8 = if (v.len >= 2 and v[0] == '[' and v[v.len - 1] == ']') v[1 .. v.len - 1] else v;
+            var it = std.mem.splitScalar(u8, inner, ',');
+            while (it.next()) |raw| {
+                const item = std.mem.trim(u8, raw, " \t");
+                if (item.len == 0) continue;
+                const owned = arena.dupe(u8, stripQuotes(item)) catch return null;
+                tools.append(arena, owned) catch return null;
+            }
+        }
+    }
+    if (name == null or desc == null) return null;
+    return .{ .name = name.?, .description = desc.?, .tools = tools.items };
+}
+
+fn stripQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2 and ((s[0] == '"' and s[s.len - 1] == '"') or (s[0] == '\'' and s[s.len - 1] == '\''))) {
+        return s[1 .. s.len - 1];
+    }
+    return s;
 }
 
 fn parseKeyValue(line: []const u8, key: []const u8) ?[]const u8 {
@@ -227,6 +329,74 @@ test "parseFrontmatter: handles quoted values" {
     const fm = parseFrontmatter(body).?;
     try testing.expectEqualStrings("quoted name", fm.name);
     try testing.expectEqualStrings("single-quoted desc", fm.description);
+}
+
+test "parseFrontmatterAlloc: inline tools list" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body =
+        \\---
+        \\name: x
+        \\description: y
+        \\tools: [bash, edit, write_file]
+        \\---
+        \\
+    ;
+    const fm = parseFrontmatterAlloc(arena_state.allocator(), body).?;
+    try testing.expectEqual(@as(usize, 3), fm.tools.len);
+    try testing.expectEqualStrings("bash", fm.tools[0]);
+    try testing.expectEqualStrings("edit", fm.tools[1]);
+    try testing.expectEqualStrings("write_file", fm.tools[2]);
+}
+
+test "parseFrontmatterAlloc: bare comma-separated tools" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body =
+        \\---
+        \\name: x
+        \\description: y
+        \\tools: read_file, grep
+        \\---
+        \\
+    ;
+    const fm = parseFrontmatterAlloc(arena_state.allocator(), body).?;
+    try testing.expectEqual(@as(usize, 2), fm.tools.len);
+    try testing.expectEqualStrings("read_file", fm.tools[0]);
+    try testing.expectEqualStrings("grep", fm.tools[1]);
+}
+
+test "parseFrontmatterAlloc: block-list tools" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body =
+        \\---
+        \\name: x
+        \\description: y
+        \\tools:
+        \\  - bash
+        \\  - "edit"
+        \\---
+        \\
+    ;
+    const fm = parseFrontmatterAlloc(arena_state.allocator(), body).?;
+    try testing.expectEqual(@as(usize, 2), fm.tools.len);
+    try testing.expectEqualStrings("bash", fm.tools[0]);
+    try testing.expectEqualStrings("edit", fm.tools[1]);
+}
+
+test "parseFrontmatterAlloc: missing tools key yields empty list" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body =
+        \\---
+        \\name: x
+        \\description: y
+        \\---
+        \\
+    ;
+    const fm = parseFrontmatterAlloc(arena_state.allocator(), body).?;
+    try testing.expectEqual(@as(usize, 0), fm.tools.len);
 }
 
 test "formatCatalog: empty list yields empty string" {
