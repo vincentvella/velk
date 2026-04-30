@@ -5,6 +5,7 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
+import org.jetbrains.plugins.terminal.ShellTerminalWidget
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
 
 /**
@@ -23,10 +24,13 @@ class OpenReplAction : AnAction() {
         try {
             val mgr = TerminalToolWindowManager.getInstance(project)
             val args = arrayOf(cfg.binaryPath) + cfg.extraArgs.toTypedArray()
-            // `createShellWidget` opens a new terminal tab and runs the
-            // given command. The label below shows up as the tab title.
-            mgr.createShellWidget(cwd, "velk", true, true)
-                .executeCommand(args.joinToString(" ") { quoteIfNeeded(it) })
+            val cmd = args.joinToString(" ") { quoteIfNeeded(it) }
+            // `createShellWidget` opens a new terminal tab and returns
+            // the widget. Cast to ShellTerminalWidget for executeCommand,
+            // which types the given line into the terminal as if the
+            // user had hit Enter.
+            val widget = mgr.createShellWidget(cwd, "velk", true, true)
+            (widget as? ShellTerminalWidget)?.executeCommand(cmd)
         } catch (t: Throwable) {
             Messages.showErrorDialog(
                 project,

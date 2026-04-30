@@ -23,8 +23,10 @@ dependencies {
         // gets compiled against this and works on Community + Ultimate
         // + most JetBrains IDEs that share the platform.
         intellijIdeaCommunity("2024.3")
-        // We use the integrated terminal API that ships in the
-        // platform; no separate plugin dep needed for the launcher.
+        // The integrated terminal lives in a bundled plugin we have
+        // to depend on explicitly so its classes are on the compile
+        // classpath. plugin.xml already declares the same id.
+        bundledPlugin("org.jetbrains.plugins.terminal")
     }
     implementation("org.jetbrains.kotlin:kotlin-stdlib")
 }

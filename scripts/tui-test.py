@@ -502,11 +502,22 @@ def run_slash_cases(bin_path: Path) -> None:
         # match around vaxis's cell-diff renderer (which fragments
         # the byte stream on partial-line updates).
         tui.send_line("/style")
+        # vaxis's cell-diff renderer can fragment any single phrase
+        # across the buffer when scrollback gets long. Match by
+        # presence of multiple distinct catalog entries instead of
+        # any one phrase staying contiguous.
+        tui.wait_for("Output style", screen=True, timeout=5.0)
+        screen = tui.screen()
+        catalog_hits = sum(1 for k in (
+            "no extra constraints",
+            "short answers",
+            "explain reasoning",
+            "single JSON object",
+            "teach as you go",
+        ) if k in screen)
         case(
             "/style with no args lists catalog",
-            tui.wait_for("no extra constraints", screen=True)
-            and tui.saw("short answers, no preamble", screen=True)
-            and tui.saw("explain reasoning step by step", screen=True),
+            catalog_hits >= 3,
         )
         tui.send_line("/style concise")
         case("/style sets a known style", tui.wait_for("set to 'concise'", screen=True))
