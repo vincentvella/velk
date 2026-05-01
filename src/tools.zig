@@ -21,6 +21,7 @@ const ask_mod = @import("ask.zig");
 const provider_mod = @import("provider.zig");
 const agent_mod = @import("agent.zig");
 const hooks_mod = @import("hooks.zig");
+const lsp_mod = @import("lsp.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
 /// so any tool that touches the filesystem can consult `unsafe` and reuse
@@ -67,6 +68,12 @@ pub const Settings = struct {
     /// languageId). Populated from settings.json. The
     /// `lsp_diagnostics` tool looks up by extension.
     lsp_servers: []const LspServerConfig = &.{},
+    /// Optional pool of long-lived LSP clients. When set, the
+    /// `lsp_diagnostics` tool reuses an existing server process per
+    /// language instead of spawning one per call (saves the 0.5–2s
+    /// warmup of zls / rust-analyzer). Null = spawn-per-call (the
+    /// pre-pool behaviour, kept for tests).
+    lsp_pool: ?*lsp_mod.Pool = null,
 };
 
 /// Mirror of `settings.LspServer` — duplicated here so tools.zig
@@ -1741,8 +1748,6 @@ fn sniffImageMediaType(bytes: []const u8) ?[]const u8 {
 
 // ───────── lsp_diagnostics ─────────
 
-const lsp_mod = @import("lsp.zig");
-
 const lsp_diagnostics_schema_json: []const u8 =
     \\{"type":"object",
     \\ "properties":{
@@ -1820,14 +1825,39 @@ fn lspDiagnosticsExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.
     if (argv.items.len == 0) return errorOutput(arena, "lsp_diagnostics: empty command for '{s}'", .{ext});
 
     const gpa = settings.gpa;
-    const client = lsp_mod.Client.start(gpa, settings.io, argv.items, root_abs) catch |e|
-        return errorOutput(arena, "lsp_diagnostics: spawn '{s}' failed: {s}", .{ server.command, @errorName(e) });
-    defer client.deinit();
+    // Reuse a pooled client when one is available. Falls through to
+    // spawn-per-call for tests / `--no-tui` paths that don't wire a
+    // pool. The `pooled` flag controls whether we deinit at the end —
+    // pool-owned clients live for the session.
+    const pooled: bool = settings.lsp_pool != null;
+    const client = if (settings.lsp_pool) |pool|
+        pool.get(ext, argv.items, root_abs) catch |e|
+            return errorOutput(arena, "lsp_diagnostics: spawn '{s}' failed: {s}", .{ server.command, @errorName(e) })
+    else
+        lsp_mod.Client.start(gpa, settings.io, argv.items, root_abs) catch |e|
+            return errorOutput(arena, "lsp_diagnostics: spawn '{s}' failed: {s}", .{ server.command, @errorName(e) });
+    defer if (!pooled) client.deinit();
 
     const diags = client.diagnostics(arena, file_abs, server.language_id, body, timeout_ms) catch |e| switch (e) {
-        error.Timeout => return errorOutput(arena, "lsp_diagnostics: timed out after {d}ms waiting for diagnostics", .{timeout_ms}),
+        error.Timeout => {
+            // Even on timeout, close the document so the next call
+            // starts clean. Pool-side state must not leak across
+            // calls just because the server was slow this round.
+            if (pooled) {
+                const uri = std.fmt.allocPrint(arena, "file://{s}", .{file_abs}) catch "";
+                if (uri.len > 0) client.closeDocument(uri);
+            }
+            return errorOutput(arena, "lsp_diagnostics: timed out after {d}ms waiting for diagnostics", .{timeout_ms});
+        },
         else => return errorOutput(arena, "lsp_diagnostics: query failed: {s}", .{@errorName(e)}),
     };
+
+    // Close the doc on the pool path so a subsequent diagnostics
+    // call for the same file can re-open at version 1 cleanly.
+    if (pooled) {
+        const uri = std.fmt.allocPrint(arena, "file://{s}", .{file_abs}) catch "";
+        if (uri.len > 0) client.closeDocument(uri);
+    }
 
     if (diags.len == 0) {
         return .{ .text = "(no diagnostics reported)", .is_error = false };

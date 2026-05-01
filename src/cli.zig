@@ -42,6 +42,10 @@ pub const Options = struct {
     /// Prepend a filtered repo layout to the system prompt at
     /// launch. Cached by `git status --porcelain` hash.
     repo_map: bool = false,
+    /// When true (and `repo_map` is also set), include up to
+    /// `max_symbols_per_file` top-level decls (per-language regex)
+    /// under each source file in the rendered map.
+    repo_map_symbols: bool = false,
     /// Per-turn wall-clock cap (ms). 0 = unlimited.
     max_turn_ms: u64 = 0,
     /// Per-turn cumulative-token cap (input + output). 0 = unlimited.
@@ -160,6 +164,11 @@ pub fn parse(args: []const []const u8) Action {
         }
         if (eql(arg, "--auto-commit")) {
             opts.auto_commit = true;
+            continue;
+        }
+        if (eql(arg, "--repo-map-symbols")) {
+            opts.repo_map = true;
+            opts.repo_map_symbols = true;
             continue;
         }
         if (eql(arg, "--repo-map")) {
@@ -293,6 +302,8 @@ pub fn printHelp(w: anytype) !void {
         \\                        (node_modules, .git, .zig-cache, ...)
         \\      --auto-commit     git add -A + git commit at every dirty
         \\                        turn end (best-effort, requires git repo)
+        \\      --repo-map-symbols same as --repo-map but also lists up to 12
+        \\                        top-level decls per file (Zig/Rust/TS/JS/Python/Go).
         \\      --repo-map        prepend a filtered repo layout to the
         \\                        system prompt (cached by `git status`)
         \\      --max-turn-ms <n> abort a turn if it runs longer than n ms

@@ -19,6 +19,7 @@ const ask_mod = @import("ask.zig");
 const skills_mod = @import("skills.zig");
 const memory_mod = @import("memory.zig");
 const styles_mod = @import("styles.zig");
+const lsp_mod = @import("lsp.zig");
 const ignore_mod = @import("ignore.zig");
 const lockfile = @import("lockfile.zig");
 const watch_mod = @import("watch.zig");
@@ -282,6 +283,17 @@ pub fn main(init: std.process.Init) !void {
                 break :blk lr;
             };
 
+            // Long-lived LSP client pool — first call to
+            // `lsp_diagnostics` for a given language spawns the
+            // server (zls/rust-analyzer warmup is 0.5–2s); reuses
+            // the same process for every subsequent call until
+            // shutdown. Pool itself is created on `arena` so its
+            // storage frees on session end; per-server processes are
+            // killed via the deinit deferred below.
+            const lsp_pool = try arena.create(lsp_mod.Pool);
+            lsp_pool.* = lsp_mod.Pool.init(init.gpa, init.io);
+            defer lsp_pool.deinit();
+
             const settings = try arena.create(tools.Settings);
             settings.* = .{
                 .io = init.io,
@@ -296,6 +308,7 @@ pub fn main(init: std.process.Init) !void {
                 .sub_agent = sub_agent,
                 .gitignore_matcher = gitignore_matcher,
                 .lsp_servers = lsp_runtime,
+                .lsp_pool = lsp_pool,
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 
@@ -485,7 +498,9 @@ pub fn main(init: std.process.Init) !void {
                 const cwd_key = try std.fmt.allocPrint(arena, "{x:0>16}", .{
                     std.hash.Wyhash.hash(0, repo_root orelse "."),
                 });
-                const map = repo_map_mod.cachedOrGenerate(arena, init.io, init.gpa, init.environ_map, cwd_key) catch "";
+                const map = repo_map_mod.cachedOrGenerateWithOptions(arena, init.io, init.gpa, init.environ_map, cwd_key, .{
+                    .with_symbols = opts.repo_map_symbols,
+                }) catch "";
                 if (map.len > 0) {
                     final_system = try workspace_mod.buildSystemPrompt(arena, final_system, map, "repo-map");
                     try errw.print("velk: repo-map prepended ({d} bytes)\n", .{map.len});
@@ -611,7 +626,8 @@ pub fn main(init: std.process.Init) !void {
                 if (opts.watch) {
                     const watch_root = ".";
                     var prev = watch_mod.fingerprint(arena, init.io, watch_root) catch 0;
-                    try errw.print("velk: --watch · polling every {d}ms · Ctrl-C to exit\n", .{watch_mod.default_poll_ms});
+                    const watch_backend: []const u8 = if (watch_mod.has_native_backend) "native (kqueue/inotify)" else "polling";
+                    try errw.print("velk: --watch · backend={s} · poll-interval={d}ms (native fallback) · Ctrl-C to exit\n", .{ watch_backend, watch_mod.default_poll_ms });
                     try errw.flush();
                     while (true) {
                         prev = watch_mod.waitForChange(arena, init.io, watch_root, prev, watch_mod.default_poll_ms) catch |e| {

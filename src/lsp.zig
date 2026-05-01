@@ -188,6 +188,25 @@ pub const Client = struct {
         }
     }
 
+    /// Send `textDocument/didClose` for `uri` so the server wipes
+    /// its in-memory state for that document. Called by the Pool
+    /// after each `diagnostics` call so a re-query for the same path
+    /// can re-issue `didOpen` cleanly without confusing the server
+    /// with a duplicate-open error. No-op (best-effort) on failure —
+    /// next time we'll just spawn a new client if the channel's
+    /// genuinely broken.
+    pub fn closeDocument(self: *Client, uri: []const u8) void {
+        const DidCloseParams = struct {
+            textDocument: struct { uri: []const u8 },
+        };
+        const note = .{
+            .jsonrpc = @as([]const u8, "2.0"),
+            .method = @as([]const u8, "textDocument/didClose"),
+            .params = DidCloseParams{ .textDocument = .{ .uri = uri } },
+        };
+        self.sendFrame(note) catch {};
+    }
+
     fn parseDiagnostics(self: *Client, arena: std.mem.Allocator, params: std.json.Value, want_uri: []const u8) ![]const Diagnostic {
         _ = self;
         const obj = switch (params) {
@@ -332,6 +351,64 @@ pub const Client = struct {
     }
 };
 
+/// Per-extension client pool. The first `lsp_diagnostics` call for a
+/// given language spawns the server (cost: 500ms–2s for zls /
+/// rust-analyzer warmup). Subsequent calls reuse the same process and
+/// pay only the framing overhead (single-digit ms). Pool lives for
+/// the velk session and shuts every server down on `deinit`.
+///
+/// One client per extension is enough today: `lsp_diagnostics` is
+/// the only consumer and it runs serially on the agent worker
+/// thread. If we add hover/definition later they'll multiplex on the
+/// same client (LSP supports it natively — just need a request-id
+/// dispatcher).
+pub const Pool = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    /// Map keyed by file extension (`.zig`, `.rs`). Owns the keys
+    /// (duped on insert) and the *Client values.
+    clients: std.StringHashMap(*Client),
+
+    pub fn init(gpa: std.mem.Allocator, io: Io) Pool {
+        return .{ .gpa = gpa, .io = io, .clients = .init(gpa) };
+    }
+
+    pub fn deinit(self: *Pool) void {
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.gpa.free(entry.key_ptr.*);
+        }
+        self.clients.deinit();
+    }
+
+    /// Returns a usable client for `extension`, spawning one via
+    /// `Client.start(...)` on first contact. The returned pointer
+    /// is owned by the pool — do NOT call `deinit()` on it.
+    /// `argv` and `root_abs` are only consulted on first contact;
+    /// subsequent calls with different argv for the same extension
+    /// silently reuse the original spawn (settings are immutable
+    /// for the session in v1).
+    pub fn get(
+        self: *Pool,
+        extension: []const u8,
+        argv: []const []const u8,
+        root_abs: []const u8,
+    ) !*Client {
+        if (self.clients.get(extension)) |c| return c;
+        const c = try Client.start(self.gpa, self.io, argv, root_abs);
+        errdefer c.deinit();
+        const key = try self.gpa.dupe(u8, extension);
+        errdefer self.gpa.free(key);
+        try self.clients.put(key, c);
+        return c;
+    }
+
+    pub fn isEmpty(self: *const Pool) bool {
+        return self.clients.count() == 0;
+    }
+};
+
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
@@ -355,6 +432,33 @@ fn severityLabel(n: i32) []const u8 {
 // ───────── tests ─────────
 
 const testing = std.testing;
+
+test "Pool: empty until first get" {
+    var pool: Pool = .init(testing.allocator, testing.io);
+    defer pool.deinit();
+    try testing.expect(pool.isEmpty());
+    try testing.expectEqual(@as(u32, 0), pool.clients.count());
+}
+
+test "Pool: get spawns once per extension" {
+    // We can't actually spawn a real LSP server in this test (no zls
+    // on the test runner), but we can verify the cache-miss path
+    // surfaces the spawn error without leaking a partial entry.
+    var pool: Pool = .init(testing.allocator, testing.io);
+    defer pool.deinit();
+    const argv: []const []const u8 = &.{"this-binary-does-not-exist-xyz"};
+    _ = pool.get(".zig", argv, "/tmp") catch |e| {
+        // Expect SpawnFailed or FileNotFound style error; concrete
+        // value depends on the OS but it MUST not be a successful
+        // insert.
+        _ = e;
+        try testing.expect(pool.isEmpty());
+        return;
+    };
+    // If we somehow got here (e.g. a binary by that name exists),
+    // just make sure the entry's cached.
+    try testing.expectEqual(@as(u32, 1), pool.clients.count());
+}
 
 test "asciiEqlIgnoreCase: matches across case" {
     try testing.expect(asciiEqlIgnoreCase("Content-Length", "content-length"));
