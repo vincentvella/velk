@@ -493,6 +493,19 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
+            // Architect/coder auto-route: when both halves of the
+            // split are configured, append a directive telling the
+            // coder to consult the planner via `task` on the very
+            // first non-trivial turn. Soft-routing — the model is
+            // expected to comply, not enforced. We rely on the
+            // recursion-depth cap to keep things bounded.
+            if (opts.planner_model != null) {
+                const route_block = try system_prompts.formatAutoRoute(arena, sub_default_model);
+                final_system = try workspace_mod.buildSystemPrompt(arena, final_system, route_block, "auto-route");
+                try errw.print("velk: auto-route enabled (planner={s})\n", .{sub_default_model});
+                try errw.flush();
+            }
+
             // `--system-append`: tack a session-specific block onto
             // the very end so it's the last thing the model reads
             // before user content. We wrap it with a header so the

@@ -113,6 +113,26 @@ pub fn run(
 
         const stop = state.stop_reason orelse "end_turn";
         if (!std.mem.eql(u8, stop, "tool_use")) {
+            // PostSampling: notification fired with the final
+            // assistant text from this turn. Useful for archiving or
+            // post-processing without intercepting tool calls.
+            if (config.hook_engine) |engine| {
+                if (engine.hooks.len > 0) {
+                    if (config.hook_io) |io| {
+                        const gpa = config.hook_gpa orelse arena;
+                        if (engine.dispatch(gpa, io, .post_sampling, .{
+                            .tool_output = state.text.items,
+                            .tool_error = false,
+                        })) |outcome| {
+                            if (outcome.inject) |s| gpa.free(s);
+                            if (outcome.notice) |s| gpa.free(s);
+                            if (outcome.blocked) |s| gpa.free(s);
+                        } else |e| {
+                            std.log.warn("PostSampling dispatch failed: {s}", .{@errorName(e)});
+                        }
+                    }
+                }
+            }
             try sink.onTurnEnd(sink.ctx, cumulative);
             return messages.items;
         }
@@ -222,21 +242,32 @@ fn executeOne(
     try sink.onToolResult(sink.ctx, out.text, out.is_error);
 
     // PostToolUse: notification only. Errors are swallowed.
+    // PostToolUseFailure: subset that fires only on is_error=true.
     if (config.hook_engine) |engine| {
         if (engine.hooks.len > 0) {
             const gpa = config.hook_gpa orelse arena;
             if (config.hook_io) |io| {
-                if (engine.dispatch(gpa, io, .post_tool_use, .{
+                const ctx_payload: hooks.Context = .{
                     .tool_name = use.name,
                     .tool_input = use.input,
                     .tool_output = out.text,
                     .tool_error = out.is_error,
-                })) |outcome| {
+                };
+                if (engine.dispatch(gpa, io, .post_tool_use, ctx_payload)) |outcome| {
                     if (outcome.inject) |s| gpa.free(s);
                     if (outcome.notice) |s| gpa.free(s);
                     if (outcome.blocked) |s| gpa.free(s);
                 } else |e| {
                     std.log.warn("PostToolUse dispatch failed: {s}", .{@errorName(e)});
+                }
+                if (out.is_error) {
+                    if (engine.dispatch(gpa, io, .post_tool_use_failure, ctx_payload)) |outcome| {
+                        if (outcome.inject) |s| gpa.free(s);
+                        if (outcome.notice) |s| gpa.free(s);
+                        if (outcome.blocked) |s| gpa.free(s);
+                    } else |e| {
+                        std.log.warn("PostToolUseFailure dispatch failed: {s}", .{@errorName(e)});
+                    }
                 }
             }
         }

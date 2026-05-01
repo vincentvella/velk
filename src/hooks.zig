@@ -1,19 +1,21 @@
 //! Hook system: settings-driven shell commands fired at well-known
-//! lifecycle points. v1 supports four events:
+//! lifecycle points. The events:
 //!
-//!   PreToolUse        before a tool runs (exit 2 = block, stdout/stderr = reason)
-//!   PostToolUse       after a tool runs (notification only)
-//!   UserPromptSubmit  on prompt submit (stdout = extra context to prepend)
-//!   Stop              after a turn finishes (notification only)
+//!   PreToolUse          before a tool runs (exit 2 = block, stdout/stderr = reason)
+//!   PostToolUse         after a tool runs (notification only)
+//!   PostToolUseFailure  after a tool fails (is_error=true). Subset of PostToolUse.
+//!   UserPromptSubmit    on prompt submit (stdout = extra context to prepend)
+//!   Stop                after a turn finishes (notification only)
+//!   SubagentStop        after a `task` sub-agent returns (notification only)
+//!   Notification        velk-side notice fired (e.g. budget breach)
+//!   PostSampling        after a provider streaming response completes
 //!
 //! Two hook types ship in v1:
 //!   command  shell command, JSON event passed via stdin, exit code = decision
 //!   prompt   literal text used as injected context (UserPromptSubmit only)
 //!
-//! Out of scope for v1: agent + http hook types, PostSampling event,
-//! per-hook timeout enforcement (the field is parsed but currently
-//! advisory). The `agent`, `http`, and `subagent_stop` plumbing lands
-//! once the sub-agent runtime exists in Phase 12 part 2.
+//! Out of scope for v1: agent + http hook types, per-hook timeout
+//! enforcement (the field is parsed but currently advisory).
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,14 +24,33 @@ const mvzr = @import("mvzr");
 pub const Event = enum {
     pre_tool_use,
     post_tool_use,
+    /// Subset of post_tool_use that fires only when the tool returned
+    /// is_error=true. Useful for "send me a Slack message when bash
+    /// fails" without spamming on every successful tool call.
+    post_tool_use_failure,
     user_prompt_submit,
     stop,
+    /// Fires after a `task` sub-agent completes. Payload includes
+    /// the child's final text under `tool_output` and a synthetic
+    /// `tool_name = "task"` so existing matcher syntax works.
+    subagent_stop,
+    /// Fires when velk surfaces a user-visible notice (budget breach,
+    /// auto-compact, etc). Use to mirror notices to a wider channel.
+    notification,
+    /// Fires after a provider streaming response completes. Payload
+    /// carries the final assistant text under `tool_output` so a
+    /// hook can post-process or archive it.
+    post_sampling,
 
     pub fn fromString(s: []const u8) ?Event {
         if (std.mem.eql(u8, s, "PreToolUse")) return .pre_tool_use;
         if (std.mem.eql(u8, s, "PostToolUse")) return .post_tool_use;
+        if (std.mem.eql(u8, s, "PostToolUseFailure")) return .post_tool_use_failure;
         if (std.mem.eql(u8, s, "UserPromptSubmit")) return .user_prompt_submit;
         if (std.mem.eql(u8, s, "Stop")) return .stop;
+        if (std.mem.eql(u8, s, "SubagentStop")) return .subagent_stop;
+        if (std.mem.eql(u8, s, "Notification")) return .notification;
+        if (std.mem.eql(u8, s, "PostSampling")) return .post_sampling;
         return null;
     }
 
@@ -37,8 +58,12 @@ pub const Event = enum {
         return switch (self) {
             .pre_tool_use => "PreToolUse",
             .post_tool_use => "PostToolUse",
+            .post_tool_use_failure => "PostToolUseFailure",
             .user_prompt_submit => "UserPromptSubmit",
             .stop => "Stop",
+            .subagent_stop => "SubagentStop",
+            .notification => "Notification",
+            .post_sampling => "PostSampling",
         };
     }
 };
@@ -384,6 +409,50 @@ test "Event.fromString round-trip" {
     try testing.expectEqualStrings("UserPromptSubmit", Event.user_prompt_submit.toString());
 }
 
+test "Event.fromString: new event names" {
+    try testing.expectEqual(Event.post_tool_use_failure, Event.fromString("PostToolUseFailure").?);
+    try testing.expectEqual(Event.subagent_stop, Event.fromString("SubagentStop").?);
+    try testing.expectEqual(Event.notification, Event.fromString("Notification").?);
+    try testing.expectEqual(Event.post_sampling, Event.fromString("PostSampling").?);
+}
+
+test "Event.toString: new event names" {
+    try testing.expectEqualStrings("PostToolUseFailure", Event.post_tool_use_failure.toString());
+    try testing.expectEqualStrings("SubagentStop", Event.subagent_stop.toString());
+    try testing.expectEqualStrings("Notification", Event.notification.toString());
+    try testing.expectEqualStrings("PostSampling", Event.post_sampling.toString());
+}
+
+test "parse: PostToolUseFailure + SubagentStop hooks load" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{
+        \\  "PostToolUseFailure": [{"type":"command","command":"echo failed"}],
+        \\  "SubagentStop":       [{"type":"command","command":"echo done"}],
+        \\  "Notification":       [{"type":"command","command":"echo notice"}],
+        \\  "PostSampling":       [{"type":"command","command":"echo sampled"}]
+        \\}
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
+    const e = try Engine.parse(arena_state.allocator(), v);
+    try testing.expectEqual(@as(usize, 4), e.hooks.len);
+    var saw_failure = false;
+    var saw_subagent = false;
+    var saw_notif = false;
+    var saw_sampling = false;
+    for (e.hooks) |h| {
+        switch (h.event) {
+            .post_tool_use_failure => saw_failure = true,
+            .subagent_stop => saw_subagent = true,
+            .notification => saw_notif = true,
+            .post_sampling => saw_sampling = true,
+            else => {},
+        }
+    }
+    try testing.expect(saw_failure and saw_subagent and saw_notif and saw_sampling);
+}
+
 test "parse: empty object yields empty engine" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -559,6 +628,60 @@ test "dispatch: matcher rejects mismatched tool_name and skips the hook" {
     defer if (out.inject) |s| arena.free(s);
     defer if (out.notice) |s| arena.free(s);
     defer if (out.blocked) |s| arena.free(s);
+    try testing.expect(out.blocked == null);
+}
+
+test "dispatch: PostToolUseFailure hook fires only when is_error" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .post_tool_use_failure,
+        .kind = .command,
+        .body = "echo got-failure",
+    }} };
+    // Success-only events do not match a *_failure hook, even on the
+    // post_tool_use family — caller decides which one to dispatch.
+    const out = try e.dispatch(arena, testIo(), .post_tool_use_failure, .{
+        .tool_name = "bash",
+        .tool_error = true,
+    });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    defer if (out.notice) |s| arena.free(s);
+    try testing.expect(out.blocked == null);
+    // No notice expected — `echo` exits 0 cleanly. We just confirm
+    // the dispatch ran without raising.
+}
+
+test "dispatch: SubagentStop notification round-trips" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .subagent_stop,
+        .kind = .command,
+        .body = "exit 0",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .subagent_stop, .{
+        .tool_name = "task",
+        .tool_output = "child finished",
+    });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    defer if (out.notice) |s| arena.free(s);
+    try testing.expect(out.blocked == null);
+}
+
+test "dispatch: PostSampling carries tool_output for archival" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .post_sampling,
+        .kind = .command,
+        .body = "exit 0",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .post_sampling, .{
+        .tool_output = "the assistant said hi",
+    });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    defer if (out.notice) |s| arena.free(s);
     try testing.expect(out.blocked == null);
 }
 

@@ -478,6 +478,27 @@ const Tui = struct {
         }
         try self.blocks.append(self.arena, block);
         self.scroll_offset = 0;
+
+        // Notification hook: fire every time we surface a `.notice`
+        // block so external watchers (Slack mirrors, desktop pop-ups,
+        // etc.) see the same lifecycle events the user does. Failures
+        // are logged but never propagate — a misconfigured hook must
+        // not break the UI.
+        if (kind == .notice) {
+            if (self.hook_engine) |engine| {
+                if (engine.hooks.len > 0) {
+                    if (engine.dispatch(self.gpa, self.io, .notification, .{
+                        .tool_output = owned,
+                    })) |outcome| {
+                        if (outcome.inject) |s| self.gpa.free(s);
+                        if (outcome.notice) |s| self.gpa.free(s);
+                        if (outcome.blocked) |s| self.gpa.free(s);
+                    } else |e| {
+                        std.log.warn("Notification dispatch failed: {s}", .{@errorName(e)});
+                    }
+                }
+            }
+        }
     }
 
     fn appendAssistantText(self: *Tui, text: []const u8) !void {

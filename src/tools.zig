@@ -97,6 +97,14 @@ pub const SubAgent = struct {
     /// safety boundaries should still apply. Null disables.
     hook_engine: ?*const hooks_mod.Engine = null,
     hook_io: ?Io = null,
+    /// Current recursion depth. Top-level (model-issued) `task` runs
+    /// at depth 0; a `task` inside a child runs at depth 1, etc.
+    /// `taskExecute` refuses to spawn another child at `max_depth`.
+    depth: u8 = 0,
+    /// Hard cap on `depth`. Default 2 lets a planner spawn a coder,
+    /// or a coder spawn a single sub-task, but stops infinite-loop
+    /// recursion cold.
+    max_depth: u8 = 2,
 };
 
 pub const Error = error{
@@ -1176,21 +1184,37 @@ pub fn buildTask(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool
     const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, task_schema_json, .{});
     return .{
         .name = "task",
-        .description = "Spawn a sub-agent with isolated context. Pass a `prompt` (and optionally a `tools` allowlist by name); the sub-agent runs the agent loop with its own fresh message history and returns the final assistant text. Use for self-contained sub-tasks where you don't want to pollute the main conversation. Sub-agents do not nest — `task` is excluded from the child's tool set.",
+        .description = "Spawn a sub-agent with isolated context. Pass a `prompt` (and optionally a `tools` allowlist by name); the sub-agent runs the agent loop with its own fresh message history and returns the final assistant text. Use for self-contained sub-tasks where you don't want to pollute the main conversation. `task` may recurse up to a depth cap (default 2) — beyond that the call is refused so a malformed plan can't infinite-loop.",
         .input_schema = schema,
         .context = @constCast(@ptrCast(settings)),
         .execute = taskExecute,
     };
 }
 
+/// Single shared depth counter. The agent worker that runs `task`
+/// is single-threaded, so synchronous recursion is the only way the
+/// counter changes — no atomics needed. `taskExecute` bumps on entry
+/// and decrements on exit; if the bump would exceed `sub.max_depth`,
+/// we refuse before invoking the child.
+const TaskRecursion = struct {
+    var depth: u8 = 0;
+};
+
 fn taskExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
     const settings = settingsFromCtx(ctx);
     const sub = settings.sub_agent orelse return errorOutput(arena, "task: no sub-agent runtime configured", .{});
 
+    if (TaskRecursion.depth >= sub.max_depth) {
+        return errorOutput(arena, "task: max recursion depth ({d}) reached — refusing to nest further", .{sub.max_depth});
+    }
+    TaskRecursion.depth += 1;
+    defer TaskRecursion.depth -= 1;
+
     const prompt = (try getString(input, "prompt")) orelse return errorOutput(arena, "task: missing 'prompt'", .{});
 
-    // Build the child's tool set: parent's registry minus `task`,
-    // optionally filtered by the caller's allowlist.
+    // Build the child's tool set: parent's registry, optionally
+    // filtered by the caller's allowlist. `task` is *kept* so the
+    // child can recurse — depth-capped via TaskRecursion above.
     var allow: ?[]const []const u8 = null;
     if (input == .object) {
         if (input.object.get("tools")) |v| switch (v) {
@@ -1210,7 +1234,6 @@ fn taskExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
 
     var child_tools: std.ArrayList(tool.Tool) = .empty;
     for (sub.tools) |t| {
-        if (std.mem.eql(u8, t.name, "task")) continue;
         if (allow) |names| {
             var matched = false;
             for (names) |n| if (std.mem.eql(u8, t.name, n)) {
@@ -1289,6 +1312,30 @@ fn taskExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value
     } else {
         try out.appendSlice(arena, "(no final text produced)");
     }
+
+    // SubagentStop: notification fired after the child agent returns.
+    // Mirrors PostToolUse but with a tool_name='task' fingerprint so
+    // matchers can target it explicitly. Errors are swallowed —
+    // hooks must not block the parent from seeing the result.
+    if (sub.hook_engine) |engine| {
+        if (engine.hooks.len > 0) {
+            if (sub.hook_io) |io| {
+                const gpa = settings.gpa;
+                if (engine.dispatch(gpa, io, .subagent_stop, .{
+                    .tool_name = "task",
+                    .tool_output = out.items,
+                    .tool_error = false,
+                })) |outcome| {
+                    if (outcome.inject) |s| gpa.free(s);
+                    if (outcome.notice) |s| gpa.free(s);
+                    if (outcome.blocked) |s| gpa.free(s);
+                } else |e| {
+                    std.log.warn("SubagentStop dispatch failed: {s}", .{@errorName(e)});
+                }
+            }
+        }
+    }
+
     return .{ .text = out.items };
 }
 
@@ -3128,13 +3175,14 @@ test "team: each task missing prompt is an error" {
     try testing.expect(std.mem.indexOf(u8, out.text, "prompt missing") != null);
 }
 
-test "task: child registry filters out `task` and respects allowlist" {
+test "task: child registry honors the allowlist (and now keeps `task` for recursion)" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     // Hand-crafted parent registry with three tools; the allowlist
-    // restricts the child to "echo".
+    // permits "echo" and "task". `edit` is dropped by the allowlist;
+    // `task` is now retained so the child can recurse (depth-capped).
     var captured_filter: ChildFilterCapture = .{};
     const parent_tools = [_]tool.Tool{
         .{ .name = "echo", .description = "", .input_schema = .{ .null = {} }, .execute = stubExecute },
@@ -3157,12 +3205,49 @@ test "task: child registry filters out `task` and respects allowlist" {
     const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"prompt\":\"x\",\"tools\":[\"echo\",\"task\"]}", .{});
     _ = try t.execute(@constCast(@ptrCast(&settings)), a, input);
 
-    // The provider was called once with the child's tool defs;
-    // we verify the registry was filtered to ONLY "echo": "task"
-    // is excluded by the runtime even though it's in the allowlist,
-    // and "edit" is excluded because the allowlist blocks it.
-    try testing.expectEqual(@as(usize, 1), captured_filter.tool_count);
-    try testing.expectEqualStrings("echo", captured_filter.first_tool_name);
+    // Both echo and task land; edit is filtered out by the allowlist.
+    try testing.expectEqual(@as(usize, 2), captured_filter.tool_count);
+}
+
+test "task: max_depth=0 refuses any nesting" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = stubStream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+        .max_depth = 0,
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTask(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"prompt\":\"x\"}", .{});
+    const out = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(out.is_error);
+    try testing.expect(std.mem.indexOf(u8, out.text, "max recursion depth") != null);
+}
+
+test "task: depth counter resets across consecutive top-level calls" {
+    // Two back-to-back top-level invocations should each succeed —
+    // the deferred decrement must put `depth` back to 0 between calls.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sub: SubAgent = .{
+        .provider = .{ .ctx = null, .streamFn = stubStream, .lastErrorBodyFn = stubLastBody },
+        .model = "m",
+    };
+    var settings = testSettings();
+    settings.gpa = testing.allocator;
+    settings.sub_agent = &sub;
+    const t = try buildTask(a, &settings);
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"prompt\":\"x\"}", .{});
+    const out1 = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out1.is_error);
+    const out2 = try t.execute(@constCast(@ptrCast(&settings)), a, input);
+    try testing.expect(!out2.is_error);
+    try testing.expectEqual(@as(u8, 0), TaskRecursion.depth);
 }
 
 const ChildFilterCapture = struct {

@@ -97,7 +97,32 @@ pub fn formatAppend(arena: std.mem.Allocator, base: []const u8, append: []const 
     );
 }
 
+/// Build the architect/coder auto-route directive as an `<auto-route>`
+/// block. main.zig prepends this to the system prompt when
+/// `--planner-model` is set so the coder consults the planner via
+/// `task` on its first substantive turn. Soft-routing — bounded by
+/// the `task` recursion-depth cap.
+pub fn formatAutoRoute(arena: std.mem.Allocator, planner_model: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(
+        arena,
+        "<auto-route>\nA planner model ('{s}') is configured. On your *very first* substantive turn in this session, before any other tool call:\n  1. Call `task` with `model='{s}'`, `prompt=` (the user's request, verbatim).\n  2. When the planner returns, summarise its plan in 1–2 sentences and proceed to implement.\n  3. Do NOT call `task(model='{s}')` again in subsequent turns unless the user asks for a re-plan.\nSkip this for trivial requests (single yes/no, simple lookups, pure questions).\n</auto-route>",
+        .{ planner_model, planner_model, planner_model },
+    );
+}
+
 const testing = std.testing;
+
+test "formatAutoRoute: includes planner model name and the three steps" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const out = try formatAutoRoute(arena.allocator(), "claude-opus-4-7");
+    try testing.expect(std.mem.startsWith(u8, out, "<auto-route>"));
+    try testing.expect(std.mem.endsWith(u8, out, "</auto-route>"));
+    try testing.expect(std.mem.indexOf(u8, out, "claude-opus-4-7") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Call `task`") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "summarise its plan") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Skip this for trivial") != null);
+}
 
 test "default prompt: substantive sections present" {
     try testing.expect(std.mem.indexOf(u8, default, "# Doing tasks") != null);
