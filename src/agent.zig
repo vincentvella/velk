@@ -8,6 +8,7 @@ const Io = std.Io;
 const provider_mod = @import("provider.zig");
 const tool = @import("tool.zig");
 const hooks = @import("hooks.zig");
+const telemetry = @import("telemetry.zig");
 
 /// Callbacks the agent fires as a turn unfolds. All slices passed in
 /// are only valid for the duration of the call — copy if you need to
@@ -50,6 +51,11 @@ pub const Config = struct {
     /// output across all iterations). Checked after each iteration's
     /// usage is collected. 0 = unlimited.
     max_total_tokens: u64 = 0,
+    /// Optional telemetry config. When `isActive`, a `tool_use`
+    /// event POSTs per tool call (fire-and-forget). Null skips the
+    /// telemetry path entirely so tests / unsubscribed runs never
+    /// touch the network.
+    telemetry: ?*const telemetry.Config = null,
 };
 
 pub const Error = error{
@@ -202,6 +208,26 @@ fn executeOne(
 ) !provider_mod.ToolResult {
     const input_str = try std.json.Stringify.valueAlloc(arena, use.input, .{});
     try sink.onToolCall(sink.ctx, use.name, input_str);
+
+    // Telemetry: tool_use event, fire-and-forget. Only the tool name
+    // and timestamp go on the wire — never the input (which would
+    // leak prompt content). Failure is swallowed; a flaky telemetry
+    // endpoint must not block tool execution.
+    if (config.telemetry) |t_cfg| {
+        if (telemetry.isActive(t_cfg.*)) {
+            const gpa = config.hook_gpa orelse arena;
+            const io = config.hook_io orelse arena_io: {
+                break :arena_io null;
+            };
+            if (io) |real_io| {
+                telemetry.record(gpa, real_io, t_cfg.*, .{
+                    .name = "tool_use",
+                    .tool = use.name,
+                    .ts = std.Io.Clock.now(.real, real_io).toSeconds(),
+                }) catch {};
+            }
+        }
+    }
 
     const reg: tool.Registry = .{ .tools = config.tools };
     const t = reg.find(use.name) orelse {

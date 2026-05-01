@@ -9,6 +9,7 @@ const tool = @import("tool.zig");
 const agent = @import("agent.zig");
 const persist = @import("persist.zig");
 const hooks = @import("hooks.zig");
+const telemetry = @import("telemetry.zig");
 
 pub const Config = struct {
     model: []const u8,
@@ -26,6 +27,9 @@ pub const Config = struct {
     /// Forwarded to agent.Config — optional per-turn budget caps.
     max_wall_ms: u64 = 0,
     max_total_tokens: u64 = 0,
+    /// Optional anonymous telemetry config. Forwarded to the agent
+    /// loop so `tool_use` events fire when active.
+    telemetry: ?*const telemetry.Config = null,
 };
 
 pub const Session = struct {
@@ -57,6 +61,7 @@ pub const Session = struct {
             .hook_io = self.config.hook_io,
             .max_wall_ms = self.config.max_wall_ms,
             .max_total_tokens = self.config.max_total_tokens,
+            .telemetry = self.config.telemetry,
         });
         self.messages.clearRetainingCapacity();
         try self.messages.appendSlice(self.arena, final);

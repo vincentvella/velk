@@ -22,6 +22,7 @@ const provider_mod = @import("provider.zig");
 const agent_mod = @import("agent.zig");
 const hooks_mod = @import("hooks.zig");
 const lsp_mod = @import("lsp.zig");
+const telemetry_mod = @import("telemetry.zig");
 
 /// Per-process tool settings. Pointed to by every tool's `context` field
 /// so any tool that touches the filesystem can consult `unsafe` and reuse
@@ -74,6 +75,11 @@ pub const Settings = struct {
     /// warmup of zls / rust-analyzer). Null = spawn-per-call (the
     /// pre-pool behaviour, kept for tests).
     lsp_pool: ?*lsp_mod.Pool = null,
+    /// Optional telemetry config. When set + active (`isActive`),
+    /// `tool_use` events fire one POST per tool call. Null = no
+    /// telemetry path is taken regardless of env / settings — used
+    /// in tests where we never want a network attempt.
+    telemetry: ?*const telemetry_mod.Config = null,
 };
 
 /// Mirror of `settings.LspServer` — duplicated here so tools.zig

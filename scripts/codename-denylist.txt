@@ -1,0 +1,12 @@
+# Codename deny-list — checked by scripts/codename-check.sh as part
+# of `zig build check`. One term per line. Blank lines and `#`-prefix
+# lines are ignored. Matched case-insensitively as a substring.
+#
+# Empty by default. A maintainer adds entries here when they need to
+# gate a release against accidental disclosure of internal model
+# codenames, project codenames, or anything else that should not
+# appear in commits / generated content.
+#
+# Examples (commented out — uncomment to enable):
+#   sundial-7
+#   project-aurora

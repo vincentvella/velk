@@ -168,10 +168,21 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke", "Run CLI smoke tests (no API)");
     smoke_step.dependOn(&smoke_cmd.step);
 
+    // `zig build codename-check` greps the source tree against a
+    // deny-list of internal codenames (scripts/codename-denylist.txt).
+    // The deny-list ships empty so this is a no-op for fresh checkouts;
+    // a maintainer fills it in when they need to gate a release. The
+    // step is fast (single-digit ms on this tree), so we wire it into
+    // `check` unconditionally — the overhead is negligible.
+    const codename_cmd = b.addSystemCommand(&.{ "bash", "scripts/codename-check.sh" });
+    const codename_step = b.step("codename-check", "Grep source tree against the codename deny-list");
+    codename_step.dependOn(&codename_cmd.step);
+
     // `zig build check` runs both unit tests and smoke tests.
     const check_step = b.step("check", "Run unit tests + smoke tests");
     check_step.dependOn(test_step);
     check_step.dependOn(smoke_step);
+    check_step.dependOn(codename_step);
 
     // `zig build tui-test` drives the TUI under a python pty harness
     // (scripts/tui-test.py) and asserts on ANSI-stripped output. Lets

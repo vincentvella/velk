@@ -20,6 +20,7 @@ const skills_mod = @import("skills.zig");
 const memory_mod = @import("memory.zig");
 const styles_mod = @import("styles.zig");
 const lsp_mod = @import("lsp.zig");
+const telemetry_mod = @import("telemetry.zig");
 const ignore_mod = @import("ignore.zig");
 const lockfile = @import("lockfile.zig");
 const watch_mod = @import("watch.zig");
@@ -174,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
             // Layer settings.json defaults underneath the CLI flags.
             // CLI flags WIN — overlaySettings only fills fields the
             // user didn't explicitly set on the command line.
-            var file_settings = settings_mod.loadAndMerge(arena, init.io, init.environ_map) catch |err| settings: {
+            var file_settings = settings_mod.loadAndMergeWithManaged(arena, init.io, init.gpa, init.environ_map) catch |err| settings: {
                 try errw.print("velk: settings file: {s}\n", .{@errorName(err)});
                 try errw.flush();
                 break :settings settings_mod.Settings{};
@@ -196,6 +197,27 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             const opts = applySettingsToOptions(arena, raw_opts, file_settings);
+
+            // Telemetry config — opt-in, off by default. Both
+            // `telemetry.url` (or `VELK_TELEMETRY_URL`) AND
+            // `telemetry.opt_in: true` (or `VELK_TELEMETRY_OPT_IN=1`)
+            // must be set before any network call fires. Wired here
+            // so the session_start event below has a config to
+            // consult; lives on Settings so tools.zig can fire too.
+            const telemetry_cfg = try telemetry_mod.fromSources(
+                arena,
+                init.environ_map,
+                file_settings.telemetry.opt_in,
+                file_settings.telemetry.url,
+            );
+            if (telemetry_mod.isActive(telemetry_cfg)) {
+                try errw.print("velk: telemetry active (machine={s})\n", .{telemetry_cfg.machine_id orelse "unknown"});
+                try errw.flush();
+                telemetry_mod.record(init.gpa, init.io, telemetry_cfg, .{
+                    .name = "session_start",
+                    .ts = std.Io.Clock.now(.real, init.io).toSeconds(),
+                }) catch {};
+            }
 
             const holder = setupProvider(arena, init, errw, opts) catch |err| {
                 try errw.print("velk: {s}\n", .{@errorName(err)});
@@ -294,6 +316,9 @@ pub fn main(init: std.process.Init) !void {
             lsp_pool.* = lsp_mod.Pool.init(init.gpa, init.io);
             defer lsp_pool.deinit();
 
+            const telemetry_ptr = try arena.create(telemetry_mod.Config);
+            telemetry_ptr.* = telemetry_cfg;
+
             const settings = try arena.create(tools.Settings);
             settings.* = .{
                 .io = init.io,
@@ -309,6 +334,7 @@ pub fn main(init: std.process.Init) !void {
                 .gitignore_matcher = gitignore_matcher,
                 .lsp_servers = lsp_runtime,
                 .lsp_pool = lsp_pool,
+                .telemetry = telemetry_ptr,
             };
             const builtin_tools = try tools.buildAll(arena, settings);
 
@@ -547,6 +573,7 @@ pub fn main(init: std.process.Init) !void {
                 .max_wall_ms = opts.max_turn_ms,
                 .max_total_tokens = opts.max_turn_tokens,
                 .max_iterations = if (opts.max_iterations > 0) opts.max_iterations else 10,
+                .telemetry = telemetry_ptr,
             });
 
             if (opts.session) |name| {

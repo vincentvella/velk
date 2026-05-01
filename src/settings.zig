@@ -15,6 +15,7 @@ const std = @import("std");
 const Io = std.Io;
 const cli = @import("cli.zig");
 const hooks = @import("hooks.zig");
+const managed_settings_mod = @import("managed_settings.zig");
 
 pub const default_filename: []const u8 = "settings.json";
 pub const project_dir_name: []const u8 = ".velk";
@@ -82,6 +83,23 @@ pub const LspServer = struct {
     language_id: []const u8,
 };
 
+/// Anonymous tool-use telemetry config. Defaults to off; both
+/// `opt_in: true` AND a non-null `url` must be set before any
+/// network calls fire. Env vars (`VELK_TELEMETRY_OPT_IN`,
+/// `VELK_TELEMETRY_URL`) override these at startup.
+pub const Telemetry = struct {
+    opt_in: bool = false,
+    url: ?[]const u8 = null,
+};
+
+/// Remote managed-settings config. Optional URL we GET on launch
+/// (with on-disk cache + freshness window) to pull org-wide defaults.
+/// Merged at the lowest priority — user/project always win. The env
+/// var `VELK_MANAGED_SETTINGS_URL` overrides the JSON value.
+pub const ManagedSettings = struct {
+    url: ?[]const u8 = null,
+};
+
 pub const Settings = struct {
     defaults: Defaults = .{},
     /// Each entry is a shell command (matches `--mcp`). Loaded
@@ -106,6 +124,12 @@ pub const Settings = struct {
     /// Per-language LSP servers. Same merge semantics as `custom_tools`:
     /// later entries replace same-extension earlier ones.
     lsp_servers: []const LspServer = &.{},
+    /// Anonymous tool-use telemetry config. Off by default; even when
+    /// set in JSON, env vars (`VELK_TELEMETRY_OPT_IN`,
+    /// `VELK_TELEMETRY_URL`) take priority at runtime.
+    telemetry: Telemetry = .{},
+    /// Optional URL to GET org-wide defaults from on launch.
+    managed_settings: ManagedSettings = .{},
     /// Compiled hook engine. Built lazily by `compileHooks` once
     /// settings have been merged so project-level hooks override the
     /// user-level set wholesale (no concatenation — last one wins).
@@ -167,6 +191,12 @@ pub const Settings = struct {
         if (b.lsp_servers.len > 0) {
             self.lsp_servers = try mergeLspServers(arena, self.lsp_servers, b.lsp_servers);
         }
+        // Telemetry: only the *non-default* fields of b override self.
+        // Both are conservative — we never reset opt_in to false from
+        // a project file that doesn't mention telemetry.
+        if (b.telemetry.opt_in) self.telemetry.opt_in = true;
+        if (b.telemetry.url) |u| self.telemetry.url = u;
+        if (b.managed_settings.url) |u| self.managed_settings.url = u;
     }
 
     /// Lookup an LSP server config by file extension. Match is exact
@@ -305,6 +335,46 @@ pub fn loadAndMerge(
     return out;
 }
 
+/// Variant that *also* pulls org-wide managed settings (when
+/// configured) and merges them at the lowest priority — below user,
+/// below project. Two-pass: first read user/project to discover the
+/// managed URL, then fetch (with on-disk cache + 1h freshness window),
+/// then re-build with managed at the bottom of the merge stack.
+///
+/// On managed-fetch failure (network down, cache cold, malformed
+/// body) we silently fall back to plain `loadAndMerge` — managed
+/// is best-effort by design.
+pub fn loadAndMergeWithManaged(
+    arena: std.mem.Allocator,
+    io: Io,
+    gpa: std.mem.Allocator,
+    env_map: *std.process.Environ.Map,
+) !Settings {
+    // Pass 1 — local-only, just to learn the managed URL (if any).
+    var probe: Settings = .{};
+    if (userPath(arena, env_map)) |up| {
+        if (try loadFile(arena, io, up)) |u| try probe.merge(arena, u);
+    } else |_| {}
+    const pp = try projectPath(arena);
+    if (try loadFile(arena, io, pp)) |p| try probe.merge(arena, p);
+
+    const url = managed_settings_mod.resolveUrl(env_map, probe.managed_settings.url);
+    if (url == null) return loadAndMerge(arena, io, env_map);
+
+    // Pass 2 — managed first, then user, then project.
+    var out: Settings = .{};
+    const fetched = managed_settings_mod.fetchOrCache(arena, gpa, io, env_map, url.?) catch null;
+    if (fetched) |result| {
+        if (parse(arena, result.body)) |m| try out.merge(arena, m) else |_| {}
+    }
+    if (userPath(arena, env_map)) |up| {
+        if (try loadFile(arena, io, up)) |u| try out.merge(arena, u);
+    } else |_| {}
+    if (try loadFile(arena, io, pp)) |p| try out.merge(arena, p);
+    try out.compileHooks(arena);
+    return out;
+}
+
 const Wire = struct {
     /// Mirrors `Defaults` but with `provider` as a string so the
     /// JSON file stays human-friendly (`"provider": "anthropic"`).
@@ -324,6 +394,20 @@ const Wire = struct {
     tools: ?[]WireCustomTool = null,
     /// `{"extension":".zig","command":"zls","language_id":"zig"}, ...`
     lsp: ?WireLsp = null,
+    /// `{ "opt_in": true, "url": "https://…" }` — both must be set
+    /// for telemetry to fire.
+    telemetry: ?WireTelemetry = null,
+    /// `{ "url": "https://…" }` for org-wide managed defaults.
+    managed_settings: ?WireManagedSettings = null,
+};
+
+const WireTelemetry = struct {
+    opt_in: ?bool = null,
+    url: ?[]const u8 = null,
+};
+
+const WireManagedSettings = struct {
+    url: ?[]const u8 = null,
 };
 
 const WireCustomTool = struct {
@@ -397,6 +481,13 @@ fn parse(arena: std.mem.Allocator, data: []const u8) !Settings {
         if (l.servers) |s| {
             out.lsp_servers = try parseLspServers(arena, s);
         }
+    }
+    if (wire.telemetry) |t| {
+        if (t.opt_in) |o| out.telemetry.opt_in = o;
+        if (t.url) |u| out.telemetry.url = try arena.dupe(u8, u);
+    }
+    if (wire.managed_settings) |m| {
+        if (m.url) |u| out.managed_settings.url = try arena.dupe(u8, u);
     }
     return out;
 }
@@ -702,6 +793,53 @@ test "setStyleAtPath: null style_name removes defaults.style" {
     try setStyleAtPath(a, testing.io, Io.Dir.cwd(), dir_name, file_path, null);
     const data = try Io.Dir.cwd().readFileAlloc(testing.io, file_path, a, .limited(64 * 1024));
     try testing.expect(std.mem.indexOf(u8, data, "\"style\"") == null);
+}
+
+test "telemetry: parses opt_in + url from JSON" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{"telemetry":{"opt_in":true,"url":"https://t.example.com/ingest"}}
+    ;
+    const s = try parse(arena_state.allocator(), json);
+    try testing.expect(s.telemetry.opt_in);
+    try testing.expectEqualStrings("https://t.example.com/ingest", s.telemetry.url.?);
+}
+
+test "telemetry: defaults to off when JSON omits the field" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const s = try parse(arena_state.allocator(), "{}");
+    try testing.expect(!s.telemetry.opt_in);
+    try testing.expect(s.telemetry.url == null);
+}
+
+test "managed_settings: parses url from JSON" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{"managed_settings":{"url":"https://policy.example.com/velk.json"}}
+    ;
+    const s = try parse(arena_state.allocator(), json);
+    try testing.expectEqualStrings("https://policy.example.com/velk.json", s.managed_settings.url.?);
+}
+
+test "merge: managed settings layer is overridden by later layers" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Simulate the loadAndMergeWithManaged shape: managed first
+    // (lowest priority), then user, then project.
+    var managed = try parse(a, "{\"defaults\":{\"model\":\"managed-default-model\",\"max_tokens\":1024}}");
+    const user = try parse(a, "{\"defaults\":{\"max_tokens\":4096}}");
+    const project = try parse(a, "{\"defaults\":{\"model\":\"project-model\"}}");
+    try managed.merge(a, user);
+    try managed.merge(a, project);
+    // Project's model wins; user's max_tokens wins; managed
+    // contributed nothing that wasn't overridden — proves the
+    // priority order.
+    try testing.expectEqualStrings("project-model", managed.defaults.model.?);
+    try testing.expectEqual(@as(u32, 4096), managed.defaults.max_tokens.?);
 }
 
 test "defaults.style: parsed from settings.json" {
