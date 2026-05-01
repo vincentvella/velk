@@ -32,6 +32,19 @@ pub const Diagnostic = struct {
     message: []const u8,
 };
 
+/// Single LSP `Location` (definition target / reference site). 0-based
+/// line+col matching the rest of the LSP API.
+pub const Location = struct {
+    uri: []const u8,
+    line: u32,
+    col: u32,
+    /// End line of the highlighted range. Useful for `references`
+    /// where the same `(line, col)` shows up multiple times in a
+    /// file but with distinct ranges.
+    end_line: u32 = 0,
+    end_col: u32 = 0,
+};
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -185,6 +198,164 @@ pub const Client = struct {
             if (!std.mem.eql(u8, m, "textDocument/publishDiagnostics")) continue;
             const params = decoded.value.params orelse continue;
             return try self.parseDiagnostics(arena, params, uri);
+        }
+    }
+
+    /// `textDocument/hover` at `(line, col)` in `file_abs`. Returns
+    /// the server's hover contents as a single rendered string, or
+    /// null when the cursor is on something with no hover info. Both
+    /// modern (`{contents: {kind, value}}`) and legacy
+    /// (`{contents: <string>}` or `{contents: [<string>, ...]}`)
+    /// shapes are accepted.
+    pub fn hover(
+        self: *Client,
+        arena: std.mem.Allocator,
+        file_abs: []const u8,
+        language_id: []const u8,
+        body: []const u8,
+        line: u32,
+        col: u32,
+        timeout_ms: u64,
+    ) !?[]const u8 {
+        const uri = try std.fmt.allocPrint(arena, "file://{s}", .{file_abs});
+        try self.didOpen(arena, uri, language_id, body);
+        defer self.closeDocument(uri);
+
+        const id = self.takeId();
+        const HoverReq = struct {
+            jsonrpc: []const u8 = "2.0",
+            id: u64,
+            method: []const u8 = "textDocument/hover",
+            params: struct {
+                textDocument: struct { uri: []const u8 },
+                position: struct { line: u32, character: u32 },
+            },
+        };
+        try self.sendFrame(HoverReq{
+            .id = id,
+            .params = .{
+                .textDocument = .{ .uri = uri },
+                .position = .{ .line = line, .character = col },
+            },
+        });
+
+        const raw = try self.awaitResponseWithTimeout(id, timeout_ms);
+        defer self.gpa.free(raw);
+        return parseHoverResult(arena, raw);
+    }
+
+    /// `textDocument/definition` at `(line, col)`. Returns the list
+    /// of `(uri, line, col)` Locations the server reported. Empty
+    /// when the symbol has no resolved definition.
+    pub fn definition(
+        self: *Client,
+        arena: std.mem.Allocator,
+        file_abs: []const u8,
+        language_id: []const u8,
+        body: []const u8,
+        line: u32,
+        col: u32,
+        timeout_ms: u64,
+    ) ![]const Location {
+        return self.locationQuery(arena, "textDocument/definition", file_abs, language_id, body, line, col, timeout_ms);
+    }
+
+    /// `textDocument/references` at `(line, col)`. Includes the
+    /// definition site too (LSP `includeDeclaration: true`).
+    pub fn references(
+        self: *Client,
+        arena: std.mem.Allocator,
+        file_abs: []const u8,
+        language_id: []const u8,
+        body: []const u8,
+        line: u32,
+        col: u32,
+        timeout_ms: u64,
+    ) ![]const Location {
+        return self.locationQuery(arena, "textDocument/references", file_abs, language_id, body, line, col, timeout_ms);
+    }
+
+    fn locationQuery(
+        self: *Client,
+        arena: std.mem.Allocator,
+        method: []const u8,
+        file_abs: []const u8,
+        language_id: []const u8,
+        body: []const u8,
+        line: u32,
+        col: u32,
+        timeout_ms: u64,
+    ) ![]const Location {
+        const uri = try std.fmt.allocPrint(arena, "file://{s}", .{file_abs});
+        try self.didOpen(arena, uri, language_id, body);
+        defer self.closeDocument(uri);
+
+        const id = self.takeId();
+        const LocReq = struct {
+            jsonrpc: []const u8 = "2.0",
+            id: u64,
+            method: []const u8,
+            params: struct {
+                textDocument: struct { uri: []const u8 },
+                position: struct { line: u32, character: u32 },
+                context: ?struct { includeDeclaration: bool } = null,
+            },
+        };
+        const include_decl = std.mem.eql(u8, method, "textDocument/references");
+        try self.sendFrame(LocReq{
+            .id = id,
+            .method = method,
+            .params = .{
+                .textDocument = .{ .uri = uri },
+                .position = .{ .line = line, .character = col },
+                .context = if (include_decl) .{ .includeDeclaration = true } else null,
+            },
+        });
+
+        const raw = try self.awaitResponseWithTimeout(id, timeout_ms);
+        defer self.gpa.free(raw);
+        return parseLocationResult(arena, raw);
+    }
+
+    fn didOpen(self: *Client, arena: std.mem.Allocator, uri: []const u8, language_id: []const u8, body: []const u8) !void {
+        const DidOpenParams = struct {
+            textDocument: struct {
+                uri: []const u8,
+                languageId: []const u8,
+                version: i64 = 1,
+                text: []const u8,
+            },
+        };
+        _ = arena;
+        try self.sendNotification("textDocument/didOpen", DidOpenParams{ .textDocument = .{
+            .uri = uri,
+            .languageId = language_id,
+            .text = body,
+        } });
+    }
+
+    /// Block on `awaitResponseRaw` with a wall-clock cap. The
+    /// underlying `readMessage` is blocking so we approximate
+    /// timeout via `Io.Timeout` on the reader. On expiry we surface
+    /// `Error.Timeout` so the tool can convert to a user-visible
+    /// message.
+    fn awaitResponseWithTimeout(self: *Client, want_id: u64, timeout_ms: u64) ![]u8 {
+        const start_ts: ?Io.Timestamp = if (timeout_ms > 0) Io.Clock.now(.awake, self.io) else null;
+        while (true) {
+            if (start_ts) |t0| {
+                const elapsed = t0.untilNow(self.io, .awake);
+                const elapsed_ms: u64 = @intCast(@max(@as(i96, 0), @divTrunc(elapsed.nanoseconds, std.time.ns_per_ms)));
+                if (elapsed_ms > timeout_ms) return Error.Timeout;
+            }
+            const raw = try self.readMessage();
+            const Probe = struct { id: ?u64 = null };
+            const probe = std.json.parseFromSlice(Probe, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch {
+                self.gpa.free(raw);
+                continue;
+            };
+            defer probe.deinit();
+            if (probe.value.id) |got| if (got == want_id) return raw;
+            self.gpa.free(raw);
         }
     }
 
@@ -429,9 +600,209 @@ fn severityLabel(n: i32) []const u8 {
     };
 }
 
+/// Parse the `result` of a `textDocument/hover` response into a
+/// human-readable string. Three shapes are accepted:
+///   { result: { contents: { kind, value } } }
+///   { result: { contents: "string" } }
+///   { result: { contents: [<string|MarkedString>...] } }
+/// Null result → null. The arena-allocated string includes any
+/// language-specific code fences (model can render Markdown).
+pub fn parseHoverResult(arena: std.mem.Allocator, raw_message: []const u8) !?[]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, raw_message, .{}) catch return null;
+    const msg = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const result_v = msg.get("result") orelse return null;
+    if (result_v == .null) return null;
+    const result = switch (result_v) {
+        .object => |o| o,
+        else => return null,
+    };
+    const contents_v = result.get("contents") orelse return null;
+    return try renderHoverContents(arena, contents_v);
+}
+
+fn renderHoverContents(arena: std.mem.Allocator, v: std.json.Value) !?[]const u8 {
+    return switch (v) {
+        .string => |s| try arena.dupe(u8, s),
+        .object => |o| blk: {
+            // MarkupContent: { kind, value }. Plain or Markdown both
+            // pass through as the model can re-render either.
+            if (o.get("value")) |vv| {
+                switch (vv) {
+                    .string => |s| break :blk try arena.dupe(u8, s),
+                    else => {},
+                }
+            }
+            break :blk null;
+        },
+        .array => |a| blk: {
+            // Pre-3.18 servers send MarkedString[]: each entry is
+            // either a string or `{ language, value }`. We join with
+            // blank lines so the model still sees structure.
+            var buf: std.ArrayList(u8) = .empty;
+            for (a.items) |item| {
+                const piece = (try renderHoverContents(arena, item)) orelse continue;
+                if (buf.items.len > 0) try buf.appendSlice(arena, "\n\n");
+                try buf.appendSlice(arena, piece);
+            }
+            if (buf.items.len == 0) break :blk null;
+            break :blk buf.items;
+        },
+        else => null,
+    };
+}
+
+/// Parse the `result` of a definition/references response. LSP
+/// allows the result to be a single Location, a Location[], or
+/// LocationLink[]. We canonicalise to `Location[]`.
+pub fn parseLocationResult(arena: std.mem.Allocator, raw_message: []const u8) ![]const Location {
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, raw_message, .{}) catch return &.{};
+    const msg = switch (parsed.value) {
+        .object => |o| o,
+        else => return &.{},
+    };
+    const result_v = msg.get("result") orelse return &.{};
+    var out: std.ArrayList(Location) = .empty;
+    switch (result_v) {
+        .null => return &.{},
+        .object => |o| {
+            if (try parseSingleLocation(arena, o)) |loc| try out.append(arena, loc);
+        },
+        .array => |a| {
+            for (a.items) |item| switch (item) {
+                .object => |o| if (try parseSingleLocation(arena, o)) |loc| try out.append(arena, loc),
+                else => {},
+            };
+        },
+        else => return &.{},
+    }
+    return out.items;
+}
+
+fn parseSingleLocation(arena: std.mem.Allocator, obj: std.json.ObjectMap) !?Location {
+    // LocationLink uses `targetUri` + `targetRange`; Location uses
+    // `uri` + `range`. Try both.
+    const uri_v = obj.get("uri") orelse obj.get("targetUri") orelse return null;
+    const uri = switch (uri_v) {
+        .string => |s| try arena.dupe(u8, s),
+        else => return null,
+    };
+    const range_v = obj.get("range") orelse obj.get("targetSelectionRange") orelse obj.get("targetRange") orelse return null;
+    const range = switch (range_v) {
+        .object => |r| r,
+        else => return null,
+    };
+    const start = switch (range.get("start") orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    const end = switch (range.get("end") orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    return .{
+        .uri = uri,
+        .line = readU32(start, "line"),
+        .col = readU32(start, "character"),
+        .end_line = readU32(end, "line"),
+        .end_col = readU32(end, "character"),
+    };
+}
+
+fn readU32(obj: std.json.ObjectMap, key: []const u8) u32 {
+    const v = obj.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| @intCast(@max(@as(i64, 0), i)),
+        else => 0,
+    };
+}
+
 // ───────── tests ─────────
 
 const testing = std.testing;
+
+test "parseHoverResult: MarkupContent shape" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":\"`fn run() void`\"}}}";
+    const out = (try parseHoverResult(a, raw)).?;
+    try testing.expectEqualStrings("`fn run() void`", out);
+}
+
+test "parseHoverResult: legacy bare string" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"contents\":\"plain text\"}}";
+    const out = (try parseHoverResult(a, raw)).?;
+    try testing.expectEqualStrings("plain text", out);
+}
+
+test "parseHoverResult: array of MarkedString joined with blank lines" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw = "{\"result\":{\"contents\":[\"first\",{\"value\":\"second\"}]}}";
+    const out = (try parseHoverResult(a, raw)).?;
+    try testing.expect(std.mem.indexOf(u8, out, "first") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "second") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "first\n\nsecond") != null);
+}
+
+test "parseHoverResult: null result yields null" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}";
+    const out = try parseHoverResult(a, raw);
+    try testing.expect(out == null);
+}
+
+test "parseLocationResult: single Location" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw = "{\"result\":{\"uri\":\"file:///x.zig\",\"range\":{\"start\":{\"line\":3,\"character\":7},\"end\":{\"line\":3,\"character\":12}}}}";
+    const locs = try parseLocationResult(a, raw);
+    try testing.expectEqual(@as(usize, 1), locs.len);
+    try testing.expectEqualStrings("file:///x.zig", locs[0].uri);
+    try testing.expectEqual(@as(u32, 3), locs[0].line);
+    try testing.expectEqual(@as(u32, 7), locs[0].col);
+    try testing.expectEqual(@as(u32, 12), locs[0].end_col);
+}
+
+test "parseLocationResult: array of Locations" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw = "{\"result\":[{\"uri\":\"file:///a.zig\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}},{\"uri\":\"file:///b.zig\",\"range\":{\"start\":{\"line\":5,\"character\":2},\"end\":{\"line\":5,\"character\":3}}}]}";
+    const locs = try parseLocationResult(a, raw);
+    try testing.expectEqual(@as(usize, 2), locs.len);
+    try testing.expectEqualStrings("file:///a.zig", locs[0].uri);
+    try testing.expectEqualStrings("file:///b.zig", locs[1].uri);
+}
+
+test "parseLocationResult: LocationLink uses targetUri + targetSelectionRange" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw = "{\"result\":[{\"targetUri\":\"file:///x.zig\",\"targetSelectionRange\":{\"start\":{\"line\":1,\"character\":1},\"end\":{\"line\":1,\"character\":4}}}]}";
+    const locs = try parseLocationResult(a, raw);
+    try testing.expectEqual(@as(usize, 1), locs.len);
+    try testing.expectEqualStrings("file:///x.zig", locs[0].uri);
+    try testing.expectEqual(@as(u32, 1), locs[0].line);
+}
+
+test "parseLocationResult: null result yields empty" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const locs = try parseLocationResult(a, "{\"result\":null}");
+    try testing.expectEqual(@as(usize, 0), locs.len);
+}
 
 test "Pool: empty until first get" {
     var pool: Pool = .init(testing.allocator, testing.io);

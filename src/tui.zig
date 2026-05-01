@@ -1833,6 +1833,34 @@ fn slashDoctor(ctx: *anyopaque, _: []const u8) anyerror!slash.Action {
     try buf.print(c.tui.arena, "  · model: {s}\n", .{c.tui.model});
     try buf.print(c.tui.arena, "  · mcp servers attached: {d}\n", .{c.tui.mcp_count});
 
+    // Hooks broken down by source. Surfaces the priority-layering so
+    // the user can see at a glance which layers contributed which
+    // hooks (and that policy/settings/skills entries are stacked in
+    // the right order).
+    if (c.tui.hook_engine) |engine| {
+        if (engine.hooks.len > 0) {
+            var counts = [_]usize{0} ** 5;
+            for (engine.hooks) |h| {
+                counts[@intFromEnum(h.source)] += 1;
+            }
+            try buf.print(c.tui.arena, "  · hooks: {d} total", .{engine.hooks.len});
+            const sources = [_]hooks.Source{ .policy, .settings, .frontmatter, .skills, .plugins };
+            var first = true;
+            for (sources) |src| {
+                const n = counts[@intFromEnum(src)];
+                if (n == 0) continue;
+                if (first) {
+                    try buf.appendSlice(c.tui.arena, " · ");
+                    first = false;
+                } else {
+                    try buf.appendSlice(c.tui.arena, ", ");
+                }
+                try buf.print(c.tui.arena, "{s}: {d}", .{ src.toString(), n });
+            }
+            try buf.append(c.tui.arena, '\n');
+        }
+    }
+
     // System-prompt size + cache eligibility. Approximate token
     // count via /4 byte heuristic (good enough for English; the
     // model server tokenizes for the actual price). Engages

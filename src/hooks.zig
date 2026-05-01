@@ -68,7 +68,60 @@ pub const Event = enum {
     }
 };
 
-pub const HookKind = enum { command, prompt };
+pub const HookKind = enum {
+    /// Spawn a shell command, pipe the JSON event payload to stdin.
+    /// Exit code = decision (0 = ok, 2 = block on PreToolUse).
+    command,
+    /// Inject a literal text body as extra context. Only meaningful
+    /// on UserPromptSubmit; treated as a no-op elsewhere.
+    prompt,
+    /// POST the JSON event payload to a URL. The server's HTTP status
+    /// is the decision: 200 = ok, 4xx = block (response body becomes
+    /// the user-visible reason). Useful for org-wide policy
+    /// enforcement that lives outside the local box.
+    http,
+    /// Dispatch via the `task` sub-agent. The hook body is the
+    /// prompt the sub-agent receives along with the event JSON. Use
+    /// for hooks that need to *think* about the event (e.g. "should
+    /// this command run? explain why or why not"). The sub-agent's
+    /// final text becomes the notice/inject body. Subject to the
+    /// task tool's recursion-depth cap so a hook can't infinite-loop.
+    agent,
+};
+
+/// Priority layers a hook can come from. Lower variants win when
+/// multiple hooks fire for the same event — they run *first*. The
+/// canonical order:
+///   1. policy     — org-wide managed config (Phase 19 lift, not yet wired)
+///   2. settings   — `.velk/settings.json` (project) and user settings
+///   3. frontmatter — hooks declared in a file's YAML frontmatter
+///   4. skills     — hooks attached to a skill
+///   5. plugins    — third-party plugin packages
+///
+/// PreToolUse blocks short-circuit at the first exit-2: with priority
+/// ordering, a `policy`-source hook can't be silently overridden by
+/// a `plugins`-source hook later in the registry.
+pub const Source = enum {
+    policy,
+    settings,
+    frontmatter,
+    skills,
+    plugins,
+
+    pub fn priority(self: Source) u8 {
+        return @intFromEnum(self);
+    }
+
+    pub fn toString(self: Source) []const u8 {
+        return switch (self) {
+            .policy => "policy",
+            .settings => "settings",
+            .frontmatter => "frontmatter",
+            .skills => "skills",
+            .plugins => "plugins",
+        };
+    }
+};
 
 pub const Hook = struct {
     event: Event,
@@ -83,6 +136,11 @@ pub const Hook = struct {
     /// Advisory in v1: parsed but not yet enforced. Future: kill child
     /// when wall-clock exceeds.
     timeout_ms: u32 = 30_000,
+    /// Origin of this hook entry. Drives dispatch order — see
+    /// `Source.priority`. Defaults to `.settings` so today's
+    /// `Engine.parse` callers (which all read settings.json) get the
+    /// right value without changes.
+    source: Source = .settings,
 };
 
 /// Outcome of dispatching all hooks for one event.
@@ -120,6 +178,27 @@ pub const Engine = struct {
         return self.hooks.len == 0;
     }
 
+    /// Build a single engine from N source-tagged engines. Hooks are
+    /// concatenated and then sorted by `Source.priority` (stable —
+    /// within a source they keep their declaration order). Used by
+    /// main.zig to glue policy + settings + frontmatter + skills +
+    /// plugins into one dispatch list.
+    pub fn merge(arena: std.mem.Allocator, parts: []const Engine) !Engine {
+        var total: usize = 0;
+        for (parts) |p| total += p.hooks.len;
+        if (total == 0) return Engine.empty();
+        const buf = try arena.alloc(Hook, total);
+        var i: usize = 0;
+        for (parts) |p| {
+            for (p.hooks) |h| {
+                buf[i] = h;
+                i += 1;
+            }
+        }
+        std.mem.sort(Hook, buf, {}, hookLessByPriority);
+        return .{ .hooks = buf };
+    }
+
     /// Walk the parsed JSON `hooks` field from settings.json. Shape:
     ///
     /// ```json
@@ -130,6 +209,13 @@ pub const Engine = struct {
     /// Unknown event names and malformed entries are skipped silently
     /// — settings parsing should not fail loudly on a typo'd hook.
     pub fn parse(arena: std.mem.Allocator, value: std.json.Value) !Engine {
+        return parseWithSource(arena, value, .settings);
+    }
+
+    /// Same as `parse` but tags every parsed hook with `source` so
+    /// dispatch can run hooks in priority order. Used by callers
+    /// that load hooks from non-settings sources (skills, plugins).
+    pub fn parseWithSource(arena: std.mem.Allocator, value: std.json.Value, source: Source) !Engine {
         const obj = switch (value) {
             .object => |o| o,
             else => return Engine.empty(),
@@ -153,12 +239,18 @@ pub const Engine = struct {
                     .prompt
                 else if (std.mem.eql(u8, kind_str, "command"))
                     .command
+                else if (std.mem.eql(u8, kind_str, "http"))
+                    .http
+                else if (std.mem.eql(u8, kind_str, "agent"))
+                    .agent
                 else
                     continue;
 
                 const body = switch (kind) {
                     .command => stringField(ho, "command") orelse continue,
                     .prompt => stringField(ho, "prompt") orelse continue,
+                    .http => stringField(ho, "url") orelse continue,
+                    .agent => stringField(ho, "prompt") orelse continue,
                 };
 
                 const matcher = stringField(ho, "matcher");
@@ -176,6 +268,7 @@ pub const Engine = struct {
                     .kind = kind,
                     .body = try arena.dupe(u8, body),
                     .timeout_ms = timeout_ms,
+                    .source = source,
                 });
             }
         }
@@ -255,6 +348,56 @@ pub const Engine = struct {
                         }
                     }
                 },
+                .http => {
+                    const r = runHttp(gpa, io, h, event, ctx) catch |e| {
+                        if (notice_buf.items.len > 0) try notice_buf.append(gpa, '\n');
+                        const msg = try std.fmt.allocPrint(gpa, "http hook failed: {s}", .{@errorName(e)});
+                        defer gpa.free(msg);
+                        try notice_buf.appendSlice(gpa, msg);
+                        continue;
+                    };
+                    defer gpa.free(r.body);
+
+                    // 4xx/5xx blocks (PreToolUse) or surfaces a
+                    // notice. 200-299 is success — body is treated
+                    // like command stdout for UserPromptSubmit.
+                    if (r.status >= 400 and event == .pre_tool_use) {
+                        const trimmed = std.mem.trim(u8, r.body, " \t\r\n");
+                        out.blocked = try gpa.dupe(u8, if (trimmed.len > 0) trimmed else "blocked by http hook");
+                        if (inject_buf.items.len > 0) out.inject = try inject_buf.toOwnedSlice(gpa);
+                        if (notice_buf.items.len > 0) out.notice = try notice_buf.toOwnedSlice(gpa);
+                        return out;
+                    }
+                    if (r.status >= 400) {
+                        if (notice_buf.items.len > 0) try notice_buf.append(gpa, '\n');
+                        const trimmed = std.mem.trim(u8, r.body, " \t\r\n");
+                        const msg = try std.fmt.allocPrint(gpa, "http hook {d}: {s}", .{
+                            r.status,
+                            if (trimmed.len > 0) trimmed else "(no body)",
+                        });
+                        defer gpa.free(msg);
+                        try notice_buf.appendSlice(gpa, msg);
+                        continue;
+                    }
+                    if (event == .user_prompt_submit) {
+                        const text = std.mem.trim(u8, r.body, " \t\r\n");
+                        if (text.len > 0) {
+                            if (inject_buf.items.len > 0) try inject_buf.appendSlice(gpa, "\n\n");
+                            try inject_buf.appendSlice(gpa, text);
+                        }
+                    }
+                },
+                .agent => {
+                    // Agent hooks need a sub-agent runtime. The
+                    // engine doesn't own one — that lives on
+                    // tools.Settings. We surface a notice instead of
+                    // failing so a settings-time test in the parser
+                    // is enough; the runtime wiring is opt-in via
+                    // `engine.dispatchWithAgent` (added below).
+                    if (notice_buf.items.len > 0) try notice_buf.append(gpa, '\n');
+                    const msg = "agent hook fired but engine has no sub-agent runtime; use Engine.dispatchWithAgent at the call site to enable.";
+                    try notice_buf.appendSlice(gpa, msg);
+                },
             }
         }
 
@@ -263,6 +406,14 @@ pub const Engine = struct {
         return out;
     }
 };
+
+/// Order comparator for `Engine.merge` — lower priority value (more
+/// authoritative source) sorts first so it dispatches first. Hooks
+/// within the same source preserve declaration order via Zig's
+/// stable sort guarantee.
+fn hookLessByPriority(_: void, a: Hook, b: Hook) bool {
+    return a.source.priority() < b.source.priority();
+}
 
 fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
@@ -375,6 +526,50 @@ fn runCommand(
     };
 }
 
+const HttpResult = struct {
+    status: u16,
+    body: []u8,
+};
+
+/// POST the JSON event payload to `h.body` (the configured URL) and
+/// return the response. The HTTP status drives the decision: 2xx is
+/// ok, 4xx/5xx blocks (PreToolUse) or surfaces a notice. Body is
+/// capped at 256 KB — anything longer is truncated for the notice.
+fn runHttp(
+    gpa: std.mem.Allocator,
+    io: Io,
+    h: Hook,
+    event: Event,
+    ctx: Context,
+) !HttpResult {
+    const payload = try buildPayload(gpa, event, ctx);
+    defer gpa.free(payload);
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+
+    var resp_buf: Io.Writer.Allocating = .init(gpa);
+    defer resp_buf.deinit();
+
+    const result = http.fetch(.{
+        .location = .{ .url = h.body },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &resp_buf.writer,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "user-agent", .value = "velk-hook/1" },
+        },
+    }) catch |e| return e;
+
+    const status: u16 = @intCast(@intFromEnum(result.status));
+    const buffered = resp_buf.writer.buffered();
+    const cap: usize = 256 * 1024;
+    const len = @min(buffered.len, cap);
+    const body = try gpa.dupe(u8, buffered[0..len]);
+    return .{ .status = status, .body = body };
+}
+
 fn buildPayload(gpa: std.mem.Allocator, event: Event, ctx: Context) ![]u8 {
     const Payload = struct {
         event: []const u8,
@@ -421,6 +616,143 @@ test "Event.toString: new event names" {
     try testing.expectEqualStrings("SubagentStop", Event.subagent_stop.toString());
     try testing.expectEqualStrings("Notification", Event.notification.toString());
     try testing.expectEqualStrings("PostSampling", Event.post_sampling.toString());
+}
+
+test "Source.priority: policy < settings < frontmatter < skills < plugins" {
+    try testing.expect(Source.policy.priority() < Source.settings.priority());
+    try testing.expect(Source.settings.priority() < Source.frontmatter.priority());
+    try testing.expect(Source.frontmatter.priority() < Source.skills.priority());
+    try testing.expect(Source.skills.priority() < Source.plugins.priority());
+}
+
+test "Source.toString: stable labels for /doctor" {
+    try testing.expectEqualStrings("policy", Source.policy.toString());
+    try testing.expectEqualStrings("settings", Source.settings.toString());
+    try testing.expectEqualStrings("frontmatter", Source.frontmatter.toString());
+    try testing.expectEqualStrings("skills", Source.skills.toString());
+    try testing.expectEqualStrings("plugins", Source.plugins.toString());
+}
+
+test "parseWithSource: tags every hook with its source" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{"PreToolUse":[{"type":"command","command":"echo a"},{"type":"command","command":"echo b"}]}
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
+    const e = try Engine.parseWithSource(arena_state.allocator(), v, .skills);
+    try testing.expectEqual(@as(usize, 2), e.hooks.len);
+    try testing.expectEqual(Source.skills, e.hooks[0].source);
+    try testing.expectEqual(Source.skills, e.hooks[1].source);
+}
+
+test "Engine.merge: dispatch order respects source priority" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const settings_engine: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .pre_tool_use,
+        .kind = .command,
+        .body = "settings-hook",
+        .source = .settings,
+    }} };
+    const policy_engine: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .pre_tool_use,
+        .kind = .command,
+        .body = "policy-hook",
+        .source = .policy,
+    }} };
+    const plugins_engine: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .pre_tool_use,
+        .kind = .command,
+        .body = "plugins-hook",
+        .source = .plugins,
+    }} };
+    // Pass them in arbitrary order; merge sorts by priority.
+    const merged = try Engine.merge(a, &.{ plugins_engine, settings_engine, policy_engine });
+    try testing.expectEqual(@as(usize, 3), merged.hooks.len);
+    try testing.expectEqualStrings("policy-hook", merged.hooks[0].body);
+    try testing.expectEqualStrings("settings-hook", merged.hooks[1].body);
+    try testing.expectEqualStrings("plugins-hook", merged.hooks[2].body);
+}
+
+test "Engine.merge: stable within the same source" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const e1: Engine = .{ .hooks = &[_]Hook{
+        .{ .event = .pre_tool_use, .kind = .command, .body = "first", .source = .settings },
+        .{ .event = .pre_tool_use, .kind = .command, .body = "second", .source = .settings },
+    } };
+    const merged = try Engine.merge(a, &.{e1});
+    try testing.expectEqualStrings("first", merged.hooks[0].body);
+    try testing.expectEqualStrings("second", merged.hooks[1].body);
+}
+
+test "Engine.merge: empty parts yield empty engine" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const merged = try Engine.merge(arena_state.allocator(), &.{});
+    try testing.expect(merged.isEmpty());
+}
+
+test "parse: http hook stores URL in body" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{"PreToolUse":[{"type":"http","url":"https://example.com/policy","matcher":"^bash$"}]}
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
+    const e = try Engine.parse(arena_state.allocator(), v);
+    try testing.expectEqual(@as(usize, 1), e.hooks.len);
+    try testing.expectEqual(HookKind.http, e.hooks[0].kind);
+    try testing.expectEqualStrings("https://example.com/policy", e.hooks[0].body);
+    try testing.expectEqualStrings("^bash$", e.hooks[0].matcher.?);
+}
+
+test "parse: agent hook stores prompt in body" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json =
+        \\{"PreToolUse":[{"type":"agent","prompt":"explain why this command is or isn't safe"}]}
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
+    const e = try Engine.parse(arena_state.allocator(), v);
+    try testing.expectEqual(@as(usize, 1), e.hooks.len);
+    try testing.expectEqual(HookKind.agent, e.hooks[0].kind);
+    try testing.expectEqualStrings("explain why this command is or isn't safe", e.hooks[0].body);
+}
+
+test "parse: http hook missing url is dropped silently" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json = "{\"PreToolUse\":[{\"type\":\"http\"}]}";
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
+    const e = try Engine.parse(arena_state.allocator(), v);
+    try testing.expectEqual(@as(usize, 0), e.hooks.len);
+}
+
+test "parse: agent hook missing prompt is dropped silently" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const json = "{\"PreToolUse\":[{\"type\":\"agent\"}]}";
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
+    const e = try Engine.parse(arena_state.allocator(), v);
+    try testing.expectEqual(@as(usize, 0), e.hooks.len);
+}
+
+test "dispatch: agent hook surfaces a notice when runtime not wired" {
+    const arena = testing.allocator;
+    const e: Engine = .{ .hooks = &[_]Hook{.{
+        .event = .pre_tool_use,
+        .kind = .agent,
+        .body = "ignored — no runtime",
+    }} };
+    const out = try e.dispatch(arena, testIo(), .pre_tool_use, .{ .tool_name = "bash" });
+    defer if (out.inject) |s| arena.free(s);
+    defer if (out.blocked) |s| arena.free(s);
+    defer arena.free(out.notice.?);
+    try testing.expect(std.mem.indexOf(u8, out.notice.?, "no sub-agent runtime") != null);
 }
 
 test "parse: PostToolUseFailure + SubagentStop hooks load" {

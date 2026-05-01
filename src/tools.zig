@@ -142,6 +142,9 @@ pub fn buildAll(arena: std.mem.Allocator, settings: *const Settings) ![]const to
     try list.append(arena, try buildWriteMemory(arena, settings));
     try list.append(arena, try buildSearchMemory(arena, settings));
     try list.append(arena, try buildLspDiagnostics(arena, settings));
+    try list.append(arena, try buildLspHover(arena, settings));
+    try list.append(arena, try buildLspDefinition(arena, settings));
+    try list.append(arena, try buildLspReferences(arena, settings));
     try list.append(arena, try buildViewImage(arena, settings));
     if (settings.todos != null) try list.append(arena, try buildTodoWrite(arena, settings));
     if (settings.ask != null) try list.append(arena, try buildAskUserQuestion(arena, settings));
@@ -1867,6 +1870,215 @@ fn lspDiagnosticsExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.
     try out.print(arena, "{d} diagnostic(s) for {s}:\n", .{ diags.len, file });
     for (diags) |d| {
         try out.print(arena, "  [{s}] {s}:{d}:{d}: {s}\n", .{ d.severity, file, d.line + 1, d.col + 1, d.message });
+    }
+    if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') _ = out.pop();
+    return .{ .text = out.items, .is_error = false };
+}
+
+// ───────── lsp_hover / lsp_definition / lsp_references ─────────
+
+const lsp_position_schema_json: []const u8 =
+    \\{"type":"object",
+    \\ "properties":{
+    \\   "file":{"type":"string","description":"Path to a source file in the project."},
+    \\   "line":{"type":"integer","description":"0-based line number of the cursor position."},
+    \\   "col":{"type":"integer","description":"0-based column. Treat as the character offset within the line."},
+    \\   "timeout_ms":{"type":"integer","description":"Optional. How long to wait for the server's response. Default 5000."}
+    \\ },
+    \\ "required":["file","line","col"]}
+;
+
+/// Common scaffolding for every LSP query tool: validates the path,
+/// looks up the configured server by extension, reads the file body,
+/// resolves absolute paths, tokenises the command, and gets a client
+/// from the pool (or spawns ad-hoc when there's no pool wired). On
+/// any error returns a formatted Output the caller can return as-is.
+const LspCallCtx = struct {
+    client: *lsp_mod.Client,
+    pooled: bool,
+    file: []const u8,
+    file_abs: []const u8,
+    body: []const u8,
+    language_id: []const u8,
+};
+
+const LspCallResult = union(enum) {
+    ok: LspCallCtx,
+    err: tool.Output,
+};
+
+fn beginLspCall(
+    arena: std.mem.Allocator,
+    settings: *const Settings,
+    file: []const u8,
+    tool_name: []const u8,
+) !LspCallResult {
+    _ = validatePath(settings, file) catch {
+        return .{ .err = try formatErrorOutput(arena, "{s}: refused — path '{s}' is outside CWD (use --unsafe to override)", .{ tool_name, file }) };
+    };
+    const ext = std.fs.path.extension(file);
+    if (ext.len == 0) return .{ .err = try formatErrorOutput(arena, "{s}: file '{s}' has no extension", .{ tool_name, file }) };
+
+    const server: LspServerConfig = blk: {
+        for (settings.lsp_servers) |s| {
+            if (std.mem.eql(u8, s.extension, ext)) break :blk s;
+        }
+        return .{ .err = try formatErrorOutput(arena, "{s}: no LSP server configured for '{s}' — add `lsp.servers` entry to settings.json", .{ tool_name, ext }) };
+    };
+
+    const cwd = std.Io.Dir.cwd();
+    const body = cwd.readFileAlloc(settings.io, file, arena, .limited(max_file_bytes)) catch |e|
+        return .{ .err = try formatErrorOutput(arena, "{s}: read failed: {s}", .{ tool_name, @errorName(e) }) };
+
+    const root_abs = blk: {
+        var buf: [4096]u8 = undefined;
+        const ptr = std.c.getcwd(&buf, buf.len) orelse
+            return .{ .err = try formatErrorOutput(arena, "{s}: getcwd failed", .{tool_name}) };
+        const len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
+        _ = ptr;
+        break :blk try arena.dupe(u8, buf[0..len]);
+    };
+    const file_abs: []const u8 = if (std.fs.path.isAbsolute(file)) file else try std.fs.path.join(arena, &.{ root_abs, file });
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    var iter = std.mem.tokenizeAny(u8, server.command, " \t");
+    while (iter.next()) |part| try argv.append(arena, part);
+    if (argv.items.len == 0) return .{ .err = try formatErrorOutput(arena, "{s}: empty command for '{s}'", .{ tool_name, ext }) };
+
+    const pooled: bool = settings.lsp_pool != null;
+    const client = if (settings.lsp_pool) |pool|
+        pool.get(ext, argv.items, root_abs) catch |e|
+            return .{ .err = try formatErrorOutput(arena, "{s}: spawn '{s}' failed: {s}", .{ tool_name, server.command, @errorName(e) }) }
+    else
+        lsp_mod.Client.start(settings.gpa, settings.io, argv.items, root_abs) catch |e|
+            return .{ .err = try formatErrorOutput(arena, "{s}: spawn '{s}' failed: {s}", .{ tool_name, server.command, @errorName(e) }) };
+
+    return .{ .ok = .{
+        .client = client,
+        .pooled = pooled,
+        .file = file,
+        .file_abs = file_abs,
+        .body = body,
+        .language_id = server.language_id,
+    } };
+}
+
+fn formatErrorOutput(arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !tool.Output {
+    const text = try std.fmt.allocPrint(arena, fmt, args);
+    return .{ .text = text, .is_error = true };
+}
+
+const lsp_hover_description: []const u8 =
+    "Get the LSP hover info (type signature + doc comment) for a symbol at `(line, col)` in `file`. The position is the cursor location, 0-based. Use this to learn what a name resolves to without reading the whole file — far cheaper than `read_file` for symbol lookups.";
+
+pub fn buildLspHover(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, lsp_position_schema_json, .{});
+    return .{
+        .name = "lsp_hover",
+        .description = lsp_hover_description,
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = lspHoverExecute,
+    };
+}
+
+fn lspHoverExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const file = (try getString(input, "file")) orelse return errorOutput(arena, "lsp_hover: missing 'file'", .{});
+    const line: u32 = @intCast(@as(i64, (try getInt(input, "line")) orelse 0));
+    const col: u32 = @intCast(@as(i64, (try getInt(input, "col")) orelse 0));
+    const timeout_ms: u64 = @intCast(@as(i64, (try getInt(input, "timeout_ms")) orelse 5000));
+
+    const begun = try beginLspCall(arena, settings, file, "lsp_hover");
+    const c = switch (begun) {
+        .ok => |x| x,
+        .err => |e| return e,
+    };
+    defer if (!c.pooled) c.client.deinit();
+
+    const result = c.client.hover(arena, c.file_abs, c.language_id, c.body, line, col, timeout_ms) catch |e| switch (e) {
+        error.Timeout => return errorOutput(arena, "lsp_hover: timed out after {d}ms", .{timeout_ms}),
+        else => return errorOutput(arena, "lsp_hover: query failed: {s}", .{@errorName(e)}),
+    };
+
+    if (result == null or result.?.len == 0) {
+        return .{ .text = try std.fmt.allocPrint(arena, "(no hover info at {s}:{d}:{d})", .{ file, line + 1, col + 1 }), .is_error = false };
+    }
+    const text = try std.fmt.allocPrint(arena, "{s}:{d}:{d}\n{s}", .{ file, line + 1, col + 1, result.? });
+    return .{ .text = text, .is_error = false };
+}
+
+const lsp_definition_description: []const u8 =
+    "Jump to the definition of the symbol at `(line, col)` in `file`. Returns each Location (file:line:col) the LSP server points at. Use this when you need to find what implements a function/type without grepping.";
+
+pub fn buildLspDefinition(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, lsp_position_schema_json, .{});
+    return .{
+        .name = "lsp_definition",
+        .description = lsp_definition_description,
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = lspDefinitionExecute,
+    };
+}
+
+fn lspDefinitionExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    return lspLocationExecute(ctx, arena, input, .definition);
+}
+
+const lsp_references_description: []const u8 =
+    "Find every reference to the symbol at `(line, col)` in `file`. Returns one Location per call site (including the definition). Use this before refactors to size the blast radius of a rename.";
+
+pub fn buildLspReferences(arena: std.mem.Allocator, settings: *const Settings) !tool.Tool {
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, lsp_position_schema_json, .{});
+    return .{
+        .name = "lsp_references",
+        .description = lsp_references_description,
+        .input_schema = schema,
+        .context = @constCast(@ptrCast(settings)),
+        .execute = lspReferencesExecute,
+    };
+}
+
+fn lspReferencesExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value) anyerror!tool.Output {
+    return lspLocationExecute(ctx, arena, input, .references);
+}
+
+const LocationKind = enum { definition, references };
+
+fn lspLocationExecute(ctx: ?*anyopaque, arena: std.mem.Allocator, input: std.json.Value, kind: LocationKind) anyerror!tool.Output {
+    const settings = settingsFromCtx(ctx);
+    const tool_name: []const u8 = if (kind == .definition) "lsp_definition" else "lsp_references";
+    const file = (try getString(input, "file")) orelse return errorOutput(arena, "{s}: missing 'file'", .{tool_name});
+    const line: u32 = @intCast(@as(i64, (try getInt(input, "line")) orelse 0));
+    const col: u32 = @intCast(@as(i64, (try getInt(input, "col")) orelse 0));
+    const timeout_ms: u64 = @intCast(@as(i64, (try getInt(input, "timeout_ms")) orelse 5000));
+
+    const begun = try beginLspCall(arena, settings, file, tool_name);
+    const c = switch (begun) {
+        .ok => |x| x,
+        .err => |e| return e,
+    };
+    defer if (!c.pooled) c.client.deinit();
+
+    const locations = switch (kind) {
+        .definition => c.client.definition(arena, c.file_abs, c.language_id, c.body, line, col, timeout_ms),
+        .references => c.client.references(arena, c.file_abs, c.language_id, c.body, line, col, timeout_ms),
+    } catch |e| switch (e) {
+        error.Timeout => return errorOutput(arena, "{s}: timed out after {d}ms", .{ tool_name, timeout_ms }),
+        else => return errorOutput(arena, "{s}: query failed: {s}", .{ tool_name, @errorName(e) }),
+    };
+
+    if (locations.len == 0) {
+        return .{ .text = try std.fmt.allocPrint(arena, "(no {s} found at {s}:{d}:{d})", .{ tool_name, file, line + 1, col + 1 }), .is_error = false };
+    }
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "{d} location(s):\n", .{locations.len});
+    for (locations) |loc| {
+        // Strip the `file://` prefix for display so paths line up
+        // visually with grep/diagnostics output.
+        const display_uri: []const u8 = if (std.mem.startsWith(u8, loc.uri, "file://")) loc.uri["file://".len..] else loc.uri;
+        try out.print(arena, "  {s}:{d}:{d}\n", .{ display_uri, loc.line + 1, loc.col + 1 });
     }
     if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') _ = out.pop();
     return .{ .text = out.items, .is_error = false };
